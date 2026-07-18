@@ -19,6 +19,13 @@ use crate::quiche;
 /// teardown (§5.2, §8.3). Mirrors [`h3::error::Code::H3_NO_ERROR`].
 pub(crate) const H3_NO_ERROR: u64 = 0x100;
 
+/// HTTP/3 `H3_REQUEST_CANCELLED` application error code, used by the worker's
+/// direction-aware cleanup when an open reply becomes undeliverable *after*
+/// materialization (the poller cancelled in the window between the
+/// `reply.is_closed()` check and `reply.send`) so the burned stream credit is
+/// reclaimed (§6.2). Mirrors [`h3::error::Code::H3_REQUEST_CANCELLED`].
+pub(crate) const H3_REQUEST_CANCELLED: u64 = 0x10c;
+
 /// Who initiated the `CONNECTION_CLOSE` (§8.2). Retaining the origin is required
 /// so a *local* close is never reported to `h3` as though the peer closed
 /// (finding 5): `h3` treats `ApplicationClose` as a remote error.
@@ -476,5 +483,13 @@ mod tests {
     #[test]
     fn h3_no_error_matches_h3_crate() {
         assert_eq!(H3_NO_ERROR, h3::error::Code::H3_NO_ERROR.value());
+    }
+
+    #[test]
+    fn h3_request_cancelled_matches_h3_crate() {
+        assert_eq!(
+            H3_REQUEST_CANCELLED,
+            h3::error::Code::H3_REQUEST_CANCELLED.value()
+        );
     }
 }

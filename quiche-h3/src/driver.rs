@@ -27,6 +27,7 @@ use crate::conn::QuicConn;
 use crate::error::{
     classify_stream_recv_error, classify_stream_send_error, conn_terminal_from_error, CloseOrigin,
     ConnTerminal, RecvEnd, SendEnd, StreamRecvClass, StreamSendClass, H3_NO_ERROR,
+    H3_REQUEST_CANCELLED,
 };
 use crate::quiche::{self, Shutdown};
 
@@ -77,6 +78,10 @@ const MAX_WRITE_CHUNK: usize = MAX_CHUNK;
 /// blocked write, rather than starving it on the full remaining length.
 const REARM_THRESHOLD: usize = 1;
 
+/// Max locally-requested stream opens materialized per iteration (§6.1). Excess
+/// stays queued and re-forces an iteration.
+const OPEN_BUDGET: usize = 32;
+
 /// Stream-class helper: a bidirectional stream has bit 0x2 clear (§5.5).
 #[inline]
 fn is_bidi(id: u64) -> bool {
@@ -126,6 +131,26 @@ pub(crate) enum DriverCommand<B: Buf> {
     ConnectionDropped,
 }
 
+impl<B: Buf> std::fmt::Debug for DriverCommand<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DriverCommand::OpenBidi { .. } => f.write_str("OpenBidi"),
+            DriverCommand::OpenUni { .. } => f.write_str("OpenUni"),
+            DriverCommand::Send { id, .. } => write!(f, "Send {{ id: {id} }}"),
+            DriverCommand::Finish { id, .. } => write!(f, "Finish {{ id: {id} }}"),
+            DriverCommand::Reset { id, code } => write!(f, "Reset {{ id: {id}, code: {code} }}"),
+            DriverCommand::StopSending { id, code } => {
+                write!(f, "StopSending {{ id: {id}, code: {code} }}")
+            }
+            DriverCommand::Close { code, .. } => write!(f, "Close {{ code: {code} }}"),
+            DriverCommand::RecvResume { id } => write!(f, "RecvResume {{ id: {id} }}"),
+            DriverCommand::AcceptBidiResume => f.write_str("AcceptBidiResume"),
+            DriverCommand::AcceptUniResume => f.write_str("AcceptUniResume"),
+            DriverCommand::ConnectionDropped => f.write_str("ConnectionDropped"),
+        }
+    }
+}
+
 /// Cross-task shared state (§5). Holds the connection-level terminal cell the
 /// close-admission gate publishes once and every submitter reads (§5.2, M3).
 pub(crate) struct ConnShared {
@@ -134,7 +159,7 @@ pub(crate) struct ConnShared {
 }
 
 impl ConnShared {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(ConnShared {
             conn_terminal: TerminalCell::new(),
         })
@@ -224,6 +249,11 @@ pub(crate) struct StreamSendState<B: Buf> {
     pub(crate) pending_reset: Option<u64>,
     pub(crate) terminal: Option<SendEnd>,
     pub(crate) status: TerminalCell<SendEnd>,
+    /// Set once the send direction is fully terminal (FIN accepted, local reset
+    /// serviced, peer `STOP_SENDING`, or connection close). Used by the
+    /// drop-driven cleanup to reclaim a retained entry once both directions of a
+    /// stream are terminal and its front-end halves are gone (§6.2, invariant 8).
+    pub(crate) finished: bool,
 }
 
 impl<B: Buf> StreamSendState<B> {
@@ -235,6 +265,7 @@ impl<B: Buf> StreamSendState<B> {
             pending_reset: None,
             terminal: None,
             status: TerminalCell::new(),
+            finished: false,
         }
     }
 }
@@ -315,6 +346,33 @@ pub(crate) struct DriverHandles<B: Buf> {
     /// Clone of the UNI accept-terminal cell so `Connection::poll_accept_uni`
     /// resolves a blocked accept when the connection terminates (§5).
     pub(crate) accept_terminal_uni: TerminalCell<Arc<ConnTerminal>>,
+    /// Producer-coalesced BIDI accept-resume bit shared with the worker (§5.1,
+    /// finding 3): `Connection::poll_accept_bidi` flips it false→true and sends
+    /// `AcceptBidiResume` so the worker drains the parked bidi queue.
+    pub(crate) accept_bidi_resume: Arc<AtomicBool>,
+    /// Producer-coalesced UNI accept-resume bit shared with the worker (§5.1).
+    pub(crate) accept_uni_resume: Arc<AtomicBool>,
+}
+
+impl<B: Buf + Send + 'static> DriverHandles<B> {
+    /// Materialize the front-end [`crate::stream::Connection`] from these handles
+    /// (Phase 7 wiring, §6). Consumes the accept channels, per-direction accept
+    /// terminals, and resume bits, and builds a [`crate::stream::StreamOpener`]
+    /// over the control channel + shared state. The `established_rx` is not
+    /// carried into the connection: handshake readiness is awaited separately by
+    /// the acceptor/connector before the connection is handed to `h3`.
+    pub(crate) fn into_connection(self) -> crate::stream::Connection<B> {
+        let opener = crate::stream::StreamOpener::from_parts(self.cmd_tx, self.shared);
+        crate::stream::Connection::from_parts(
+            self.accept_bidi_rx,
+            self.accept_uni_rx,
+            self.accept_terminal_bidi,
+            self.accept_terminal_uni,
+            self.accept_bidi_resume,
+            self.accept_uni_resume,
+            opener,
+        )
+    }
 }
 
 /// A staged explicit local `Close` awaiting the mandatory close barrier (§5.2,
@@ -368,6 +426,22 @@ pub(crate) struct QuicheDriver<B: Buf = Bytes> {
     /// worker gates parked-stream promotion on them and clears before retry.
     accept_bidi_resume: Arc<AtomicBool>,
     accept_uni_resume: Arc<AtomicBool>,
+
+    // ----- locally-initiated stream opening (§6.1) -----
+    /// True for the acceptor (server) side; selects the QUIC stream-id parity
+    /// convention for locally-opened streams (§6.1).
+    is_server: bool,
+    /// Next locally-initiable bidi id (client `0,4,8…`; server `1,5,9…`),
+    /// advanced by 4 only after `stream_priority` materialization succeeds.
+    next_bidi_id: u64,
+    /// Next locally-initiable uni id (client `2,6,10…`; server `3,7,11…`).
+    next_uni_id: u64,
+    /// Queued `OpenStreams::poll_open_bidi` requests awaiting materialization
+    /// under peer flow control (§6.1). Each holds only its reply oneshot; a
+    /// request whose poller dropped (`reply.is_closed()`) burns no id.
+    open_bidi: VecDeque<oneshot::Sender<Result<BidiHandoff<B>, Arc<ConnTerminal>>>>,
+    /// Queued `OpenStreams::poll_open_send` requests awaiting materialization.
+    open_uni: VecDeque<oneshot::Sender<Result<SendHandoff<B>, Arc<ConnTerminal>>>>,
 
     // ----- per-stream receive registry + admission bookkeeping (§5, §5.1) -----
     /// Live recv halves: bounded byte sender + out-of-band terminal + resume bit.
@@ -443,10 +517,15 @@ pub(crate) struct QuicheDriver<B: Buf = Bytes> {
 }
 
 impl<B: Buf + Send + 'static> QuicheDriver<B> {
-    /// Create a driver and its front-end handles. `accept_bidi_cap` /
+    /// Create a driver and its front-end handles. `is_server` selects the QUIC
+    /// stream-id parity for locally-opened streams (§6.1); `accept_bidi_cap` /
     /// `accept_uni_cap` bound the respective accept queues (§5.2, provisional
     /// §12 S3).
-    pub(crate) fn new(accept_bidi_cap: usize, accept_uni_cap: usize) -> (Self, DriverHandles<B>) {
+    pub(crate) fn new(
+        is_server: bool,
+        accept_bidi_cap: usize,
+        accept_uni_cap: usize,
+    ) -> (Self, DriverHandles<B>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let cmd_tx_weak = cmd_tx.downgrade();
         let (accept_bidi_tx, accept_bidi_rx) = mpsc::channel(accept_bidi_cap.max(1));
@@ -455,6 +534,8 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         let shared = ConnShared::new();
         let accept_terminal_bidi = TerminalCell::new();
         let accept_terminal_uni = TerminalCell::new();
+        let accept_bidi_resume = Arc::new(AtomicBool::new(false));
+        let accept_uni_resume = Arc::new(AtomicBool::new(false));
 
         let driver = QuicheDriver {
             shared: Arc::clone(&shared),
@@ -463,8 +544,15 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             inbox: VecDeque::new(),
             accept_bidi: accept_bidi_tx,
             accept_uni: accept_uni_tx,
-            accept_bidi_resume: Arc::new(AtomicBool::new(false)),
-            accept_uni_resume: Arc::new(AtomicBool::new(false)),
+            accept_bidi_resume: Arc::clone(&accept_bidi_resume),
+            accept_uni_resume: Arc::clone(&accept_uni_resume),
+            is_server,
+            // Seed the id counters by QUIC convention (§6.1): client bidi
+            // `0,4,8…`/uni `2,6,10…`; server bidi `1,5,9…`/uni `3,7,11…`.
+            next_bidi_id: if is_server { 1 } else { 0 },
+            next_uni_id: if is_server { 3 } else { 2 },
+            open_bidi: VecDeque::new(),
+            open_uni: VecDeque::new(),
             recv: HashMap::new(),
             send: HashMap::new(),
             runnable_send: VecDeque::new(),
@@ -503,6 +591,8 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             shared,
             accept_terminal_bidi,
             accept_terminal_uni,
+            accept_bidi_resume,
+            accept_uni_resume,
         };
 
         (driver, handles)
@@ -580,6 +670,11 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         if no_packet {
             self.run_read_pump(qconn);
         }
+        // (c) Open-materialization stage (§6.1): worker-owned id allocation for
+        // locally-requested opens, bounded by OPEN_BUDGET and gated on peer
+        // flow control. Placed before the send stages so a freshly opened
+        // stream can be written in the same iteration.
+        self.stage_open(qconn);
         self.stage_writable(qconn);
         self.stage_send(qconn);
         // Common per-iteration boundary: clear only the pump-selection flag.
@@ -1165,8 +1260,9 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
     }
 
     /// Mark the recv direction done: release the registry entry (sealing edge —
-    /// no more bytes), drop cursor memberships, set `recv_done`, and run the
-    /// terminal transition (§5.1 terminal transition).
+    /// no more bytes), drop cursor memberships, set `recv_done`, run the terminal
+    /// transition, and reclaim a retained (finished) send entry now that both
+    /// directions are terminal (§5.1 terminal transition, §6.2 invariant 8).
     fn mark_recv_done(&mut self, id: u64) {
         self.recv.remove(&id);
         self.drop_recv_memberships(id);
@@ -1174,6 +1270,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             *recv_done = true;
         }
         self.terminal_transition(id);
+        self.reclaim_finished_send(id);
     }
 
     /// Normal local abandonment of a recv half (dropped `H3RecvStream`): issue an
@@ -1328,10 +1425,18 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                     // (§5.2, finding 4).
                     self.clean_undelivered_peer_streams(qconn);
                 }
+                DriverCommand::OpenBidi { reply } => {
+                    // Queued for the open-materialization stage (§6.1): id
+                    // allocation is worker-owned, deferred until peer flow
+                    // control permits it.
+                    self.open_bidi.push_back(reply);
+                }
+                DriverCommand::OpenUni { reply } => {
+                    self.open_uni.push_back(reply);
+                }
                 // A non-first `Close` (guard above failed) is an idempotent
-                // no-op; Open* replies are driven by Phase 6 (resolved locally on
-                // the close-admission path via `shared.conn_terminal`).
-                _ => {}
+                // no-op.
+                DriverCommand::Close { .. } => {}
             }
         }
         if !self.inbox.is_empty() {
@@ -1364,6 +1469,177 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             if self.pending_admit.remove(&id).is_some() {
                 self.shutdown_peer_directions(qconn, id, is_bidi(id));
             }
+        }
+    }
+
+    /// Open-materialization stage (§6.1). For up to [`OPEN_BUDGET`] queued
+    /// `OpenBidi`/`OpenUni` requests per direction: skip a cancelled poller
+    /// (`reply.is_closed()`) burning no id; stop (leaving the request queued and
+    /// forcing another iteration) when peer stream credit is exhausted; else
+    /// allocate the next id by convention, materialize transport state with
+    /// `stream_priority(id, 127, true)`, increment the counter **only after**
+    /// success, build the halves retaining live registry state, and deliver them
+    /// through the reply. A reply that fails *after* materialization (the poller
+    /// cancelled in the window) triggers the §6.2 direction-aware cleanup so the
+    /// stream credit is reclaimed.
+    fn stage_open<C: QuicConn>(&mut self, qconn: &mut C) {
+        self.stage_open_bidi(qconn);
+        self.stage_open_uni(qconn);
+    }
+
+    fn stage_open_bidi<C: QuicConn>(&mut self, qconn: &mut C) {
+        let mut budget = OPEN_BUDGET;
+        while budget > 0 {
+            let reply = match self.open_bidi.pop_front() {
+                Some(reply) => reply,
+                None => break,
+            };
+            budget -= 1;
+            // (1) Cancelled before materialization: no id burned.
+            if reply.is_closed() {
+                continue;
+            }
+            // (2) No peer credit: leave queued and STOP, WITHOUT setting
+            // needs_iteration — blocking on stream credit must not hot-spin
+            // (§5.2 progress bound). The peer's MAX_STREAMS is always a packet,
+            // which drives the retry via the next process_writes iteration. Use
+            // `return` (not `break`) so the budget-backlog check below is skipped
+            // on the credit-blocked path.
+            if qconn.peer_streams_left_bidi() == 0 {
+                self.open_bidi.push_front(reply);
+                return;
+            }
+            // (3) Allocate the next bidi id by convention.
+            let id = self.next_bidi_id;
+            // (4) Materialize transport state deterministically (§6.1 spike Q1).
+            let cmd_tx = match self.cmd_tx_weak.upgrade() {
+                Some(cmd_tx) => cmd_tx,
+                None => {
+                    // Teardown underway: resolve locally with the terminal.
+                    let _ = reply.send(Err(self.open_terminal()));
+                    continue;
+                }
+            };
+            if qconn.stream_priority(id, 127, true).is_err() {
+                // Credit was reported available, so this is unexpected: resolve
+                // locally without burning the id (counter not advanced).
+                let _ = reply.send(Err(self.open_terminal()));
+                continue;
+            }
+            // (5) Advance the counter only after materialization succeeded.
+            self.next_bidi_id = id.wrapping_add(4);
+            // (6) Build both halves, retaining live registry state.
+            let (recv_state, recv_handoff, _recv_done) = self.build_recv(id, cmd_tx.clone(), None);
+            let (send_handoff, send_state, _send_done) = build_send(id, cmd_tx, None);
+            if let Some(state) = recv_state {
+                self.recv.insert(id, state);
+            }
+            if let Some(state) = send_state {
+                self.send.insert(id, state);
+            }
+            let handoff = BidiHandoff {
+                send: send_handoff,
+                recv: recv_handoff,
+            };
+            if let Err(undelivered) = reply.send(Ok(handoff)) {
+                // Cancelled after materialization (§6.2): reclaim both directions.
+                drop(undelivered);
+                self.cleanup_undeliverable_open(qconn, id, true);
+            }
+        }
+        // Budget exhausted with eligible requests still queued (not blocked on
+        // credit, which returns early): force another iteration so the backlog
+        // drains instead of waiting for an unrelated event.
+        if !self.open_bidi.is_empty() {
+            self.needs_iteration = true;
+        }
+    }
+
+    fn stage_open_uni<C: QuicConn>(&mut self, qconn: &mut C) {
+        let mut budget = OPEN_BUDGET;
+        while budget > 0 {
+            let reply = match self.open_uni.pop_front() {
+                Some(reply) => reply,
+                None => break,
+            };
+            budget -= 1;
+            if reply.is_closed() {
+                continue;
+            }
+            // No peer credit: leave queued and STOP without hot-spinning; the
+            // peer's MAX_STREAMS packet drives the retry (§5.2, §6.1).
+            if qconn.peer_streams_left_uni() == 0 {
+                self.open_uni.push_front(reply);
+                return;
+            }
+            let id = self.next_uni_id;
+            let cmd_tx = match self.cmd_tx_weak.upgrade() {
+                Some(cmd_tx) => cmd_tx,
+                None => {
+                    let _ = reply.send(Err(self.open_terminal()));
+                    continue;
+                }
+            };
+            if qconn.stream_priority(id, 127, true).is_err() {
+                let _ = reply.send(Err(self.open_terminal()));
+                continue;
+            }
+            self.next_uni_id = id.wrapping_add(4);
+            let (send_handoff, send_state, _send_done) = build_send(id, cmd_tx, None);
+            if let Some(state) = send_state {
+                self.send.insert(id, state);
+            }
+            if let Err(undelivered) = reply.send(Ok(send_handoff)) {
+                // Cancelled after materialization (§6.2): a locally-initiated uni
+                // stream is send-only, so only `Shutdown::Write` is valid.
+                drop(undelivered);
+                self.cleanup_undeliverable_open(qconn, id, false);
+            }
+        }
+        if !self.open_uni.is_empty() {
+            self.needs_iteration = true;
+        }
+    }
+
+    /// The terminal handed to an open reply that the worker declines to
+    /// materialize (teardown / unexpected `stream_priority` failure): the
+    /// published connection terminal if present, else an adapter-bug `Internal`
+    /// (never a bare cancel, §5.2 M3).
+    fn open_terminal(&self) -> Arc<ConnTerminal> {
+        self.shared
+            .conn_terminal
+            .get()
+            .unwrap_or_else(|| Arc::new(ConnTerminal::Internal("open declined without a terminal")))
+    }
+
+    /// Reclaim the transport credit of a just-materialized stream whose open
+    /// reply became undeliverable (the poller cancelled in the window between
+    /// `reply.is_closed()` and `reply.send`, §6.2). Direction-aware: a **bidi**
+    /// open shuts down both directions; a **uni** (send-only, locally initiated)
+    /// open shuts down only `Shutdown::Write` — `Shutdown::Read` on it returns
+    /// `InvalidStreamState`. Drops any retained registry state first so no stale
+    /// half lingers. Idempotent (safe with no registry entry).
+    fn cleanup_undeliverable_open<C: QuicConn>(&mut self, qconn: &mut C, id: u64, bidi: bool) {
+        self.send.remove(&id);
+        let _ = qconn.stream_shutdown(id, Shutdown::Write, H3_REQUEST_CANCELLED);
+        if bidi {
+            self.recv.remove(&id);
+            let _ = qconn.stream_shutdown(id, Shutdown::Read, H3_REQUEST_CANCELLED);
+        }
+    }
+
+    /// Reclaim a retained send entry once its direction is terminal and the recv
+    /// half is no longer live (§6.2, invariant 8). Called from the drop-driven
+    /// cleanup edges (a serviced FIN/reset, or a recv-half terminal) where no
+    /// further `Send`/`Finish` can arrive, so the sticky `self.send` entry —
+    /// retained for late deferred ops — is safe to drop for locally-opened AND
+    /// admitted streams. Not called from the generic peer-driven send terminal
+    /// (§5.3a) where the front-end send handle may still enqueue work.
+    fn reclaim_finished_send(&mut self, id: u64) {
+        let finished = self.send.get(&id).map(|s| s.finished).unwrap_or(false);
+        if finished && !self.recv.contains_key(&id) {
+            self.send.remove(&id);
+            self.admit.remove(&id);
         }
     }
 
@@ -1438,12 +1714,16 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         self.mark_send_done(id);
     }
 
-    /// Mark the send direction done (§5.3a): release runnable membership, set
-    /// `send_done`, and run the contract-A terminal transition. The `send`
-    /// registry entry is **retained** (with its sticky `terminal`) so an op that
-    /// arrives after the terminal still completes immediately once; contract A
-    /// removes it only when the recv direction is also terminal.
+    /// Mark the send direction done (§5.3a): flag the entry `finished`, release
+    /// runnable membership, set `send_done`, and run the contract-A terminal
+    /// transition. The `send` registry entry is **retained** (with its sticky
+    /// `terminal`) so an op that arrives after the terminal still completes
+    /// immediately once; the drop-driven cleanup (§6.2) removes it once both
+    /// directions are terminal and the front-end halves are gone.
     fn mark_send_done(&mut self, id: u64) {
+        if let Some(state) = self.send.get_mut(&id) {
+            state.finished = true;
+        }
         self.drop_send_membership(id);
         if let Some(AdmitState::Registered { send_done, .. }) = self.admit.get_mut(&id) {
             *send_done = true;
@@ -1492,6 +1772,11 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             // Emit RESET_STREAM even at zero send capacity (§14 Q3 assumption).
             let _ = qconn.stream_shutdown(id, Shutdown::Write, code);
             self.mark_send_done(id);
+            // Note: the retained `self.send` entry is deliberately NOT reclaimed
+            // here — a still-live handle may issue a late `Send` (or a duplicate
+            // `Reset`) that must resolve idempotently against the sticky terminal
+            // (§5.3a). Reclamation happens once the recv half is also terminal
+            // (`mark_recv_done`) or via a graceful drop-`Finish`.
             return TurnOutcome::Drop;
         }
         // 2. Stale/terminal id: nothing to send. Evicted (already popped).
@@ -1577,6 +1862,10 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 // a later Send/Finish completes via the retained sticky state
                 // (§5.3a).
                 self.mark_send_done(id);
+                // The retained entry is reclaimed at the recv-done edge
+                // (`mark_recv_done`), i.e. once BOTH directions are terminal —
+                // a still-live send handle may still complete a late op against
+                // the sticky state until then (§5.3a, §6.2 invariant 8).
                 TurnOutcome::Drop
             }
             Err(err) => self.classify_send_err(qconn, id, &err),
@@ -1733,6 +2022,16 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             };
             self.complete_command_on_close(cmd, &terminal);
         }
+        // Also resolve open requests already moved into the staging queues by
+        // stage (a) — their reply senders are not in cmd_rx (§5.2 finite cut,
+        // §6.1). Every pending opener is woken with the classified terminal
+        // rather than only later via sender-drop cancellation.
+        for reply in self.open_bidi.drain(..) {
+            let _ = reply.send(Err(Arc::clone(&terminal)));
+        }
+        for reply in self.open_uni.drain(..) {
+            let _ = reply.send(Err(Arc::clone(&terminal)));
+        }
     }
 
     /// Resolve one drained command against the published connection terminal
@@ -1801,6 +2100,7 @@ fn build_send<B: Buf>(
             pending_reset: None,
             terminal: None,
             status,
+            finished: false,
         })
     };
     (handoff, state, send_done)
@@ -1892,7 +2192,8 @@ mod tests {
     use super::*;
 
     fn driver() -> (QuicheDriver<Bytes>, DriverHandles<Bytes>) {
-        QuicheDriver::<Bytes>::new(4, 4)
+        // Default to the client convention (locally-opened bidi `0,4,8…`).
+        QuicheDriver::<Bytes>::new(false, 4, 4)
     }
 
     #[test]
@@ -2092,7 +2393,7 @@ mod tests {
     /// exactly once; after `AcceptBidiResume` + capacity it is promoted once.
     #[test]
     fn parked_stream_single_admit_then_promote() {
-        let (mut d, mut h) = QuicheDriver::<Bytes>::new(1, 1);
+        let (mut d, mut h) = QuicheDriver::<Bytes>::new(false, 1, 1);
         let mut c = MockConn::new();
         c.script_recv(0, [data(b"a", false)]);
         c.script_recv(4, [data(b"b", false)]);
@@ -3018,6 +3319,204 @@ mod tests {
         assert!(c.shutdowns.iter().any(|s| s.id == 2 && !s.is_write));
         assert!(!c.shutdowns.iter().any(|s| s.id == 2 && s.is_write));
     }
+
+    // ===== §6.1 worker-side open materialization =====
+
+    fn push_open_bidi(
+        d: &mut QuicheDriver<Bytes>,
+    ) -> oneshot::Receiver<Result<BidiHandoff<Bytes>, Arc<ConnTerminal>>> {
+        let (tx, rx) = oneshot::channel();
+        d.inbox.push_back(DriverCommand::OpenBidi { reply: tx });
+        rx
+    }
+
+    fn push_open_uni(
+        d: &mut QuicheDriver<Bytes>,
+    ) -> oneshot::Receiver<Result<SendHandoff<Bytes>, Arc<ConnTerminal>>> {
+        let (tx, rx) = oneshot::channel();
+        d.inbox.push_back(DriverCommand::OpenUni { reply: tx });
+        rx
+    }
+
+    /// §6.1: a client bidi open materializes id `0` via `stream_priority(id,127,
+    /// true)` **once**, advances the counter by 4, retains live registry halves,
+    /// and delivers a `BidiHandoff` through the reply.
+    #[test]
+    fn stage_open_bidi_allocates_one_id_and_increments_counter() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        c.streams_left_bidi = 4;
+        let mut reply = push_open_bidi(&mut d);
+        d.apply_inbox(&mut c);
+        assert_eq!(d.next_bidi_id, 0, "counter unchanged before materialization");
+        d.stage_open(&mut c);
+
+        // Exactly one materialization call, at the h3 default priority.
+        assert_eq!(c.priorities, vec![(0, 127, true)]);
+        assert_eq!(d.next_bidi_id, 4, "counter advances by 4 after success");
+        // Live registry halves retained on both directions.
+        assert!(d.recv.contains_key(&0));
+        assert!(d.send.contains_key(&0));
+        // The reply carries both halves for id 0.
+        match reply.try_recv() {
+            Ok(Ok(handoff)) => {
+                assert_eq!(handoff.send.id, 0);
+                assert_eq!(handoff.recv.id, 0);
+            }
+            _ => panic!("expected BidiHandoff"),
+        }
+        assert!(d.open_bidi.is_empty());
+    }
+
+    /// §6.1: a uni open materializes the next uni id (`2` for a client) and
+    /// hands back only a send half.
+    #[test]
+    fn stage_open_uni_allocates_send_only() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        c.streams_left_uni = 4;
+        let mut reply = push_open_uni(&mut d);
+        d.apply_inbox(&mut c);
+        d.stage_open(&mut c);
+
+        assert_eq!(c.priorities, vec![(2, 127, true)]);
+        assert_eq!(d.next_uni_id, 6);
+        assert!(d.send.contains_key(&2));
+        assert!(!d.recv.contains_key(&2), "uni open has no recv half");
+        match reply.try_recv() {
+            Ok(Ok(handoff)) => assert_eq!(handoff.id, 2),
+            _ => panic!("expected SendHandoff"),
+        }
+    }
+
+    /// §6.1 step 1: a reply whose receiver was already dropped is skipped — no
+    /// id is burned, no `stream_priority` call is made.
+    #[test]
+    fn stage_open_is_closed_skips_no_id_burned() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        c.streams_left_bidi = 4;
+        let reply = push_open_bidi(&mut d);
+        drop(reply); // poller cancelled before materialization.
+        d.apply_inbox(&mut c);
+        d.stage_open(&mut c);
+
+        assert!(c.priorities.is_empty(), "no id materialized for a dead reply");
+        assert_eq!(d.next_bidi_id, 0, "counter not advanced");
+        assert!(d.open_bidi.is_empty());
+        assert!(!d.send.contains_key(&0));
+        assert!(!d.recv.contains_key(&0));
+    }
+
+    /// §6.1 step 2: zero peer credit leaves the request queued; no id is
+    /// allocated and the worker does NOT hot-spin (blocking on stream credit is
+    /// re-driven by the peer's MAX_STREAMS packet, not a self-reschedule).
+    #[test]
+    fn stage_open_zero_credit_defers_request() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        c.streams_left_bidi = 0;
+        let _reply = push_open_bidi(&mut d);
+        d.apply_inbox(&mut c);
+        d.needs_iteration = false;
+        d.stage_open(&mut c);
+
+        assert!(c.priorities.is_empty());
+        assert_eq!(d.next_bidi_id, 0);
+        assert_eq!(d.open_bidi.len(), 1, "request stays queued");
+        assert!(
+            !d.needs_iteration,
+            "blocking on stream credit must not hot-spin (§5.2 progress bound)"
+        );
+    }
+
+    /// §6.2: the direction-aware cleanup for a cancelled-after-materialize bidi
+    /// shuts down BOTH directions with `H3_REQUEST_CANCELLED` and drops both
+    /// retained halves; a uni cleanup touches only `Shutdown::Write`.
+    #[test]
+    fn cleanup_undeliverable_open_is_direction_aware() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        // Simulate retained halves for a materialized-but-undeliverable bidi.
+        let cmd_tx = d.cmd_tx_weak.upgrade().unwrap();
+        let (recv_state, _rh, _rd) = d.build_recv(0, cmd_tx.clone(), None);
+        let (_sh, send_state, _sd) = build_send(0, cmd_tx, None);
+        d.recv.insert(0, recv_state.unwrap());
+        d.send.insert(0, send_state.unwrap());
+
+        d.cleanup_undeliverable_open(&mut c, 0, true);
+        assert!(!d.recv.contains_key(&0));
+        assert!(!d.send.contains_key(&0));
+        let bidi_shuts: Vec<&crate::conn::mock::ShutdownCall> = c.shutdowns.iter().filter(|s| s.id == 0).collect();
+        assert!(bidi_shuts.iter().any(|s| s.is_write && s.code == H3_REQUEST_CANCELLED));
+        assert!(bidi_shuts.iter().any(|s| !s.is_write && s.code == H3_REQUEST_CANCELLED));
+
+        // Uni: only Shutdown::Write.
+        let (_sh, send_state, _sd) = build_send(2, d.cmd_tx_weak.upgrade().unwrap(), None);
+        d.send.insert(2, send_state.unwrap());
+        d.cleanup_undeliverable_open(&mut c, 2, false);
+        assert!(!d.send.contains_key(&2));
+        let uni_shuts: Vec<&crate::conn::mock::ShutdownCall> = c.shutdowns.iter().filter(|s| s.id == 2).collect();
+        assert_eq!(uni_shuts.len(), 1);
+        assert!(uni_shuts[0].is_write && uni_shuts[0].code == H3_REQUEST_CANCELLED);
+    }
+
+    /// §6.1: a server-role driver allocates the server bidi parity (`1,5,9…`).
+    #[test]
+    fn stage_open_bidi_uses_server_parity() {
+        let (mut d, _h) = QuicheDriver::<Bytes>::new(true, 4, 4);
+        let mut c = MockConn::new();
+        c.streams_left_bidi = 4;
+        let _reply = push_open_bidi(&mut d);
+        d.apply_inbox(&mut c);
+        d.stage_open(&mut c);
+        assert_eq!(c.priorities, vec![(1, 127, true)]);
+        assert_eq!(d.next_bidi_id, 5);
+    }
+
+    // Regression (review finding): >OPEN_BUDGET eligible opens with credit must
+    // set needs_iteration after budget exhaustion so the backlog drains, instead
+    // of stalling until an unrelated event.
+    #[test]
+    fn open_backlog_past_budget_sets_needs_iteration() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        c.streams_left_bidi = u64::MAX; // ample credit
+        // Keep the reply receivers alive (a dropped reply is skipped as closed).
+        let _replies: Vec<_> = (0..(OPEN_BUDGET + 4)).map(|_| push_open_bidi(&mut d)).collect();
+        d.apply_inbox(&mut c);
+        d.needs_iteration = false;
+        d.stage_open(&mut c);
+        // Exactly OPEN_BUDGET materialized this pass; the rest remain queued and
+        // force another iteration (no stall).
+        assert_eq!(c.priorities.len(), OPEN_BUDGET);
+        assert_eq!(d.open_bidi.len(), 4);
+        assert!(d.needs_iteration, "backlog must force another iteration");
+    }
+
+    // Regression (review finding): on_conn_close must resolve open requests
+    // already staged into open_bidi/open_uni (not just those in cmd_rx), waking
+    // pending openers with the classified terminal.
+    #[test]
+    fn on_conn_close_drains_staged_open_queues() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        // Move opens into the staged queues (apply_inbox), but do NOT run
+        // stage_open, so they sit in open_bidi/open_uni.
+        let mut bidi_reply = push_open_bidi(&mut d);
+        let mut uni_reply = push_open_uni(&mut d);
+        d.apply_inbox(&mut c);
+        assert_eq!(d.open_bidi.len(), 1);
+        assert_eq!(d.open_uni.len(), 1);
+
+        c.peer_error = Some(conn_err(true, 0x3, b""));
+        d.do_on_conn_close(&mut c);
+
+        assert!(matches!(bidi_reply.try_recv(), Ok(Err(_))), "staged bidi open resolved");
+        assert!(matches!(uni_reply.try_recv(), Ok(Err(_))), "staged uni open resolved");
+        assert!(d.open_bidi.is_empty());
+        assert!(d.open_uni.is_empty());
+    }
 }
 
 /// Phase 2 loopback: a real handshake reaches `on_conn_established` on both
@@ -3101,7 +3600,7 @@ mod loopback_tests {
         // --- server ---
         let server_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_udp.local_addr().unwrap();
-        let (server_driver, server_handles) = QuicheDriver::<Bytes>::new(8, 8);
+        let (server_driver, server_handles) = QuicheDriver::<Bytes>::new(true, 8, 8);
         let mut listeners =
             tokio_quiche::listen([server_udp], server_params(&certs), DefaultMetrics)
                 .expect("listen");
@@ -3119,7 +3618,7 @@ mod loopback_tests {
         let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client_udp.connect(server_addr).await.unwrap();
         let client_socket = Socket::try_from(client_udp).expect("socket");
-        let (client_driver, client_handles) = QuicheDriver::<Bytes>::new(8, 8);
+        let (client_driver, client_handles) = QuicheDriver::<Bytes>::new(false, 8, 8);
 
         let params = client_params();
         let conn = connect_with_config(client_socket, Some("localhost"), &params, client_driver)
