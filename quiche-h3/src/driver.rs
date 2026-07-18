@@ -22,10 +22,11 @@ use tokio_quiche::quic::HandshakeInfo;
 use tokio_quiche::quic::QuicheConnection;
 use tokio_quiche::{ApplicationOverQuic, QuicResult};
 
-use crate::buffer::{TerminalCell, MAX_CHUNK, PKT_BUF_LEN};
+use crate::buffer::{send_from_buf, TerminalCell, MAX_CHUNK, PKT_BUF_LEN};
 use crate::conn::QuicConn;
 use crate::error::{
-    classify_stream_recv_error, ConnTerminal, RecvEnd, SendEnd, StreamRecvClass, H3_NO_ERROR,
+    classify_stream_recv_error, classify_stream_send_error, ConnTerminal, RecvEnd, SendEnd,
+    StreamRecvClass, StreamSendClass, H3_NO_ERROR,
 };
 use crate::quiche::{self, Shutdown};
 
@@ -57,6 +58,24 @@ const CHUNK_BUDGET: usize = 16;
 /// Bounded per-recv byte-channel depth; the per-stream in-flight memory bound is
 /// `BYTE_CHANNEL_DEPTH × MAX_CHUNK` (§5.1, provisional §12 S3).
 const BYTE_CHANNEL_DEPTH: usize = 64;
+
+/// Max commands applied per `process_writes` stage (a) (§5.2). Excess stays in
+/// `inbox` (relative order preserved) and re-forces an iteration.
+const CMD_BUDGET: usize = 64;
+
+/// Max `stream_writable_next()` ids consumed by stage (d) per iteration (§5.5).
+const WRITABLE_BUDGET: usize = 32;
+
+/// Max round-robin runnable-send turns per stage (e) (§5.3a, invariant 12).
+const WRITE_BUDGET: usize = 32;
+
+/// Cap on the bytes offered to a single `stream_send` turn (§5.3a "one bounded
+/// transport call").
+const MAX_WRITE_CHUNK: usize = MAX_CHUNK;
+
+/// Small low-water re-arm progress threshold (§5.3): any capacity gain wakes a
+/// blocked write, rather than starving it on the full remaining length.
+const REARM_THRESHOLD: usize = 1;
 
 /// Stream-class helper: a bidirectional stream has bit 0x2 clear (§5.5).
 #[inline]
@@ -170,6 +189,56 @@ pub(crate) struct StreamRecvState {
     pub(crate) blocked: bool,
 }
 
+/// One ordered send operation queued for a stream (§5.3a). `Write` carries the
+/// caller's `WriteBuf` cursor (partial-consumed across turns) and its completion
+/// oneshot; `Finish` carries only its completion oneshot.
+pub(crate) enum SendOp<B: Buf> {
+    Write {
+        buf: h3::quic::WriteBuf<B>,
+        done: oneshot::Sender<Result<(), SendEnd>>,
+    },
+    Finish {
+        done: oneshot::Sender<Result<(), SendEnd>>,
+    },
+}
+
+impl<B: Buf> SendOp<B> {
+    /// Resolve this op's completion oneshot exactly once (§5.3a exactly-once).
+    fn complete(self, result: Result<(), SendEnd>) {
+        let done = match self {
+            SendOp::Write { done, .. } => done,
+            SendOp::Finish { done } => done,
+        };
+        // Ignore send error: the front end may have stopped polling (drop).
+        let _ = done.send(result);
+    }
+}
+
+/// Worker-owned send-registry state for a live send half (§5.3a). Holds the
+/// ordered `send_ops` queue, a possible `pending_reset` (serviced before any
+/// generic terminal/stale eviction, invariant 11), a local sticky `terminal`
+/// copy for fast checks, and the `status` cell shared with the front-end handle
+/// so a published send terminal is observable out of band (§8.2).
+pub(crate) struct StreamSendState<B: Buf> {
+    pub(crate) send_ops: VecDeque<SendOp<B>>,
+    pub(crate) pending_reset: Option<u64>,
+    pub(crate) terminal: Option<SendEnd>,
+    pub(crate) status: TerminalCell<SendEnd>,
+}
+
+impl<B: Buf> StreamSendState<B> {
+    /// A fresh live send half with its own status cell (lazy-create path for a
+    /// locally-materialized stream; Phase 6 shares the cell with the handle).
+    fn new() -> Self {
+        StreamSendState {
+            send_ops: VecDeque::new(),
+            pending_reset: None,
+            terminal: None,
+            status: TerminalCell::new(),
+        }
+    }
+}
+
 /// Admission state of an *observed* peer stream id (§5, invariant 7). `admit`
 /// holds only ids we have actually seen — there is no high-watermark and no
 /// reclaim subsystem: contract A drops the entry at the terminal edge (§5.5).
@@ -281,6 +350,13 @@ pub(crate) struct QuicheDriver<B: Buf = Bytes> {
     // ----- per-stream receive registry + admission bookkeeping (§5, §5.1) -----
     /// Live recv halves: bounded byte sender + out-of-band terminal + resume bit.
     recv: HashMap<u64, StreamRecvState>,
+    /// Live send halves: ordered `send_ops`, `pending_reset`, sticky terminal,
+    /// and the front-end-shared `status` cell (§5.3a).
+    send: HashMap<u64, StreamSendState<B>>,
+    /// Round-robin queue of stream ids with runnable send work, with a
+    /// membership set for exact-once queueing (§5.3a, invariant 12).
+    runnable_send: VecDeque<u64>,
+    runnable_send_set: HashSet<u64>,
     /// Admission state of every *observed* peer stream id (invariant 7). No
     /// high-watermark; contract A drops entries at the terminal edge (§5.5).
     admit: HashMap<u64, AdmitState>,
@@ -347,6 +423,9 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             accept_bidi_resume: Arc::new(AtomicBool::new(false)),
             accept_uni_resume: Arc::new(AtomicBool::new(false)),
             recv: HashMap::new(),
+            send: HashMap::new(),
+            runnable_send: VecDeque::new(),
+            runnable_send_set: HashSet::new(),
             admit: HashMap::new(),
             pending_readable: VecDeque::new(),
             readable_set: HashSet::new(),
@@ -394,19 +473,20 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         }
     }
 
-    /// The shared read pump (§5.1), the sole discovery + admission + receive
-    /// engine, run **exactly once per acting iteration** (§2.3, invariant 9). It
-    /// is generic over [`QuicConn`] so it is unit-testable against `MockConn`;
-    /// the concrete `QuicheConnection` satisfies the bound, so the
-    /// `ApplicationOverQuic` callbacks pass `&mut QuicheConnection` unchanged.
+    /// The shared read pump (§5.1), the sole **readable-path** discovery +
+    /// admission + receive engine, run **exactly once per acting iteration**
+    /// (§2.3, invariant 9). It is generic over [`QuicConn`] so it is
+    /// unit-testable against `MockConn`; the concrete `QuicheConnection`
+    /// satisfies the bound, so the `ApplicationOverQuic` callbacks pass
+    /// `&mut QuicheConnection` unchanged.
     ///
-    /// Control flow: bounded destructive intake (readable then writable) →
-    /// resumed-read drain → phase-1 registered-drain → phase-2 admission →
-    /// parked promotion. All receive chunk work shares the single
-    /// [`read_budget`](Self::read_budget) (iter11 finding 5).
+    /// Control flow: bounded destructive readable intake → resumed-read drain →
+    /// phase-1 registered-drain → phase-2 admission → parked promotion. The
+    /// **writable**-path scan is stage (d), run from `process_writes`
+    /// (§5.3a, §5.5), not here — the read pump owns the readable path only. All
+    /// receive chunk work shares the single [`read_budget`](Self::read_budget).
     fn run_read_pump<C: QuicConn>(&mut self, qconn: &mut C) {
         self.intake_readable(qconn);
-        self.intake_writable(qconn);
         self.drain_resumed(qconn);
         self.phase1_registered_drain(qconn);
         self.phase2_admission(qconn);
@@ -428,20 +508,29 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
     }
 
     /// Every-iteration acting body (generic for testing; the
-    /// `ApplicationOverQuic::process_writes` callback delegates here). Applies
-    /// queued commands, then on the no-packet path (process_reads skipped) treats
-    /// this as the iteration start — resets `needs_iteration` and runs the pump.
-    /// On a packet iteration the pump already ran, so it is neither reset nor
-    /// re-run, preserving the pump's deferral. The Phases 4–5 send/close stages
-    /// run here and may set `needs_iteration`; it is left as the stages computed
-    /// it (§5.1 finding 5).
+    /// `ApplicationOverQuic::process_writes` callback delegates here). Stage
+    /// order (§5 process_writes): (a) apply queued commands; (b) on the no-packet
+    /// path (process_reads skipped) run the readable read pump — this is the
+    /// iteration start, so `needs_iteration`/`read_budget` are reset here; on a
+    /// packet iteration the pump already ran and its deferral is preserved;
+    /// (d) the single destructive **writable** scan; (e) the round-robin
+    /// runnable-send drain. The Phase 5 close barrier will slot between (e) and
+    /// teardown. Stages (d)/(e) run once per iteration on both paths, preserving
+    /// the single-writable-scan-per-iteration contract (§5.3a).
     fn do_process_writes<C: QuicConn>(&mut self, qconn: &mut C) {
-        self.apply_inbox(qconn);
-        if !self.reads_ran_this_iter {
+        let no_packet = !self.reads_ran_this_iter;
+        if no_packet {
+            // No-packet iteration start: reset the per-iteration signals before
+            // any stage that may set them (§2.3; do NOT blanket-clear).
             self.needs_iteration = false;
             self.read_budget = READ_BUDGET;
+        }
+        self.apply_inbox(qconn);
+        if no_packet {
             self.run_read_pump(qconn);
         }
+        self.stage_writable(qconn);
+        self.stage_send(qconn);
         // Common per-iteration boundary: clear only the pump-selection flag.
         self.reads_ran_this_iter = false;
     }
@@ -477,32 +566,62 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         }
     }
 
-    /// Bounded destructive writable intake for peer-**bidi** discovery (§5.5).
+    /// Stage (d): the single destructive **writable** scan per acting iteration
+    /// (§5 process_writes, §5.3a, §5.5). Bounded by [`WRITABLE_BUDGET`], it
+    /// destructively drains `stream_writable_next()` and routes each id:
+    ///
+    /// - **registered send half** (`self.send`): probe `stream_capacity`. A
+    ///   `StreamStopped(code)` (and no earlier local reset owning the terminal)
+    ///   runs the send-terminal transition — draining `send_ops` once before any
+    ///   runnable eviction (invariant 13). Otherwise, if capacity is available
+    ///   and the stream has pending send work, mark it runnable exactly once.
+    /// - **new / parked / pending peer bidi id**: the same admission-capture path
+    ///   the old readable/writable intake used, including the `STOP_SENDING`
+    ///   `stream_capacity` probe for a not-yet-registered id (§5.5, §14 Q4).
+    ///
     /// Per outcome 3, only ids `stream_writable_next()` actually returns are
     /// handled — no discovery is synthesized at zero connection send capacity.
-    /// The full registered-send stage (d) arrives with the send state machine
-    /// (Phases 4–5); here the writable path admits *new* peer bidi ids and
-    /// captures a peer `STOP_SENDING` for not-yet-registered ids so the send
-    /// half is marked terminal at admission (§5.5, §14 Q4). A **registered**
-    /// stream's `STOP_SENDING` is owned by the Phase 4 send machine (which holds
-    /// the send `status` cell), so it is not handled here.
-    fn intake_writable<C: QuicConn>(&mut self, qconn: &mut C) {
+    fn stage_writable<C: QuicConn>(&mut self, qconn: &mut C) {
         let mut n = 0;
-        while n < DISCOVERY_BUDGET {
+        while n < WRITABLE_BUDGET {
             let id = match qconn.stream_writable_next() {
                 Some(id) => id,
                 None => break,
             };
             n += 1;
-            // A peer uni stream is receive-only locally and is never writable;
-            // only a new peer bidi id enters admission via this path.
+            // A registered local send half (any class): the send machine owns it.
+            if self.send.contains_key(&id) {
+                match qconn.stream_capacity(id) {
+                    Err(quiche::Error::StreamStopped(code)) => {
+                        let owns_reset = self
+                            .send
+                            .get(&id)
+                            .map(|s| s.pending_reset.is_some() || s.terminal.is_some())
+                            .unwrap_or(false);
+                        if !owns_reset {
+                            self.send_terminal_transition(id, SendEnd::Stopped { error_code: code });
+                        }
+                    }
+                    _ => {
+                        let has_work = self
+                            .send
+                            .get(&id)
+                            .map(|s| !s.send_ops.is_empty() || s.pending_reset.is_some())
+                            .unwrap_or(false);
+                        if has_work {
+                            self.mark_send_runnable(id);
+                        }
+                    }
+                }
+                continue;
+            }
+            // Peer-stream discovery: only a peer bidi id enters admission via the
+            // writable path (a peer uni stream is receive-only locally).
             if !is_bidi(id) {
                 continue;
             }
-            // A registered stream's send terminal is the send machine's job.
-            if self.recv.contains_key(&id)
-                || matches!(self.admit.get(&id), Some(AdmitState::Registered { .. }))
-            {
+            if matches!(self.admit.get(&id), Some(AdmitState::Registered { .. })) {
+                // Registered with the send half already done: nothing to do.
                 continue;
             }
             // Probe for a peer STOP_SENDING (Q4: `stream_capacity` reports
@@ -525,9 +644,12 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 peer.pending_send_terminal = stopped;
                 self.pending_admit.insert(id, peer);
                 self.pending_admit_order.push_back(id);
+                // A new admission is pending: ensure stage (b) runs next iteration.
+                self.needs_iteration = true;
             }
         }
-        if n == DISCOVERY_BUDGET {
+        if n == WRITABLE_BUDGET {
+            // Pessimistic re-probe is cheaper than stranding a ready write (§5.5).
             self.needs_iteration = true;
         }
     }
@@ -814,10 +936,16 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             };
             let (recv_state, recv_handoff, recv_done) =
                 self.build_recv(id, cmd_tx.clone(), peer.pending_recv_terminal.take());
-            let (send_handoff, send_done) =
+            let (send_handoff, send_state, send_done) =
                 build_send(id, cmd_tx, peer.pending_send_terminal.take());
             if let Some(state) = recv_state {
                 self.recv.insert(id, state);
+            }
+            // Retain the live send half so a later STOP_SENDING / Send / Reset
+            // resolves through the SAME `status` cell the handle holds (§5.4
+            // invariant 7). A send-terminal-at-admission bidi has no live half.
+            if let Some(state) = send_state {
+                self.send.insert(id, state);
             }
             self.admit
                 .insert(id, AdmitState::Registered { send_done, recv_done });
@@ -969,6 +1097,12 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             self.admit.remove(&id);
             self.recv.remove(&id);
             self.drop_recv_memberships(id);
+            self.drop_send_membership(id);
+            // self.send is deliberately RETAINED: its sticky `terminal` still
+            // resolves a Send/Finish that was deferred in `cmd_rx` before the
+            // terminal edge (§5.3a "ops after a terminal"; §5.2 exactly-once).
+            // The send registry entry is reclaimed by front-end drop cleanup
+            // (§6.2, invariant 8), not by contract A.
         }
     }
 
@@ -989,11 +1123,42 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         }
     }
 
-    /// Apply queued control commands (§5.2). Phase 3 drives only the receive/
-    /// admission resume signals; the send/close/open command stages arrive in
-    /// Phases 4–5. Routing `RecvResume` here keeps the §5.1 resume path testable.
-    fn apply_inbox<C: QuicConn>(&mut self, _qconn: &mut C) {
-        while let Some(cmd) = self.inbox.pop_front() {
+    /// Add an id to the round-robin runnable-send queue with exact-once
+    /// membership (§5.3a). Idempotent: the non-runnable→runnable edge is the set
+    /// insert, so repeated calls never duplicate the id.
+    fn mark_send_runnable(&mut self, id: u64) {
+        if self.runnable_send_set.insert(id) {
+            self.runnable_send.push_back(id);
+        }
+    }
+
+    /// Drop an id's runnable-send membership (terminal / reset-serviced edge).
+    fn drop_send_membership(&mut self, id: u64) {
+        if self.runnable_send_set.remove(&id) {
+            self.runnable_send.retain(|queued| *queued != id);
+        }
+    }
+
+    /// Apply up to [`CMD_BUDGET`] queued control commands (§5.2 stage (a)):
+    /// drain `self.inbox` first, then `cmd_rx.try_recv()`. `Send`/`Finish` append
+    /// to the target stream's ordered `send_ops` and make it runnable on the
+    /// non-runnable→runnable edge; `Reset` is the FIFO-preemption exception;
+    /// `StopSending` shuts the recv half down like a local abandonment (§5.3a).
+    /// Excess commands stay in `inbox` in receipt order and re-force an iteration.
+    fn apply_inbox<C: QuicConn>(&mut self, qconn: &mut C) {
+        let mut budget = CMD_BUDGET;
+        while budget > 0 {
+            let cmd = match self.inbox.pop_front() {
+                Some(cmd) => cmd,
+                None => match self.cmd_rx.try_recv() {
+                    Ok(cmd) => cmd,
+                    // Empty: nothing more this iteration. Disconnected (all
+                    // senders dropped) is the last-handle teardown signal owned
+                    // by Phase 5; stage (a) here just stops draining.
+                    Err(_) => break,
+                },
+            };
+            budget -= 1;
             match cmd {
                 DriverCommand::RecvResume { id } => self.enqueue_resume(id),
                 DriverCommand::AcceptBidiResume => {
@@ -1002,14 +1167,312 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 DriverCommand::AcceptUniResume => {
                     self.accept_uni_resume.store(true, Ordering::Relaxed);
                 }
-                // Send / Finish / Reset / StopSending / Close / Open* /
-                // ConnectionDropped are driven by Phases 4–5.
+                DriverCommand::Send { id, buf, done } => {
+                    self.enqueue_send_op(id, SendOp::Write { buf, done });
+                }
+                DriverCommand::Finish { id, done } => {
+                    self.enqueue_send_op(id, SendOp::Finish { done });
+                }
+                DriverCommand::Reset { id, code } => self.apply_reset(id, code),
+                DriverCommand::StopSending { id, code } => {
+                    let _ = qconn.stream_shutdown(id, Shutdown::Read, code);
+                    self.mark_recv_done(id);
+                }
+                // Close / Open* / ConnectionDropped are driven by Phases 5–6.
                 _ => {}
+            }
+        }
+        if !self.inbox.is_empty() {
+            // Budget-deferred commands remain in receipt order (§5.2).
+            self.needs_iteration = true;
+        }
+    }
+
+    /// Append a `Write`/`Finish` op to a stream's send queue (§5.3a stage (a)).
+    /// If the send half is already terminal, complete the op **immediately once**
+    /// with the sticky terminal instead of enqueueing (never a bare cancel,
+    /// never a fabricated `Ok`). Otherwise queue it and make the id runnable.
+    fn enqueue_send_op(&mut self, id: u64, op: SendOp<B>) {
+        let state = self.send.entry(id).or_insert_with(StreamSendState::new);
+        if let Some(end) = state.terminal.clone() {
+            op.complete(Err(end));
+            return;
+        }
+        state.send_ops.push_back(op);
+        self.mark_send_runnable(id);
+    }
+
+    /// Apply the first effective `Reset` for a stream (§5.3a preemption): install
+    /// `pending_reset`, publish the sticky `SendEnd::Reset` (first-writer-wins),
+    /// drain every not-yet-accepted `Write`/`Finish` once with the effective
+    /// terminal, and make the id runnable so stage (e) emits `RESET_STREAM`
+    /// before any generic terminal/stale eviction (invariant 11). A later reset
+    /// is an idempotent no-op (does not replace the first effective reset).
+    fn apply_reset(&mut self, id: u64, code: u64) {
+        let state = self.send.entry(id).or_insert_with(StreamSendState::new);
+        // Idempotent: once a reset is pending OR the send half is already
+        // terminal (a prior reset serviced, or a peer STOP_SENDING/close), a
+        // later reset is a no-op — it must never schedule a second RESET_STREAM
+        // (§5.3a first-effective reset).
+        if state.pending_reset.is_some() || state.terminal.is_some() {
+            return;
+        }
+        state.pending_reset = Some(code);
+        let end = SendEnd::Reset { error_code: code };
+        // First-writer-wins: a prior peer STOP_SENDING keeps its `Stopped`.
+        state.status.set(end.clone());
+        if state.terminal.is_none() {
+            state.terminal = Some(end);
+        }
+        let terminal = state.terminal.clone().expect("terminal just set");
+        let ops: Vec<SendOp<B>> = state.send_ops.drain(..).collect();
+        for op in ops {
+            op.complete(Err(terminal.clone()));
+        }
+        self.mark_send_runnable(id);
+    }
+
+    /// The send-terminal transition (§5.3a, invariant 13): publish `end` to the
+    /// sticky `terminal` + shared `status` cell (first-writer-wins), drain
+    /// **every** not-yet-completed `send_ops` entry exactly once with `end`,
+    /// then mark the send half done and release runnable membership. Reusable by
+    /// stage (d) discovery, stage (e) `StreamStopped`, and (Phase 5) close.
+    fn send_terminal_transition(&mut self, id: u64, end: SendEnd) {
+        let ops: Vec<SendOp<B>> = match self.send.get_mut(&id) {
+            Some(state) => {
+                state.status.set(end.clone());
+                if state.terminal.is_none() {
+                    state.terminal = Some(end.clone());
+                }
+                state.send_ops.drain(..).collect()
+            }
+            None => return,
+        };
+        let terminal = self
+            .send
+            .get(&id)
+            .and_then(|s| s.terminal.clone())
+            .unwrap_or(end);
+        for op in ops {
+            op.complete(Err(terminal.clone()));
+        }
+        self.mark_send_done(id);
+    }
+
+    /// Mark the send direction done (§5.3a): release runnable membership, set
+    /// `send_done`, and run the contract-A terminal transition. The `send`
+    /// registry entry is **retained** (with its sticky `terminal`) so an op that
+    /// arrives after the terminal still completes immediately once; contract A
+    /// removes it only when the recv direction is also terminal.
+    fn mark_send_done(&mut self, id: u64) {
+        self.drop_send_membership(id);
+        if let Some(AdmitState::Registered { send_done, .. }) = self.admit.get_mut(&id) {
+            *send_done = true;
+        }
+        self.terminal_transition(id);
+    }
+
+    /// Stage (e): the round-robin runnable-send drain (§5.3a, invariant 12).
+    /// Pop at most [`WRITE_BUDGET`] ids from `runnable_send`; each pop (including
+    /// a stale/terminal id removed lazily) consumes one turn. A still-runnable id
+    /// returns at the tail, so a continuously-writable bulk stream cannot starve
+    /// later work. `needs_iteration` is set while runnable work remains.
+    fn stage_send<C: QuicConn>(&mut self, qconn: &mut C) {
+        let mut turns = WRITE_BUDGET;
+        while turns > 0 {
+            let id = match self.runnable_send.pop_front() {
+                Some(id) => id,
+                None => break,
+            };
+            self.runnable_send_set.remove(&id);
+            turns -= 1;
+            match self.service_send_turn(qconn, id) {
+                TurnOutcome::Requeue => {
+                    self.mark_send_runnable(id);
+                    self.needs_iteration = true;
+                }
+                TurnOutcome::Park | TurnOutcome::Drop => {}
+            }
+        }
+        if !self.runnable_send.is_empty() {
+            self.needs_iteration = true;
+        }
+    }
+
+    /// Service one round-robin turn for `id` (§5.3a). Order is mandatory:
+    /// `pending_reset` is checked **before** any generic terminal/stale eviction
+    /// (invariant 11); then the head `send_op` gets at most one bounded transport
+    /// call. Returns whether the id should return to the round-robin tail.
+    fn service_send_turn<C: QuicConn>(&mut self, qconn: &mut C, id: u64) -> TurnOutcome {
+        // 1. pending_reset FIRST (before terminal/stale eviction, invariant 11).
+        let pending_reset = self.send.get(&id).and_then(|s| s.pending_reset);
+        if let Some(code) = pending_reset {
+            if let Some(state) = self.send.get_mut(&id) {
+                state.pending_reset = None;
+            }
+            // Emit RESET_STREAM even at zero send capacity (§14 Q3 assumption).
+            let _ = qconn.stream_shutdown(id, Shutdown::Write, code);
+            self.mark_send_done(id);
+            return TurnOutcome::Drop;
+        }
+        // 2. Stale/terminal id: nothing to send. Evicted (already popped).
+        let has_ops = match self.send.get(&id) {
+            Some(state) => state.terminal.is_none() && !state.send_ops.is_empty(),
+            None => false,
+        };
+        if !has_ops {
+            return TurnOutcome::Drop;
+        }
+        // 3. Service the head op with exactly one transport call.
+        let is_write = matches!(self.send.get(&id).and_then(|s| s.send_ops.front()), Some(SendOp::Write { .. }));
+        if is_write {
+            self.service_write_turn(qconn, id)
+        } else {
+            self.service_finish_turn(qconn, id)
+        }
+    }
+
+    /// One `Write` turn: a single bounded `stream_send(id, chunk, fin=false)`
+    /// honoring partial writes (§5.3a). Full acceptance pops the op and completes
+    /// `Ok(())`; a capacity-exhausted partial / `Done` re-arms the low-water mark
+    /// (§5.3) and parks; `StreamStopped` runs the send-terminal transition.
+    fn service_write_turn<C: QuicConn>(&mut self, qconn: &mut C, id: u64) -> TurnOutcome {
+        let mut offered = 0usize;
+        let result = {
+            let state = self.send.get_mut(&id).expect("send state present");
+            match state.send_ops.front_mut() {
+                Some(SendOp::Write { buf, .. }) => send_from_buf(buf, |chunk| {
+                    let n = chunk.len().min(MAX_WRITE_CHUNK);
+                    offered = n;
+                    qconn.stream_send(id, &chunk[..n], false)
+                }),
+                _ => return TurnOutcome::Drop,
+            }
+        };
+        match result {
+            Ok(written) => {
+                let has_remaining = self
+                    .send
+                    .get(&id)
+                    .and_then(|s| s.send_ops.front())
+                    .map(|op| match op {
+                        SendOp::Write { buf, .. } => buf.has_remaining(),
+                        SendOp::Finish { .. } => false,
+                    })
+                    .unwrap_or(false);
+                if !has_remaining {
+                    // Whole buffer accepted: pop + complete Ok exactly once.
+                    if let Some(state) = self.send.get_mut(&id) {
+                        if let Some(op) = state.send_ops.pop_front() {
+                            op.complete(Ok(()));
+                        }
+                    }
+                    // Still runnable if more ops remain behind it.
+                    return self.runnable_after_pop(id);
+                }
+                if written == offered {
+                    // Made full progress on the offered chunk; more buffer (our
+                    // own chunking / next segment) with capacity likely present.
+                    TurnOutcome::Requeue
+                } else {
+                    // Capacity exhausted mid-write: re-arm low-water and park.
+                    self.rearm_send(qconn, id)
+                }
+            }
+            Err(err) => self.classify_send_err(qconn, id, &err),
+        }
+    }
+
+    /// One `Finish` turn: `stream_send(id, &[], fin=true)` (§5.3a). Accepted even
+    /// at zero send capacity (§14 Q5); on acceptance pop + complete `Ok(())`.
+    fn service_finish_turn<C: QuicConn>(&mut self, qconn: &mut C, id: u64) -> TurnOutcome {
+        match qconn.stream_send(id, &[], true) {
+            Ok(_) => {
+                if let Some(state) = self.send.get_mut(&id) {
+                    if let Some(op) = state.send_ops.pop_front() {
+                        op.complete(Ok(()));
+                    }
+                }
+                // A sent FIN closes the send direction: mark it done so contract
+                // A reclaims an admitted bidi once its recv half also ends, and
+                // a later Send/Finish completes via the retained sticky state
+                // (§5.3a).
+                self.mark_send_done(id);
+                TurnOutcome::Drop
+            }
+            Err(err) => self.classify_send_err(qconn, id, &err),
+        }
+    }
+
+    /// Classify a `stream_send` error into a turn outcome (§8.3): `StreamStopped`
+    /// drains all ops via the send-terminal transition; `Done` (blocked) re-arms
+    /// and parks; a connection-gone / bug resolves via a sticky terminal so the
+    /// op never spins or leaks a bare cancel.
+    fn classify_send_err<C: QuicConn>(
+        &mut self,
+        qconn: &mut C,
+        id: u64,
+        err: &quiche::Error,
+    ) -> TurnOutcome {
+        match classify_stream_send_error(err) {
+            StreamSendClass::Stopped(code) => {
+                self.send_terminal_transition(id, SendEnd::Stopped { error_code: code });
+                TurnOutcome::Drop
+            }
+            StreamSendClass::Blocked => self.rearm_send(qconn, id),
+            StreamSendClass::ConnGone => {
+                let end = self
+                    .shared
+                    .conn_terminal
+                    .get()
+                    .map(SendEnd::Conn)
+                    .unwrap_or(SendEnd::Conn(Arc::new(ConnTerminal::Internal(
+                        "stream_send after connection gone",
+                    ))));
+                self.send_terminal_transition(id, end);
+                TurnOutcome::Drop
+            }
+            StreamSendClass::Limit | StreamSendClass::Bug(_) => {
+                let end = SendEnd::Conn(Arc::new(ConnTerminal::Internal(
+                    "unexpected stream_send error",
+                )));
+                self.send_terminal_transition(id, end);
+                TurnOutcome::Drop
             }
         }
     }
 
-    /// Route a `RecvResume` id onto the resume cursor with exact-once membership.
+    /// Low-water re-arm a blocked send half (§5.3): set a SMALL progress
+    /// threshold so any capacity gain re-surfaces the id via stage (d), and park
+    /// it (do not requeue — no spin). A `StreamStopped` observed here runs the
+    /// send-terminal transition instead.
+    fn rearm_send<C: QuicConn>(&mut self, qconn: &mut C, id: u64) -> TurnOutcome {
+        match qconn.stream_writable(id, REARM_THRESHOLD) {
+            Err(quiche::Error::StreamStopped(code)) => {
+                self.send_terminal_transition(id, SendEnd::Stopped { error_code: code });
+                TurnOutcome::Drop
+            }
+            _ => TurnOutcome::Park,
+        }
+    }
+
+    /// After popping a completed op: the id stays runnable iff more ops remain
+    /// and no terminal was published (§5.3a round-robin tail).
+    fn runnable_after_pop(&mut self, id: u64) -> TurnOutcome {
+        let more = self
+            .send
+            .get(&id)
+            .map(|s| s.terminal.is_none() && !s.send_ops.is_empty())
+            .unwrap_or(false);
+        if more {
+            TurnOutcome::Requeue
+        } else {
+            TurnOutcome::Drop
+        }
+    }
+
+    /// Apply queued control commands (§5.2). Route a `RecvResume` id onto the
+    /// resume cursor with exact-once membership.
     fn enqueue_resume(&mut self, id: u64) {
         if self.resume_set.insert(id) {
             self.pending_resume.push_back(id);
@@ -1017,19 +1480,47 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
     }
 }
 
-/// Build a send handoff, initializing its sticky `status` cell from any retained
-/// `SendEnd` (§5.1 atomic transfer). Free function: it touches no worker state.
+/// The disposition of one stage-(e) round-robin turn (§5.3a).
+enum TurnOutcome {
+    /// Still immediately runnable: return to the round-robin tail.
+    Requeue,
+    /// Blocked on send capacity: re-armed via low-water, do not requeue (no spin).
+    Park,
+    /// Terminal / stale / reset-serviced: release the turn, do not requeue.
+    Drop,
+}
+
+/// Build a send handoff and, for a still-live send half, the worker-retained
+/// [`StreamSendState`] that **shares** the handoff's sticky `status` cell (§5.1
+/// atomic transfer, §5.4 invariant 7). When the send half is already terminal
+/// (a retained `SendEnd`), the cell is pre-set and no registry state is created.
+/// Free function: it touches no worker state.
 fn build_send<B: Buf>(
     id: u64,
     cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
     retained: Option<SendEnd>,
-) -> (SendHandoff<B>, bool) {
+) -> (SendHandoff<B>, Option<StreamSendState<B>>, bool) {
     let status = TerminalCell::new();
     let send_done = retained.is_some();
-    if let Some(end) = retained {
-        status.set(end);
+    if let Some(ref end) = retained {
+        status.set(end.clone());
     }
-    (SendHandoff { id, status, cmd_tx }, send_done)
+    let handoff = SendHandoff {
+        id,
+        status: status.clone(),
+        cmd_tx,
+    };
+    let state = if send_done {
+        None
+    } else {
+        Some(StreamSendState {
+            send_ops: VecDeque::new(),
+            pending_reset: None,
+            terminal: None,
+            status,
+        })
+    };
+    (handoff, state, send_done)
 }
 
 impl<B: Buf + Send + 'static> ApplicationOverQuic for QuicheDriver<B> {
@@ -1398,9 +1889,11 @@ mod tests {
         let (mut d, mut h) = driver();
         let mut c = MockConn::new();
         // Peer bidi id 0 surfaces on the writable cursor; capacity probe reports
-        // it stopped by the peer.
+        // it stopped by the peer. Stage (d) captures it, then the read pump's
+        // admission phase registers it on the following iteration.
         c.writable_next.push_back(0);
         c.capacity.insert(0, Err(quiche::Error::StreamStopped(66)));
+        d.stage_writable(&mut c);
         d.read_budget = READ_BUDGET;
         d.run_read_pump(&mut c);
 
@@ -1505,6 +1998,373 @@ mod tests {
         );
         // Keep handles alive.
         let _ = &mut h;
+    }
+
+    // ===== Phase 4: per-stream SEND state machine (§11 send matrix) =====
+
+    use h3::quic::WriteBuf;
+
+    /// A `WriteBuf` carrying a DATA frame (header + payload); non-contiguous, so
+    /// it exercises the multi-turn segment walk of `send_from_buf`.
+    fn wbuf(payload: &'static [u8]) -> WriteBuf<Bytes> {
+        WriteBuf::from(h3::proto::frame::Frame::Data(Bytes::from_static(payload)))
+    }
+
+    /// Total wire length of `wbuf(payload)` (frame header + payload).
+    fn wbuf_len(payload: &'static [u8]) -> usize {
+        wbuf(payload).remaining()
+    }
+
+    /// Sum of bytes `stream_send` recorded for `id`.
+    fn sent_len(c: &MockConn, id: u64) -> usize {
+        c.sent
+            .iter()
+            .filter(|(sid, _, _)| *sid == id)
+            .map(|(_, b, _)| b.len())
+            .sum()
+    }
+
+    fn sent_fin(c: &MockConn, id: u64) -> bool {
+        c.sent.iter().any(|(sid, _, fin)| *sid == id && *fin)
+    }
+
+    fn push_send(
+        d: &mut QuicheDriver<Bytes>,
+        id: u64,
+        payload: &'static [u8],
+    ) -> oneshot::Receiver<Result<(), SendEnd>> {
+        let (tx, rx) = oneshot::channel();
+        d.inbox.push_back(DriverCommand::Send {
+            id,
+            buf: wbuf(payload),
+            done: tx,
+        });
+        rx
+    }
+
+    fn push_finish(
+        d: &mut QuicheDriver<Bytes>,
+        id: u64,
+    ) -> oneshot::Receiver<Result<(), SendEnd>> {
+        let (tx, rx) = oneshot::channel();
+        d.inbox.push_back(DriverCommand::Finish { id, done: tx });
+        rx
+    }
+
+    /// §11: partial `stream_send` on a buffer larger than the available window,
+    /// then re-armed low-water, then repeated partial progress as capacity opens.
+    /// Exactly one `Ok(())` fires at full acceptance (§5.3 / §5.3a).
+    #[test]
+    fn partial_write_then_capacity_rearms_one_ok() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        let total = wbuf_len(b"hello world");
+        // Accept at most 3 bytes per stream_send call.
+        c.send_capacity.insert(0, 3);
+        let mut done = push_send(&mut d, 0, b"hello world");
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+
+        // Not fully accepted yet: no completion, and the blocked write re-armed.
+        assert!(matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        let rearms: Vec<usize> = c.rearms.iter().filter(|(id, _)| *id == 0).map(|(_, len)| *len).collect();
+        assert!(!rearms.is_empty(), "blocked write must low-water re-arm");
+        assert_eq!(*rearms.last().unwrap(), REARM_THRESHOLD);
+        let after_first = sent_len(&c, 0);
+        assert!(after_first > 0 && after_first < total);
+
+        // Capacity opens; the writable edge re-marks it runnable; it finishes.
+        c.send_capacity.remove(&0);
+        c.writable_next.push_back(0);
+        loop {
+            d.stage_writable(&mut c);
+            d.stage_send(&mut c);
+            if sent_len(&c, 0) == total {
+                break;
+            }
+            // Keep re-arming the writable edge until drained.
+            c.writable_next.push_back(0);
+        }
+        assert_eq!(sent_len(&c, 0), total, "all bytes eventually accepted");
+        assert!(matches!(done.try_recv(), Ok(Ok(()))), "exactly one Ok at full acceptance");
+    }
+
+    /// §11 / Q5: `Finish` acceptance completes once, even at **zero** send
+    /// capacity (a FIN needs no window), and records the FIN on the wire.
+    #[test]
+    fn finish_accepted_at_zero_capacity_completes_once() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        c.send_capacity.insert(0, 0); // zero send capacity
+        let mut done = push_finish(&mut d, 0);
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+
+        assert!(sent_fin(&c, 0), "zero-capacity FIN accepted (Q5)");
+        assert!(matches!(done.try_recv(), Ok(Ok(()))));
+        // Idempotent single completion: op popped, nothing more runnable.
+        assert!(d.runnable_send.is_empty());
+        d.stage_send(&mut c);
+        assert!(matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
+    }
+
+    /// §11: `Reset` preempts an in-flight/queued `Write` — the queued op is
+    /// cancelled exactly once with the local-reset terminal, while a Write
+    /// wholly accepted **before** reset keeps its recorded `Ok`. Stage (e) then
+    /// emits `RESET_STREAM`.
+    #[test]
+    fn reset_preempts_queued_write_keeps_earlier_ok() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        // Write1 is small and fully accepted this turn.
+        let mut done1 = push_send(&mut d, 0, b"a");
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+        assert!(matches!(done1.try_recv(), Ok(Ok(()))), "Write1 accepted before reset");
+
+        // Write2 queued, then Reset preempts it in the same stage (a).
+        let mut done2 = push_send(&mut d, 0, b"bcde");
+        d.inbox.push_back(DriverCommand::Reset { id: 0, code: 42 });
+        d.apply_inbox(&mut c);
+        match done2.try_recv() {
+            Ok(Err(SendEnd::Reset { error_code: 42 })) => {}
+            other => panic!("Write2 must be cancelled once with local reset, got {other:?}"),
+        }
+        // Sticky status published for the front end.
+        assert!(matches!(
+            d.send.get(&0).unwrap().status.get(),
+            Some(SendEnd::Reset { error_code: 42 })
+        ));
+
+        // Stage (e) services pending_reset before any eviction → RESET_STREAM.
+        d.stage_send(&mut c);
+        assert!(c.shutdowns.contains(&crate::conn::mock::ShutdownCall {
+            id: 0,
+            is_write: true,
+            code: 42,
+        }));
+    }
+
+    /// §11 / Q3: a `Reset` at **zero** send capacity still emits `RESET_STREAM`
+    /// (the reset call cannot sit behind a flow-control-blocked remainder).
+    #[test]
+    fn reset_emitted_at_zero_capacity() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        c.send_capacity.insert(0, 0);
+        d.inbox.push_back(DriverCommand::Reset { id: 0, code: 7 });
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+        assert!(c.shutdowns.contains(&crate::conn::mock::ShutdownCall {
+            id: 0,
+            is_write: true,
+            code: 7,
+        }));
+    }
+
+    // Regression (review finding 1): a successfully sent FIN marks the send
+    // direction done, so contract A reclaims an admitted bidi once its recv half
+    // also ends. Before the fix, send_done stayed false and the stream leaked.
+    #[test]
+    fn accepted_fin_marks_send_done_and_enables_contract_a() {
+        let (mut d, _h) = driver();
+        d.admit
+            .insert(0, AdmitState::Registered { send_done: false, recv_done: true });
+        d.send.insert(0, StreamSendState::new());
+        let mut c = MockConn::new();
+        let mut fin = push_finish(&mut d, 0);
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+        assert!(matches!(fin.try_recv(), Ok(Ok(()))));
+        // recv already done + send now done → contract A reclaimed admit + recv.
+        assert!(!d.admit.contains_key(&0), "both directions terminal → admit dropped");
+        assert!(!d.recv.contains_key(&0));
+    }
+
+    // Regression (review finding 2): a second Reset command is idempotent — it
+    // must not schedule a second RESET_STREAM. Before the fix, the guard only
+    // checked pending_reset (cleared after servicing), so a later reset re-fired.
+    #[test]
+    fn duplicate_reset_is_idempotent() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        d.inbox.push_back(DriverCommand::Reset { id: 0, code: 7 });
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c); // services the reset → one RESET_STREAM
+        // A second reset with a different code must be a no-op.
+        d.inbox.push_back(DriverCommand::Reset { id: 0, code: 9 });
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+        let resets: Vec<_> = c.shutdowns.iter().filter(|s| s.is_write).collect();
+        assert_eq!(resets.len(), 1, "exactly one RESET_STREAM");
+        assert_eq!(resets[0].code, 7, "first-effective reset code wins");
+    }
+
+    // Regression (review finding 3): a Send deferred in cmd_rx past the terminal
+    // edge must complete with the retained sticky terminal, not recreate a fresh
+    // non-terminal state. Contract A therefore retains self.send after reclaim.
+    #[test]
+    fn deferred_send_after_contract_a_completes_with_sticky_terminal() {
+        let (mut d, _h) = driver();
+        d.admit
+            .insert(0, AdmitState::Registered { send_done: false, recv_done: true });
+        let mut c = MockConn::new();
+        // Peer STOP_SENDING on the send half → send terminal + contract A (recv
+        // already done) reclaims admit/recv but retains self.send's terminal.
+        let mut w1 = push_send(&mut d, 0, b"aa");
+        c.send_errors
+            .entry(0)
+            .or_default()
+            .push_back(quiche::Error::StreamStopped(55));
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+        assert!(matches!(w1.try_recv(), Ok(Err(SendEnd::Stopped { error_code: 55 }))));
+        assert!(!d.admit.contains_key(&0), "contract A reclaimed admit");
+        assert!(d.send.contains_key(&0), "send retained for deferred ops");
+
+        // A Send that was deferred past the terminal edge completes with the
+        // sticky Stopped terminal (never a fabricated Internal / bare cancel).
+        let mut late = push_send(&mut d, 0, b"bb");
+        d.apply_inbox(&mut c);
+        assert!(matches!(
+            late.try_recv(),
+            Ok(Err(SendEnd::Stopped { error_code: 55 }))
+        ));
+    }
+
+    /// §11: peer `STOP_SENDING` observed on a `stream_send` call drains ALL
+    /// remaining `send_ops` exactly once with `SendEnd::Stopped`, marks the send
+    /// half done, and publishes the sticky terminal (invariant 13).
+    #[test]
+    fn stop_sending_on_send_drains_all_ops_once() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        let mut w1 = push_send(&mut d, 0, b"aa");
+        let mut w2 = push_send(&mut d, 0, b"bb");
+        let mut fin = push_finish(&mut d, 0);
+        d.apply_inbox(&mut c);
+        // The first stream_send call reports the peer stopped us.
+        c.send_errors
+            .entry(0)
+            .or_default()
+            .push_back(quiche::Error::StreamStopped(9));
+        d.stage_send(&mut c);
+
+        for (label, rx) in [("w1", &mut w1), ("w2", &mut w2), ("fin", &mut fin)] {
+            match rx.try_recv() {
+                Ok(Err(SendEnd::Stopped { error_code: 9 })) => {}
+                other => panic!("{label} must complete once with Stopped, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            d.send.get(&0).unwrap().status.get(),
+            Some(SendEnd::Stopped { error_code: 9 })
+        ));
+        assert!(d.send.get(&0).unwrap().send_ops.is_empty());
+        assert!(!d.runnable_send_set.contains(&0), "runnable membership released");
+    }
+
+    /// §11 / invariant 13: peer `STOP_SENDING` surfaced on the **writable** path
+    /// (stage (d) `stream_capacity` probe of a registered send id) resolves
+    /// queued commands before runnable cleanup.
+    #[test]
+    fn stop_sending_via_writable_probe_drains_ops() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        let mut w1 = push_send(&mut d, 0, b"aa");
+        let mut w2 = push_send(&mut d, 0, b"bb");
+        d.apply_inbox(&mut c);
+        // Stage (d) probes capacity and finds the stream stopped.
+        c.writable_next.push_back(0);
+        c.capacity.insert(0, Err(quiche::Error::StreamStopped(13)));
+        d.stage_writable(&mut c);
+
+        for (label, rx) in [("w1", &mut w1), ("w2", &mut w2)] {
+            match rx.try_recv() {
+                Ok(Err(SendEnd::Stopped { error_code: 13 })) => {}
+                other => panic!("{label} must complete once with Stopped, got {other:?}"),
+            }
+        }
+        assert!(!d.runnable_send_set.contains(&0));
+    }
+
+    /// §11: round-robin fairness — a continuously-writable bulk stream yields
+    /// turns to another runnable stream within one stage-(e) batch (invariant
+    /// 12). The small stream completes while the bulk stream is still in flight.
+    #[test]
+    fn round_robin_bulk_yields_to_other_stream() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        // Bulk stream 0: more data than one whole stage-(e) batch can drain
+        // (WRITE_BUDGET turns × MAX_WRITE_CHUNK = 512 KiB), so it cannot finish
+        // within a single batch even if it takes every remaining turn.
+        static BULK: [u8; 1024 * 1024] = [b'x'; 1024 * 1024];
+        let (bulk_tx, mut bulk_done) = oneshot::channel();
+        d.inbox.push_back(DriverCommand::Send {
+            id: 0,
+            buf: WriteBuf::from(h3::proto::frame::Frame::Data(Bytes::from_static(&BULK))),
+            done: bulk_tx,
+        });
+        // Small stream 4 enqueued behind it.
+        let mut small_done = push_send(&mut d, 4, b"z");
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+
+        // The small stream got its turn and completed despite the bulk backlog.
+        assert!(matches!(small_done.try_recv(), Ok(Ok(()))), "small stream serviced");
+        // The bulk stream is still in flight (not completed, still runnable).
+        assert!(matches!(bulk_done.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        assert!(d.runnable_send_set.contains(&0) || d.needs_iteration);
+    }
+
+    /// §11: a `Send`/`Finish` received **after** the send half is terminal
+    /// completes immediately once with the sticky terminal — never enqueued,
+    /// never a bare cancel, never a fabricated `Ok` (§5.3a ops-after-terminal).
+    #[test]
+    fn send_after_terminal_completes_immediately() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        // Establish a local-reset terminal first.
+        d.inbox.push_back(DriverCommand::Reset { id: 0, code: 5 });
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c); // service the reset shutdown
+
+        // A late Send resolves immediately with the sticky reset terminal.
+        let mut late = push_send(&mut d, 0, b"late");
+        d.apply_inbox(&mut c);
+        match late.try_recv() {
+            Ok(Err(SendEnd::Reset { error_code: 5 })) => {}
+            other => panic!("late Send must complete once with sticky terminal, got {other:?}"),
+        }
+        assert!(d.send.get(&0).unwrap().send_ops.is_empty(), "late op not enqueued");
+        // No new transport send call was made for the late op.
+        assert!(c.sent.iter().all(|(_, b, _)| b != b"late"));
+    }
+
+    /// §11: an admitted peer bidi retains a live `StreamSendState` sharing the
+    /// handoff's `status` cell, so a later peer `STOP_SENDING` is visible to the
+    /// front end (register_peer / send-registry integration).
+    #[test]
+    fn admitted_bidi_retains_send_state_sharing_status() {
+        let (mut d, mut h) = driver();
+        let mut c = MockConn::new();
+        c.script_recv(0, [data(b"hi", false)]);
+        c.queue_readable([0]);
+        d.read_budget = READ_BUDGET;
+        d.run_read_pump(&mut c);
+        let ho = h.accept_bidi_rx.try_recv().expect("admitted");
+        // The driver retains a live send half for the admitted bidi.
+        assert!(d.send.contains_key(&0));
+        assert!(ho.send.status.get().is_none());
+
+        // A peer STOP_SENDING (via writable probe) publishes to the SHARED cell.
+        c.writable_next.push_back(0);
+        c.capacity.insert(0, Err(quiche::Error::StreamStopped(88)));
+        d.stage_writable(&mut c);
+        assert!(matches!(
+            ho.send.status.get(),
+            Some(SendEnd::Stopped { error_code: 88 })
+        ));
     }
 }
 

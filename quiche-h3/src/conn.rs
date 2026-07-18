@@ -28,6 +28,10 @@ pub(crate) trait QuicConn {
     fn stream_readable_next(&mut self) -> Option<u64>;
     /// Destructive writable cursor: returns the next writable id and dearms it.
     fn stream_writable_next(&mut self) -> Option<u64>;
+    /// Re-arm the stream's send low-water mark to `len` (§5.3): quiche will not
+    /// re-report the stream as writable until `len` bytes of send capacity
+    /// exist. Returns `Ok(true)` if that much capacity is already available.
+    fn stream_writable(&mut self, id: u64, len: usize) -> QResult<bool>;
     /// Whether the stream currently has buffered readable data.
     fn stream_readable(&self, id: u64) -> bool;
     /// Whether the stream's receive side is finished (FIN read).
@@ -72,6 +76,10 @@ impl QuicConn for tokio_quiche::quic::QuicheConnection {
     #[inline]
     fn stream_writable_next(&mut self) -> Option<u64> {
         self.stream_writable_next()
+    }
+    #[inline]
+    fn stream_writable(&mut self, id: u64, len: usize) -> QResult<bool> {
+        self.stream_writable(id, len)
     }
     #[inline]
     fn stream_readable(&self, id: u64) -> bool {
@@ -167,6 +175,12 @@ pub(crate) mod mock {
 
         // --- stream_capacity scripting ---
         pub capacity: HashMap<u64, QResult<usize>>,
+
+        // --- stream_writable (low-water re-arm) scripting ---
+        /// Forced results for `stream_writable`; default `Ok(false)` (armed).
+        pub writable_results: HashMap<u64, QResult<bool>>,
+        /// Recorded `stream_writable(id, len)` re-arm calls.
+        pub rearms: Vec<(u64, usize)>,
 
         // --- stream_priority scripting ---
         pub priority_errors: HashMap<u64, VecDeque<quiche::Error>>,
@@ -271,6 +285,15 @@ pub(crate) mod mock {
 
         fn stream_writable_next(&mut self) -> Option<u64> {
             self.writable_next.pop_front()
+        }
+
+        fn stream_writable(&mut self, id: u64, len: usize) -> QResult<bool> {
+            self.rearms.push((id, len));
+            match self.writable_results.get(&id) {
+                Some(Ok(v)) => Ok(*v),
+                Some(Err(e)) => Err(*e),
+                None => Ok(false),
+            }
         }
 
         fn stream_readable(&self, id: u64) -> bool {
