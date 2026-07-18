@@ -6,3 +6,16 @@ members = ["quiche-h3"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/youyuanwu/quiche-h3"
+
+# Version policy (design §10): depend on semver-compatible ranges and pin exact
+# builds via the committed Cargo.lock, rather than `=` pins in the manifest.
+# tokio-quiche 0.19 re-exports quiche (0.29); h3 0.0.8.
+[workspace.dependencies]
+tokio-quiche = "0.19"
+h3 = "0.0.8"
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1" }
+tracing = "0.1"
+rcgen = "0.13"
+http = "1"
