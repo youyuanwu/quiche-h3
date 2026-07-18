@@ -62,6 +62,9 @@ pub struct H3RecvStream<B: Buf> {
 
 impl<B: Buf> H3RecvStream<B> {
     pub(crate) fn from_handoff(h: RecvHandoff<B>) -> Self {
+        // Conversion succeeded: this stream object now owns drop cleanup (§6.2),
+        // so disarm the handoff's fallback cleanup guard.
+        h.cleanup.disarm();
         H3RecvStream {
             id: h.id,
             bytes: h.bytes,
@@ -192,6 +195,8 @@ pub struct H3SendStream<B: Buf> {
 
 impl<B: Buf> H3SendStream<B> {
     pub(crate) fn from_handoff(h: SendHandoff<B>) -> Self {
+        // Conversion succeeded: disarm the handoff fallback cleanup (§6.2).
+        h.cleanup.disarm();
         H3SendStream {
             id: h.id,
             status: h.status,
@@ -383,7 +388,12 @@ impl<B: Buf> quic::SendStream<B> for H3SendStream<B> {
             return;
         }
         self.finalized = true;
-        self.local_terminal = Some(SendEnd::Reset { error_code: reset_code });
+        // Don't mask a terminal the worker already published (peer STOP_SENDING
+        // or connection close): only install the local reset when none exists
+        // yet, so a conflicting poll reports the earlier peer code, not ours.
+        if self.status.get().is_none() {
+            self.local_terminal = Some(SendEnd::Reset { error_code: reset_code });
+        }
         // Does not drop an existing send/finish completion receiver (§5.3a).
         let _ = self
             .cmd_tx
@@ -822,7 +832,8 @@ mod tests {
             bytes: brx,
             terminal: terminal.clone(),
             resume: Arc::clone(&resume),
-            cmd_tx: ctx,
+            cmd_tx: ctx.clone(),
+            cleanup: crate::driver::HandoffCleanup::new(0, true, ctx),
         });
         (btx, terminal, resume, recv, crx)
     }
@@ -839,7 +850,8 @@ mod tests {
         let send = H3SendStream::from_handoff(SendHandoff {
             id,
             status: status.clone(),
-            cmd_tx: ctx,
+            cmd_tx: ctx.clone(),
+            cleanup: crate::driver::HandoffCleanup::new(id, false, ctx),
         });
         (status, send, crx)
     }
@@ -1066,6 +1078,59 @@ mod tests {
         assert!(crx.try_recv().is_err(), "finalized send must not finish on drop");
     }
 
+    // Regression (final review, GPT): a materialized handoff dropped BEFORE the
+    // front end converts it (open cancelled after the worker's reply.send(Ok)
+    // succeeded, or a queued accepted handoff dropped when Connection drops)
+    // must enqueue direction-aware cleanup so the stream is not leaked (§6.2).
+    #[test]
+    fn dropped_recv_handoff_enqueues_stop_sending() {
+        let (_btx, brx) = mpsc::channel(1);
+        let (ctx, mut crx) = mpsc::unbounded_channel::<DriverCommand<Bytes>>();
+        let handoff = RecvHandoff {
+            id: 8,
+            bytes: brx,
+            terminal: TerminalCell::new(),
+            resume: Arc::new(AtomicBool::new(false)),
+            cmd_tx: ctx.clone(),
+            cleanup: crate::driver::HandoffCleanup::new(8, true, ctx),
+        };
+        drop(handoff); // unconsumed → the guard fires
+        match crx.try_recv() {
+            Ok(DriverCommand::StopSending { id: 8, code: 0 }) => {}
+            other => panic!("expected StopSending on dropped handoff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropped_send_handoff_enqueues_finish() {
+        let (ctx, mut crx) = mpsc::unbounded_channel::<DriverCommand<Bytes>>();
+        let handoff = SendHandoff {
+            id: 8,
+            status: TerminalCell::new(),
+            cmd_tx: ctx.clone(),
+            cleanup: crate::driver::HandoffCleanup::new(8, false, ctx),
+        };
+        drop(handoff);
+        match crx.try_recv() {
+            Ok(DriverCommand::Finish { id: 8, .. }) => {}
+            other => panic!("expected graceful Finish on dropped handoff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn converted_handoff_disarms_guard() {
+        // recv_channel()/send_half() convert via from_handoff → the guard is
+        // disarmed, so conversion enqueues nothing; only the STREAM object's own
+        // Drop later enqueues cleanup.
+        let (_btx, _terminal, _resume, recv, mut crx) = recv_channel();
+        assert!(crx.try_recv().is_err(), "conversion must not fire the guard");
+        drop(recv);
+        assert!(
+            matches!(crx.try_recv(), Ok(DriverCommand::StopSending { .. })),
+            "stream Drop (not the disarmed guard) enqueues cleanup"
+        );
+    }
+
     // ---- StreamOpener ----
 
     fn opener() -> (StreamOpener<Bytes>, mpsc::UnboundedReceiver<DriverCommand<Bytes>>, Arc<ConnShared>) {
@@ -1122,13 +1187,19 @@ mod tests {
         let (_btx, brx) = mpsc::channel(1);
         let (ictx, _icrx) = mpsc::unbounded_channel();
         let handoff = BidiHandoff {
-            send: SendHandoff { id: 0, status: TerminalCell::new(), cmd_tx: ictx.clone() },
+            send: SendHandoff {
+                id: 0,
+                status: TerminalCell::new(),
+                cmd_tx: ictx.clone(),
+                cleanup: crate::driver::HandoffCleanup::new(0, false, ictx.clone()),
+            },
             recv: RecvHandoff {
                 id: 0,
                 bytes: brx,
                 terminal: TerminalCell::new(),
                 resume: Arc::new(AtomicBool::new(false)),
-                cmd_tx: ictx,
+                cmd_tx: ictx.clone(),
+                cleanup: crate::driver::HandoffCleanup::new(0, true, ictx),
             },
         };
         reply.send(Ok(handoff)).ok().expect("deliver handoff");
@@ -1173,13 +1244,19 @@ mod tests {
         let (_btx, brx) = mpsc::channel(1);
         let (ictx, _icrx) = mpsc::unbounded_channel();
         BidiHandoff {
-            send: SendHandoff { id: 0, status: TerminalCell::new(), cmd_tx: ictx.clone() },
+            send: SendHandoff {
+                id: 0,
+                status: TerminalCell::new(),
+                cmd_tx: ictx.clone(),
+                cleanup: crate::driver::HandoffCleanup::new(0, false, ictx.clone()),
+            },
             recv: RecvHandoff {
                 id: 0,
                 bytes: brx,
                 terminal: TerminalCell::new(),
                 resume: Arc::new(AtomicBool::new(false)),
-                cmd_tx: ictx,
+                cmd_tx: ictx.clone(),
+                cleanup: crate::driver::HandoffCleanup::new(0, true, ictx),
             },
         }
     }

@@ -180,6 +180,8 @@ pub(crate) struct RecvHandoff<B: Buf> {
     pub(crate) resume: Arc<AtomicBool>,
     /// For `stop_sending` and drop cleanup.
     pub(crate) cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
+    /// Armed cleanup if this handoff is dropped before conversion (§6.2).
+    pub(crate) cleanup: HandoffCleanup<B>,
 }
 
 /// Raw send-half state the worker hands to the front end at open. Phase 6 wraps
@@ -190,12 +192,69 @@ pub(crate) struct SendHandoff<B: Buf> {
     pub(crate) status: TerminalCell<SendEnd>,
     /// For `send_data`/`poll_finish`/`reset` and drop cleanup.
     pub(crate) cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
+    /// Armed cleanup if this handoff is dropped before conversion (§6.2).
+    pub(crate) cleanup: HandoffCleanup<B>,
 }
 
 /// A peer/opened bidi stream handed to the front end: both halves.
 pub(crate) struct BidiHandoff<B: Buf> {
     pub(crate) send: SendHandoff<B>,
     pub(crate) recv: RecvHandoff<B>,
+}
+
+/// Armed, direction-aware cleanup for a **materialized** handoff that is dropped
+/// before the front end converts it into a stream object (§6.2). This closes
+/// the open-cancel-after-materialize window (the worker's `reply.send(Ok(..))`
+/// can succeed yet the receiver drops the handoff before polling) and the
+/// accept-drop window (a queued accepted handoff dropped when `Connection`
+/// drops): without it the peer/local stream would leak `MAX_STREAMS` credit and
+/// its worker registry entry until connection close.
+///
+/// [`disarm`](HandoffCleanup::disarm) is called by `from_handoff` on successful
+/// conversion, after which the front-end stream object's own `Drop` owns
+/// cleanup. Matches the front-end drop policy (§6.2): a recv half enqueues
+/// `StopSending(0)`, a send half a graceful `Finish` (never inferring
+/// cancellation).
+pub(crate) struct HandoffCleanup<B: Buf> {
+    id: u64,
+    is_recv: bool,
+    cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
+    armed: bool,
+}
+
+impl<B: Buf> HandoffCleanup<B> {
+    pub(crate) fn new(id: u64, is_recv: bool, cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>) -> Self {
+        HandoffCleanup {
+            id,
+            is_recv,
+            cmd_tx,
+            armed: true,
+        }
+    }
+
+    /// Called by `from_handoff` on conversion: the front-end stream object now
+    /// owns drop cleanup, so this guard becomes a no-op.
+    pub(crate) fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl<B: Buf> Drop for HandoffCleanup<B> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.is_recv {
+            let _ = self
+                .cmd_tx
+                .send(DriverCommand::StopSending { id: self.id, code: 0 });
+        } else {
+            let (done, _rx) = oneshot::channel();
+            let _ = self
+                .cmd_tx
+                .send(DriverCommand::Finish { id: self.id, done });
+        }
+    }
 }
 
 /// Worker-owned receive registry state for a live recv half (§5, §5.1). The
@@ -731,11 +790,37 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         self.stage_send(qconn);
         // Common per-iteration boundary: clear only the pump-selection flag.
         self.reads_ran_this_iter = false;
+        // Recompute `needs_iteration` from the runnable stage remainders (§5.2
+        // progress bound): a command applied here (e.g. RecvResume /
+        // Accept*Resume) on a PACKET iteration is queued but its stage does not
+        // re-run this iteration, so without this the resumed work would strand
+        // until unrelated traffic. `|=` never clears a pessimistic signal a
+        // stage already set; the predicates below are all "definitely runnable,
+        // not blocked on credit/capacity" so they cannot hot-spin.
+        self.needs_iteration |= self.has_runnable_remainder();
         // (f) The mandatory non-write-budgeted close barrier, AFTER stage (e)
         // (§5.2, invariant 10): applies a staged explicit `Close` or the
         // synthetic last-handle `H3_NO_ERROR` close even after a saturated
         // write batch.
         self.apply_close_barrier(qconn)
+    }
+
+    /// Whether any stage has runnable work left that is NOT blocked purely on
+    /// channel capacity or stream credit (§5.2). Used to recompute
+    /// `needs_iteration` at the callback boundary so a resume/command applied on
+    /// a packet iteration is serviced on the next one instead of stranding. A
+    /// blocked recv (byte channel full) is removed from `pending_readable`; a
+    /// blocked send (no capacity) is removed from `runnable_send`; a parked
+    /// stream only counts once its accept-resume bit is set; a credit-blocked
+    /// open counts nothing here (its backlog signal is set in `stage_open`).
+    fn has_runnable_remainder(&self) -> bool {
+        !self.pending_resume.is_empty()
+            || !self.pending_readable.is_empty()
+            || !self.pending_admit_order.is_empty()
+            || !self.runnable_send.is_empty()
+            || (!self.parked_bidi.is_empty()
+                && self.accept_bidi_resume.load(Ordering::Relaxed))
+            || (!self.parked_uni.is_empty() && self.accept_uni_resume.load(Ordering::Relaxed))
     }
 
     /// The mandatory explicit-close barrier (§5.2, §8.3, invariant 10), run
@@ -1288,7 +1373,8 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             bytes: rx,
             terminal: terminal.clone(),
             resume: Arc::clone(&resume),
-            cmd_tx,
+            cmd_tx: cmd_tx.clone(),
+            cleanup: HandoffCleanup::new(id, true, cmd_tx),
         };
         let state = if recv_done {
             None
@@ -1682,11 +1768,14 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
 
     /// Reclaim a retained send entry once its direction is terminal and the recv
     /// half is no longer live (§6.2, invariant 8). Called from the drop-driven
-    /// cleanup edges (a serviced FIN/reset, or a recv-half terminal) where no
-    /// further `Send`/`Finish` can arrive, so the sticky `self.send` entry —
-    /// retained for late deferred ops — is safe to drop for locally-opened AND
-    /// admitted streams. Not called from the generic peer-driven send terminal
-    /// (§5.3a) where the front-end send handle may still enqueue work.
+    /// cleanup edges where no further `Send`/`Finish` can arrive: a serviced
+    /// graceful **FIN** (`service_finish_turn`, where the front-end half is
+    /// `finalized`) and a **recv-half terminal** (`mark_recv_done`). It is
+    /// deliberately NOT called from the local-**reset** edge (a worker-side
+    /// duplicate `Reset` must still resolve idempotently against the sticky
+    /// terminal) nor from the generic peer-driven send terminal (§5.3a, where a
+    /// still-live send handle may enqueue a late op). The `finished`/`recv`
+    /// guard keeps a bidi entry retained while its recv half is still live.
     fn reclaim_finished_send(&mut self, id: u64) {
         let finished = self.send.get(&id).map(|s| s.finished).unwrap_or(false);
         if finished && !self.recv.contains_key(&id) {
@@ -1910,14 +1999,17 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                     }
                 }
                 // A sent FIN closes the send direction: mark it done so contract
-                // A reclaims an admitted bidi once its recv half also ends, and
-                // a later Send/Finish completes via the retained sticky state
-                // (§5.3a).
+                // A reclaims an admitted bidi once its recv half also ends.
                 self.mark_send_done(id);
-                // The retained entry is reclaimed at the recv-done edge
-                // (`mark_recv_done`), i.e. once BOTH directions are terminal —
-                // a still-live send handle may still complete a late op against
-                // the sticky state until then (§5.3a, §6.2 invariant 8).
+                // Reclaim the retained send entry now IF the recv half is already
+                // gone (the normal server order: request read to FIN → recv
+                // reclaimed, then response + FIN). The send half is `finalized`
+                // after a graceful FIN, so no late Send/Finish can legitimately
+                // arrive; the guard keeps it retained while a bidi recv half is
+                // still live (client order → reclaimed at the recv-done edge).
+                // Without this, one send entry leaks per handled request (§6.2
+                // invariant 8).
+                self.reclaim_finished_send(id);
                 TurnOutcome::Drop
             }
             Err(err) => self.classify_send_err(qconn, id, &err),
@@ -2142,7 +2234,8 @@ fn build_send<B: Buf>(
     let handoff = SendHandoff {
         id,
         status: status.clone(),
-        cmd_tx,
+        cmd_tx: cmd_tx.clone(),
+        cleanup: HandoffCleanup::new(id, false, cmd_tx),
     };
     let state = if send_done {
         None
@@ -3568,6 +3661,68 @@ mod tests {
         assert!(matches!(uni_reply.try_recv(), Ok(Err(_))), "staged uni open resolved");
         assert!(d.open_bidi.is_empty());
         assert!(d.open_uni.is_empty());
+    }
+
+    // Regression (final review, Opus + GPT): the send registry entry must be
+    // reclaimed when the send half FINs AFTER the recv half already terminated
+    // (the normal server request→response order), else one entry leaks per
+    // handled request.
+    #[test]
+    fn send_entry_reclaimed_when_send_finishes_after_recv() {
+        let (mut d, _h) = driver();
+        d.admit
+            .insert(0, AdmitState::Registered { send_done: false, recv_done: false });
+        let (tx, _rx) = mpsc::channel(BYTE_CHANNEL_DEPTH);
+        d.recv.insert(
+            0,
+            StreamRecvState {
+                bytes: tx,
+                terminal: TerminalCell::new(),
+                resume: Arc::new(AtomicBool::new(false)),
+                blocked: false,
+            },
+        );
+        d.send.insert(0, StreamSendState::new());
+
+        let mut c = MockConn::new();
+        // 1. Server reads the request to FIN → recv terminal first.
+        c.script_recv(0, [data(b"req", true)]);
+        d.pending_readable.push_back(0);
+        d.readable_set.insert(0);
+        d.read_budget = READ_BUDGET;
+        d.run_read_pump(&mut c);
+        assert!(!d.recv.contains_key(&0), "recv reclaimed on FIN");
+        assert!(d.send.contains_key(&0), "send retained while still open");
+
+        // 2. Server sends the response + FIN → send terminal LAST.
+        let mut fin = push_finish(&mut d, 0);
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+        assert!(matches!(fin.try_recv(), Ok(Ok(()))));
+        assert!(
+            !d.send.contains_key(&0),
+            "send entry reclaimed on FIN-after-recv-done (no per-request leak)"
+        );
+    }
+
+    // Regression (final review, GPT): a RecvResume applied during process_writes
+    // on a PACKET iteration (the pump already ran in process_reads and does not
+    // re-run) must still force another iteration via the needs_iteration
+    // recompute — otherwise the resumed read strands under backpressure.
+    #[test]
+    fn packet_path_resume_forces_another_iteration() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        // Simulate a packet iteration: process_reads already ran.
+        d.reads_ran_this_iter = true;
+        d.needs_iteration = false;
+        // A RecvResume arrives (front end freed capacity) and is applied here.
+        d.inbox.push_back(DriverCommand::RecvResume { id: 0 });
+        d.do_process_writes(&mut c).unwrap();
+        assert!(
+            d.needs_iteration,
+            "a resume applied on a packet iteration must not strand"
+        );
     }
 }
 
