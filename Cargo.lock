@@ -1849,6 +1849,7 @@ dependencies = [
  "bytes",
  "futures",
  "h3",
+ "http",
  "rcgen",
  "tokio",
  "tokio-quiche",
