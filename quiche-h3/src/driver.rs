@@ -25,8 +25,8 @@ use tokio_quiche::{ApplicationOverQuic, QuicResult};
 use crate::buffer::{send_from_buf, TerminalCell, MAX_CHUNK, PKT_BUF_LEN};
 use crate::conn::QuicConn;
 use crate::error::{
-    classify_stream_recv_error, classify_stream_send_error, ConnTerminal, RecvEnd, SendEnd,
-    StreamRecvClass, StreamSendClass, H3_NO_ERROR,
+    classify_stream_recv_error, classify_stream_send_error, conn_terminal_from_error, CloseOrigin,
+    ConnTerminal, RecvEnd, SendEnd, StreamRecvClass, StreamSendClass, H3_NO_ERROR,
 };
 use crate::quiche::{self, Shutdown};
 
@@ -309,6 +309,28 @@ pub(crate) struct DriverHandles<B: Buf> {
     pub(crate) established_rx: oneshot::Receiver<Result<(), SetupFailure>>,
     /// Shared connection state (holds the terminal cell).
     pub(crate) shared: Arc<ConnShared>,
+    /// Clone of the BIDI accept-terminal cell so `Connection::poll_accept_bidi`
+    /// resolves a blocked accept when the connection terminates (§5).
+    pub(crate) accept_terminal_bidi: TerminalCell<Arc<ConnTerminal>>,
+    /// Clone of the UNI accept-terminal cell so `Connection::poll_accept_uni`
+    /// resolves a blocked accept when the connection terminates (§5).
+    pub(crate) accept_terminal_uni: TerminalCell<Arc<ConnTerminal>>,
+}
+
+/// A staged explicit local `Close` awaiting the mandatory close barrier (§5.2,
+/// invariant 10). First-close-wins: stage (a) records only the first effective
+/// one; the barrier applies it after at most one bounded write batch.
+pub(crate) struct PendingClose {
+    pub(crate) code: u64,
+    pub(crate) reason: Bytes,
+}
+
+/// A recorded successful `qconn.close` (explicit or synthetic last-handle
+/// `H3_NO_ERROR`), used by `on_conn_close` to classify the terminal (§8.3).
+/// Its presence outranks `local_error()` and suppresses a second close call.
+pub(crate) struct RecordedLocalClose {
+    pub(crate) code: u64,
+    pub(crate) reason: Bytes,
 }
 
 /// The decision `wait_for_data` makes before awaiting (§5, finding 2). Factored
@@ -399,6 +421,25 @@ pub(crate) struct QuicheDriver<B: Buf = Bytes> {
     reads_ran_this_iter: bool,
     /// Shared chunk counter for the read pump (§5.1).
     read_budget: usize,
+
+    // ----- connection close / teardown (§5.2, §8.3) -----
+    /// The first effective explicit `Close`, staged in stage (a) and applied at
+    /// the mandatory close barrier after the bounded write stage (invariant 10).
+    pending_close: Option<PendingClose>,
+    /// Set once the barrier calls `qconn.close` (explicit or synthetic): a
+    /// second call is never issued, and any attempt suppresses synthetic
+    /// `H3_NO_ERROR` (§5.2).
+    explicit_close_attempted: bool,
+    /// A recorded successful `qconn.close` (§8.3); outranks `local_error()`.
+    local_close: Option<RecordedLocalClose>,
+    /// A `qconn.close` result our barrier could not classify (`Err` other than
+    /// `Done`): an adapter bug that fails the callback as `Internal` (§8.3).
+    close_bug: Option<&'static str>,
+    /// Accept-terminal cell shared with `poll_accept_bidi` (§5): published once
+    /// at the connection-terminal edge so a blocked accept resolves.
+    accept_terminal_bidi: TerminalCell<Arc<ConnTerminal>>,
+    /// Accept-terminal cell shared with `poll_accept_uni` (§5).
+    accept_terminal_uni: TerminalCell<Arc<ConnTerminal>>,
 }
 
 impl<B: Buf + Send + 'static> QuicheDriver<B> {
@@ -412,6 +453,8 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         let (accept_uni_tx, accept_uni_rx) = mpsc::channel(accept_uni_cap.max(1));
         let (est_tx, est_rx) = oneshot::channel();
         let shared = ConnShared::new();
+        let accept_terminal_bidi = TerminalCell::new();
+        let accept_terminal_uni = TerminalCell::new();
 
         let driver = QuicheDriver {
             shared: Arc::clone(&shared),
@@ -444,6 +487,12 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             last_handle_teardown: false,
             reads_ran_this_iter: false,
             read_budget: READ_BUDGET,
+            pending_close: None,
+            explicit_close_attempted: false,
+            local_close: None,
+            close_bug: None,
+            accept_terminal_bidi: accept_terminal_bidi.clone(),
+            accept_terminal_uni: accept_terminal_uni.clone(),
         };
 
         let handles = DriverHandles {
@@ -452,6 +501,8 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             accept_uni_rx,
             established_rx: est_rx,
             shared,
+            accept_terminal_bidi,
+            accept_terminal_uni,
         };
 
         (driver, handles)
@@ -514,10 +565,10 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
     /// iteration start, so `needs_iteration`/`read_budget` are reset here; on a
     /// packet iteration the pump already ran and its deferral is preserved;
     /// (d) the single destructive **writable** scan; (e) the round-robin
-    /// runnable-send drain. The Phase 5 close barrier will slot between (e) and
-    /// teardown. Stages (d)/(e) run once per iteration on both paths, preserving
-    /// the single-writable-scan-per-iteration contract (§5.3a).
-    fn do_process_writes<C: QuicConn>(&mut self, qconn: &mut C) {
+    /// runnable-send drain; (f) the mandatory close barrier. Stages (d)/(e) run
+    /// once per iteration on both paths, preserving the single-writable-scan-
+    /// per-iteration contract (§5.3a).
+    fn do_process_writes<C: QuicConn>(&mut self, qconn: &mut C) -> QuicResult<()> {
         let no_packet = !self.reads_ran_this_iter;
         if no_packet {
             // No-packet iteration start: reset the per-iteration signals before
@@ -533,6 +584,80 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         self.stage_send(qconn);
         // Common per-iteration boundary: clear only the pump-selection flag.
         self.reads_ran_this_iter = false;
+        // (f) The mandatory non-write-budgeted close barrier, AFTER stage (e)
+        // (§5.2, invariant 10): applies a staged explicit `Close` or the
+        // synthetic last-handle `H3_NO_ERROR` close even after a saturated
+        // write batch.
+        self.apply_close_barrier(qconn)
+    }
+
+    /// The mandatory explicit-close barrier (§5.2, §8.3, invariant 10), run
+    /// after the bounded stream-write stage and bypassing `WRITE_BUDGET`. It
+    /// applies at most one `qconn.close` per connection and classifies its
+    /// result:
+    /// - a staged explicit `Close` takes precedence and, on `Ok`, records the
+    ///   exact `local_close`; `Done` defers to the pre-existing quiche terminal;
+    /// - otherwise, on last-handle teardown with no peer/local/timeout terminal
+    ///   and no prior recorded close, it issues the synthetic
+    ///   `qconn.close(true, H3_NO_ERROR, b"")`.
+    ///
+    /// Either `Ok` or `Done` sets `graceful_close_issued` so `wait_for_data`
+    /// stays pending; any other `Err` is an adapter bug that fails the callback
+    /// as `Internal` (returned as an error from `process_writes`).
+    fn apply_close_barrier<C: QuicConn>(&mut self, qconn: &mut C) -> QuicResult<()> {
+        if self.explicit_close_attempted {
+            return Ok(());
+        }
+        if let Some(pc) = self.pending_close.take() {
+            self.explicit_close_attempted = true;
+            match qconn.close(true, pc.code, &pc.reason) {
+                Ok(()) => {
+                    self.local_close = Some(RecordedLocalClose {
+                        code: pc.code,
+                        reason: pc.reason,
+                    });
+                    self.graceful_close_issued = true;
+                }
+                Err(quiche::Error::Done) => {
+                    // A pre-existing quiche terminal supplies the cause; do not
+                    // fabricate acceptance (§8.3).
+                    self.graceful_close_issued = true;
+                }
+                Err(_) => {
+                    self.close_bug = Some("explicit qconn.close returned an unexpected error");
+                    return Err(self.close_bug.unwrap().into());
+                }
+            }
+            return Ok(());
+        }
+        // Synthetic last-handle teardown close: only when no explicit close was
+        // staged/attempted and no quiche terminal (peer/local/timeout) or prior
+        // recorded close exists (§5.2, §8.3).
+        if self.last_handle_teardown
+            && qconn.peer_error().is_none()
+            && qconn.local_error().is_none()
+            && !qconn.is_timed_out()
+            && self.local_close.is_none()
+        {
+            self.explicit_close_attempted = true;
+            match qconn.close(true, H3_NO_ERROR, b"") {
+                Ok(()) => {
+                    self.local_close = Some(RecordedLocalClose {
+                        code: H3_NO_ERROR,
+                        reason: Bytes::new(),
+                    });
+                    self.graceful_close_issued = true;
+                }
+                Err(quiche::Error::Done) => {
+                    self.graceful_close_issued = true;
+                }
+                Err(_) => {
+                    self.close_bug = Some("last-handle qconn.close returned an unexpected error");
+                    return Err(self.close_bug.unwrap().into());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Bounded **destructive** readable intake (§5.1, iter9 finding 2): each id
@@ -1059,14 +1184,23 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         self.mark_recv_done(id);
     }
 
-    /// A stream-level `ConnGone` resolves via the connection terminal if one is
-    /// already published, otherwise seals the recv half so it never spins
-    /// (the connection close machine, Phases 4–5, owns the connection edge).
+    /// A stream-level `ConnGone` (`InvalidState`/`FinalSize`/`FlowControl` while
+    /// closing) resolves via the connection terminal. If the terminal is already
+    /// published, seal the recv half now; otherwise **leave the recv entry in
+    /// place** so `on_conn_close` publishes the final `RecvEnd::Conn` into its
+    /// cell — removing it here (before the terminal exists) would strand the
+    /// front end with a drained queue and no terminal (a hang). Cursor
+    /// memberships are dropped either way so a dead stream is not re-drained.
     fn resolve_recv_via_conn(&mut self, id: u64) {
-        if let Some(terminal) = self.shared.conn_terminal.get() {
-            self.publish_recv_terminal(id, RecvEnd::Conn(terminal));
+        match self.shared.conn_terminal.get() {
+            Some(terminal) => {
+                self.publish_recv_terminal(id, RecvEnd::Conn(terminal));
+                self.mark_recv_done(id);
+            }
+            None => {
+                self.drop_recv_memberships(id);
+            }
         }
-        self.mark_recv_done(id);
     }
 
     /// Direction-aware shutdown of an un-admitted peer stream (§5.1): peer bidi
@@ -1178,13 +1312,58 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                     let _ = qconn.stream_shutdown(id, Shutdown::Read, code);
                     self.mark_recv_done(id);
                 }
-                // Close / Open* / ConnectionDropped are driven by Phases 5–6.
+                DriverCommand::Close { code, reason }
+                    if self.pending_close.is_none() && !self.explicit_close_attempted =>
+                {
+                    // First-close-wins (§5.2, invariant 10): stage only the first
+                    // effective one; a later Close (or one after an attempt) is an
+                    // idempotent no-op. The barrier applies it after the bounded
+                    // write stage, bypassing WRITE_BUDGET.
+                    self.pending_close = Some(PendingClose { code, reason });
+                }
+                DriverCommand::ConnectionDropped => {
+                    // `Connection::drop`, sent before the accept receivers close:
+                    // clean parked/pending peer streams (direction-aware shutdown,
+                    // drop bookkeeping) since they can no longer be handed over
+                    // (§5.2, finding 4).
+                    self.clean_undelivered_peer_streams(qconn);
+                }
+                // A non-first `Close` (guard above failed) is an idempotent
+                // no-op; Open* replies are driven by Phase 6 (resolved locally on
+                // the close-admission path via `shared.conn_terminal`).
                 _ => {}
             }
         }
         if !self.inbox.is_empty() {
             // Budget-deferred commands remain in receipt order (§5.2).
             self.needs_iteration = true;
+        }
+    }
+
+    /// `ConnectionDropped` cleanup (§5.2, finding 4): the front-end `Connection`
+    /// is gone and the accept receivers are about to close, so no parked or
+    /// pending peer stream can ever be handed over. Direction-aware `shutdown`
+    /// each (peer bidi: both; peer uni: read-only) and drop all admission
+    /// bookkeeping so nothing lingers.
+    fn clean_undelivered_peer_streams<C: QuicConn>(&mut self, qconn: &mut C) {
+        // Parked (accept-full) streams: their `admit` entry is `Parked`.
+        let parked: Vec<u64> = self
+            .parked_bidi
+            .drain(..)
+            .chain(self.parked_uni.drain(..))
+            .collect();
+        for id in parked {
+            if let Some(AdmitState::Parked(_)) = self.admit.get(&id) {
+                self.shutdown_peer_directions(qconn, id, is_bidi(id));
+                self.admit.remove(&id);
+            }
+        }
+        // Discovered-but-not-yet-admitted streams.
+        let pending: Vec<u64> = self.pending_admit_order.drain(..).collect();
+        for id in pending {
+            if self.pending_admit.remove(&id).is_some() {
+                self.shutdown_peer_directions(qconn, id, is_bidi(id));
+            }
         }
     }
 
@@ -1421,15 +1600,14 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             }
             StreamSendClass::Blocked => self.rearm_send(qconn, id),
             StreamSendClass::ConnGone => {
-                let end = self
-                    .shared
-                    .conn_terminal
-                    .get()
-                    .map(SendEnd::Conn)
-                    .unwrap_or(SendEnd::Conn(Arc::new(ConnTerminal::Internal(
-                        "stream_send after connection gone",
-                    ))));
-                self.send_terminal_transition(id, end);
+                match self.shared.conn_terminal.get() {
+                    Some(t) => self.send_terminal_transition(id, SendEnd::Conn(t)),
+                    // Closing window before on_conn_close classified the terminal:
+                    // leave the send_ops in place (do NOT pin a fabricated
+                    // `Internal` via the first-writer-wins `status` cell).
+                    // on_conn_close drains them with the final terminal (§5.2).
+                    None => self.drop_send_membership(id),
+                }
                 TurnOutcome::Drop
             }
             StreamSendClass::Limit | StreamSendClass::Bug(_) => {
@@ -1476,6 +1654,111 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
     fn enqueue_resume(&mut self, id: u64) {
         if self.resume_set.insert(id) {
             self.pending_resume.push_back(id);
+        }
+    }
+
+    /// Classify the connection terminal at worker exit by the §8.3 PRECEDENCE:
+    /// `Internal` (our own recorded bug) → `peer_error` → `Timeout` → recorded
+    /// explicit local close (or successful last-handle `H3_NO_ERROR`) →
+    /// `local_error`. A last-handle `H3_NO_ERROR` and an explicit local `Close`
+    /// are both carried in `local_close`; both outrank `local_error()` and are
+    /// only reachable when no peer terminal/timeout preempts them.
+    fn classify_conn_terminal<C: QuicConn>(&self, qconn: &C) -> ConnTerminal {
+        if let Some(msg) = self.close_bug {
+            return ConnTerminal::Internal(msg);
+        }
+        if let Some(pe) = qconn.peer_error() {
+            return conn_terminal_from_error(CloseOrigin::Peer, pe);
+        }
+        if qconn.is_timed_out() {
+            return ConnTerminal::Timeout;
+        }
+        if let Some(lc) = &self.local_close {
+            return ConnTerminal::AppClose {
+                origin: CloseOrigin::Local,
+                error_code: lc.code,
+                reason: lc.reason.clone(),
+            };
+        }
+        if let Some(le) = qconn.local_error() {
+            return conn_terminal_from_error(CloseOrigin::Local, le);
+        }
+        // No recorded cause after establishment is an adapter contract break.
+        ConnTerminal::Internal("connection closed without a recorded terminal")
+    }
+
+    /// The single finite-cut teardown funnel (§9, §8.3, invariant 14), generic
+    /// over [`QuicConn`] for mock testing. It (1) classifies the connection
+    /// terminal once, (2) publishes it into `shared.conn_terminal`, both
+    /// accept-terminal cells, and every live recv/send cell, (3) closes command
+    /// ingress and drains the finite remaining command set — completing every
+    /// reply/completion channel with the terminal, never a bare oneshot cancel.
+    /// It never calls `qconn.close` (§8.3).
+    fn do_on_conn_close<C: QuicConn>(&mut self, qconn: &mut C) {
+        let terminal = Arc::new(self.classify_conn_terminal(qconn));
+
+        // (2) Publish the terminal to every out-of-band cell (first-writer-wins).
+        self.shared.conn_terminal.set(Arc::clone(&terminal));
+        self.accept_terminal_bidi.set(Arc::clone(&terminal));
+        self.accept_terminal_uni.set(Arc::clone(&terminal));
+        for state in self.recv.values() {
+            state.terminal.set(RecvEnd::Conn(Arc::clone(&terminal)));
+        }
+        // Publish the send terminal into each live half AND drain every
+        // registry-held `send_ops` remainder so a flushing Send/Finish does not
+        // leak a bare cancel (§5.3a).
+        let mut pending_ops: Vec<SendOp<B>> = Vec::new();
+        for state in self.send.values_mut() {
+            let end = SendEnd::Conn(Arc::clone(&terminal));
+            state.status.set(end.clone());
+            if state.terminal.is_none() {
+                state.terminal = Some(end);
+            }
+            pending_ops.extend(state.send_ops.drain(..));
+        }
+        for op in pending_ops {
+            op.complete(Err(SendEnd::Conn(Arc::clone(&terminal))));
+        }
+
+        // (3) Close command ingress, then drain the now-finite command set:
+        // `self.inbox` first, then `cmd_rx.try_recv()` until empty (§5.2, M3).
+        self.cmd_rx.close();
+        loop {
+            let cmd = match self.inbox.pop_front() {
+                Some(cmd) => cmd,
+                None => match self.cmd_rx.try_recv() {
+                    Ok(cmd) => cmd,
+                    Err(_) => break,
+                },
+            };
+            self.complete_command_on_close(cmd, &terminal);
+        }
+    }
+
+    /// Resolve one drained command against the published connection terminal
+    /// (§5.2). A command owning a reply/completion channel is completed with the
+    /// terminal; a reply-free lifecycle command is dropped because the stream's
+    /// own cells already carry it. Never a bare oneshot cancel.
+    fn complete_command_on_close(&self, cmd: DriverCommand<B>, terminal: &Arc<ConnTerminal>) {
+        match cmd {
+            DriverCommand::Send { done, .. } | DriverCommand::Finish { done, .. } => {
+                let _ = done.send(Err(SendEnd::Conn(Arc::clone(terminal))));
+            }
+            DriverCommand::OpenBidi { reply } => {
+                let _ = reply.send(Err(Arc::clone(terminal)));
+            }
+            DriverCommand::OpenUni { reply } => {
+                let _ = reply.send(Err(Arc::clone(terminal)));
+            }
+            // Reply-free lifecycle commands: the stream/connection cells already
+            // carry the terminal, so these are dropped.
+            DriverCommand::Reset { .. }
+            | DriverCommand::StopSending { .. }
+            | DriverCommand::RecvResume { .. }
+            | DriverCommand::AcceptBidiResume
+            | DriverCommand::AcceptUniResume
+            | DriverCommand::ConnectionDropped
+            | DriverCommand::Close { .. } => {}
         }
     }
 }
@@ -1581,8 +1864,16 @@ impl<B: Buf + Send + 'static> ApplicationOverQuic for QuicheDriver<B> {
     }
 
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
-        self.do_process_writes(qconn);
-        Ok(())
+        self.do_process_writes(qconn)
+    }
+
+    fn on_conn_close<M: tokio_quiche::metrics::Metrics>(
+        &mut self,
+        qconn: &mut QuicheConnection,
+        _metrics: &M,
+        _connection_result: &QuicResult<()>,
+    ) {
+        self.do_on_conn_close(qconn);
     }
 }
 
@@ -1991,7 +2282,7 @@ mod tests {
         // defers and sets needs_iteration), then process_writes runs.
         d.do_process_reads(&mut c);
         assert!(d.needs_iteration, "pump should defer under READ_BUDGET");
-        d.do_process_writes(&mut c);
+        d.do_process_writes(&mut c).expect("writes ok");
         assert!(
             d.needs_iteration,
             "deferral must survive process_writes in the same iteration"
@@ -2366,6 +2657,367 @@ mod tests {
             Some(SendEnd::Stopped { error_code: 88 })
         ));
     }
+
+    // ===== Phase 5: connection CLOSE, teardown, finite close-cut (§11) =====
+
+    fn conn_err(is_app: bool, code: u64, reason: &[u8]) -> quiche::ConnectionError {
+        quiche::ConnectionError {
+            is_app,
+            error_code: code,
+            reason: reason.to_vec(),
+        }
+    }
+
+    /// §11: last-handle teardown issues the synthetic `H3_NO_ERROR` close, records
+    /// it, and arms `graceful_close_issued` so `wait_for_data` stays pending.
+    #[test]
+    fn last_handle_teardown_issues_h3_no_error_close() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        d.last_handle_teardown = true;
+        d.do_process_writes(&mut c).expect("clean teardown");
+        assert_eq!(c.closed, Some((true, H3_NO_ERROR, b"".to_vec())));
+        assert!(d.explicit_close_attempted);
+        assert!(d.graceful_close_issued);
+        let lc = d.local_close.as_ref().expect("recorded last-handle close");
+        assert_eq!(lc.code, H3_NO_ERROR);
+        assert!(lc.reason.is_empty());
+    }
+
+    /// §11: an explicit local `Close` crosses the mandatory barrier and is applied
+    /// even after a saturated (WRITE_BUDGET) stream-write batch, recording the
+    /// exact code/reason. A subsequent last-handle teardown issues NO synthetic
+    /// `H3_NO_ERROR` (the attempt suppresses it).
+    #[test]
+    fn explicit_close_crosses_barrier_after_saturated_batch() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        // Saturate stage (e): WRITE_BUDGET+1 streams that only make partial
+        // progress (capacity 1) so every turn requeues and the budget is spent.
+        for id in 0..=(WRITE_BUDGET as u64) {
+            let sid = id * 4; // client-bidi ids
+            c.send_capacity.insert(sid, 1);
+            let _rx = push_send(&mut d, sid, b"hello world");
+        }
+        // Stage the explicit close AFTER the sends (same inbox drain).
+        d.inbox.push_back(DriverCommand::Close {
+            code: 0x1234,
+            reason: Bytes::from_static(b"bye"),
+        });
+        d.do_process_writes(&mut c).expect("close applied");
+
+        // The write batch was saturated (needs another iteration)...
+        assert!(d.needs_iteration, "write batch should be saturated");
+        // ...but the close barrier still applied the explicit close.
+        assert_eq!(c.closed, Some((true, 0x1234, b"bye".to_vec())));
+        let lc = d.local_close.as_ref().expect("explicit close recorded");
+        assert_eq!(lc.code, 0x1234);
+        assert_eq!(&lc.reason[..], b"bye");
+        assert!(d.graceful_close_issued);
+
+        // A later last-handle teardown must NOT issue a second/synthetic close.
+        d.last_handle_teardown = true;
+        d.reads_ran_this_iter = false;
+        d.do_process_writes(&mut c).expect("no second close");
+        assert_eq!(
+            c.closed,
+            Some((true, 0x1234, b"bye".to_vec())),
+            "synthetic H3_NO_ERROR must be suppressed"
+        );
+    }
+
+    /// §11: first-close-wins — a second `Close` command is an idempotent no-op.
+    #[test]
+    fn first_close_wins_second_ignored() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        d.inbox.push_back(DriverCommand::Close {
+            code: 0xaaa,
+            reason: Bytes::from_static(b"first"),
+        });
+        d.inbox.push_back(DriverCommand::Close {
+            code: 0xbbb,
+            reason: Bytes::from_static(b"second"),
+        });
+        d.apply_inbox(&mut c);
+        let pc = d.pending_close.as_ref().expect("first staged");
+        assert_eq!(pc.code, 0xaaa);
+        assert_eq!(&pc.reason[..], b"first");
+        // Barrier applies the FIRST.
+        d.apply_close_barrier(&mut c).expect("applied");
+        assert_eq!(c.closed, Some((true, 0xaaa, b"first".to_vec())));
+    }
+
+    /// §8.3 precedence: a peer application close outranks a racing last-handle
+    /// teardown — the synthetic `H3_NO_ERROR` is suppressed and the terminal is
+    /// `AppClose { origin: Peer }`.
+    #[test]
+    fn peer_app_close_outranks_last_handle_teardown() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        c.peer_error = Some(conn_err(true, 0x99, b"peer-bye"));
+        d.last_handle_teardown = true;
+        // Barrier must NOT issue a synthetic close (a peer terminal exists).
+        d.do_process_writes(&mut c).expect("no synthetic close");
+        assert_eq!(c.closed, None, "synthetic close suppressed by peer terminal");
+        // Classification surfaces the peer app-close.
+        d.do_on_conn_close(&mut c);
+        match d.shared.conn_terminal.get().as_deref() {
+            Some(ConnTerminal::AppClose {
+                origin: CloseOrigin::Peer,
+                error_code: 0x99,
+                reason,
+            }) => assert_eq!(&reason[..], b"peer-bye"),
+            other => panic!("expected AppClose{{Peer}}, got {other:?}"),
+        }
+    }
+
+    /// §8.3: idle timeout classifies as `Timeout`.
+    #[test]
+    fn timeout_classifies_as_timeout() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        c.timed_out = true;
+        d.do_on_conn_close(&mut c);
+        assert!(matches!(
+            d.shared.conn_terminal.get().as_deref(),
+            Some(ConnTerminal::Timeout)
+        ));
+    }
+
+    /// §9/§8.3: `on_conn_close` publishes the terminal to a live recv cell
+    /// (`RecvEnd::Conn`), a live send cell (`SendEnd::Conn`), and BOTH
+    /// accept-terminal cells, plus the connection-level cell.
+    #[test]
+    fn on_conn_close_publishes_to_all_out_of_band_cells() {
+        let (mut d, mut h) = driver();
+        let mut c = MockConn::new();
+        // Admit a live peer bidi (creates a live recv + send half).
+        c.script_recv(0, [data(b"hi", false)]);
+        c.queue_readable([0]);
+        d.read_budget = READ_BUDGET;
+        d.run_read_pump(&mut c);
+        let ho = h.accept_bidi_rx.try_recv().expect("admitted");
+
+        c.local_error = Some(conn_err(true, 0x100, b""));
+        d.do_on_conn_close(&mut c);
+
+        assert!(matches!(ho.recv.terminal.get(), Some(RecvEnd::Conn(_))));
+        assert!(matches!(ho.send.status.get(), Some(SendEnd::Conn(_))));
+        assert!(h.accept_terminal_bidi.get().is_some(), "bidi accept cell");
+        assert!(h.accept_terminal_uni.get().is_some(), "uni accept cell");
+        assert!(d.shared.conn_terminal.get().is_some(), "conn cell");
+    }
+
+    /// §5.3a/§14 invariant 14: a Send whose remainder is still in `send_ops`
+    /// drains with `SendEnd::Conn` on close — never a bare oneshot cancel.
+    #[test]
+    fn pending_send_op_drains_with_conn_terminal() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        // Queue a Send op WITHOUT running stage (e), so it stays in send_ops.
+        let mut done = push_send(&mut d, 0, b"payload");
+        d.apply_inbox(&mut c);
+        assert!(!d.send.get(&0).unwrap().send_ops.is_empty());
+
+        c.peer_error = Some(conn_err(true, 0x7, b""));
+        d.do_on_conn_close(&mut c);
+
+        match done.try_recv() {
+            Ok(Err(SendEnd::Conn(_))) => {}
+            other => panic!("expected SendEnd::Conn, got {other:?}"),
+        }
+    }
+
+    // Regression (review finding): a Send that hits `ConnGone` in the closing
+    // window BEFORE on_conn_close classified the terminal must NOT be pinned with
+    // a fabricated `Internal` (first-writer-wins status). It stays in send_ops
+    // and on_conn_close drains it with the real terminal.
+    #[test]
+    fn send_conngone_in_closing_window_defers_to_on_conn_close() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        let mut done = push_send(&mut d, 0, b"x");
+        c.send_errors
+            .entry(0)
+            .or_default()
+            .push_back(quiche::Error::InvalidState);
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+        // Not completed, not pinned: op retained, status cell empty.
+        assert!(matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        assert!(!d.send.get(&0).unwrap().send_ops.is_empty());
+        assert!(d.send.get(&0).unwrap().status.get().is_none());
+        // on_conn_close classifies and drains it with SendEnd::Conn.
+        c.peer_error = Some(conn_err(true, 0x101, b""));
+        d.do_on_conn_close(&mut c);
+        match done.try_recv() {
+            Ok(Err(SendEnd::Conn(_))) => {}
+            other => panic!("expected SendEnd::Conn after close, got {other:?}"),
+        }
+    }
+
+    // Regression (review finding): a recv stream hitting `ConnGone` in the closing
+    // window must NOT be removed before the terminal is published — otherwise
+    // on_conn_close cannot publish `RecvEnd::Conn` and the front end hangs. The
+    // recv entry is retained so on_conn_close seals it.
+    #[test]
+    fn recv_conngone_in_closing_window_defers_to_on_conn_close() {
+        let (mut d, _h) = driver();
+        let (tx, _rx) = mpsc::channel(BYTE_CHANNEL_DEPTH);
+        let terminal_cell = TerminalCell::new();
+        d.recv.insert(
+            0,
+            StreamRecvState {
+                bytes: tx,
+                terminal: terminal_cell.clone(),
+                resume: Arc::new(AtomicBool::new(false)),
+                blocked: false,
+            },
+        );
+        d.pending_readable.push_back(0);
+        d.readable_set.insert(0);
+        let mut c = MockConn::new();
+        c.readable_ids.insert(0);
+        c.script_recv(0, [RecvStep::Err(quiche::Error::InvalidState)]);
+        d.read_budget = READ_BUDGET;
+        d.run_read_pump(&mut c);
+        // Recv entry retained, terminal cell still empty (no fabricated seal).
+        assert!(d.recv.contains_key(&0));
+        assert!(terminal_cell.get().is_none());
+        // on_conn_close publishes RecvEnd::Conn into the cell.
+        c.peer_error = Some(conn_err(true, 0x102, b""));
+        d.do_on_conn_close(&mut c);
+        assert!(matches!(terminal_cell.get(), Some(RecvEnd::Conn(_))));
+    }
+
+    /// §5.2/M3 invariant 14: a `OpenBidi` deferred in `cmd_rx` resolves
+    /// `Err(terminal)` after `cmd_rx.close()` — the finite drain completes it.
+    #[test]
+    fn deferred_open_bidi_resolves_err_after_close() {
+        let (mut d, h) = driver();
+        let mut c = MockConn::new();
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        h.cmd_tx
+            .send(DriverCommand::OpenBidi { reply: reply_tx })
+            .expect("enqueue open");
+
+        c.peer_error = Some(conn_err(true, 0x2, b""));
+        d.do_on_conn_close(&mut c);
+
+        match reply_rx.try_recv() {
+            Ok(Err(t)) => assert!(matches!(
+                t.as_ref(),
+                ConnTerminal::AppClose {
+                    origin: CloseOrigin::Peer,
+                    ..
+                }
+            )),
+            Ok(Ok(_)) => panic!("expected Err(terminal), got Ok(handoff)"),
+            Err(e) => panic!("expected Err(terminal), got {e:?}"),
+        }
+    }
+
+    /// §8.3: a `qconn.close` returning `Done` defers to the pre-existing quiche
+    /// terminal without fabricating acceptance (no `local_close` recorded) and
+    /// suppresses a synthetic `H3_NO_ERROR`.
+    #[test]
+    fn done_close_result_defers_to_preexisting_terminal() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        // The staged explicit close will hit a Done result from quiche.
+        c.close_result = Some(quiche::Error::Done);
+        c.peer_error = Some(conn_err(true, 0x55, b"peer"));
+        d.inbox.push_back(DriverCommand::Close {
+            code: 0x1,
+            reason: Bytes::from_static(b"local"),
+        });
+        d.apply_inbox(&mut c);
+        d.apply_close_barrier(&mut c).expect("done defers, not a bug");
+
+        assert!(d.explicit_close_attempted);
+        assert!(d.graceful_close_issued);
+        assert!(d.local_close.is_none(), "Done must not record acceptance");
+
+        d.do_on_conn_close(&mut c);
+        match d.shared.conn_terminal.get().as_deref() {
+            Some(ConnTerminal::AppClose {
+                origin: CloseOrigin::Peer,
+                error_code: 0x55,
+                ..
+            }) => {}
+            other => panic!("expected pre-existing peer terminal, got {other:?}"),
+        }
+    }
+
+    /// §8.3: an explicit local close's recorded code/reason outranks a later
+    /// `local_error()` and is surfaced as `AppClose { origin: Local }`.
+    #[test]
+    fn recorded_explicit_close_outranks_local_error() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        d.inbox.push_back(DriverCommand::Close {
+            code: 0x321,
+            reason: Bytes::from_static(b"quit"),
+        });
+        d.apply_inbox(&mut c);
+        d.apply_close_barrier(&mut c).expect("applied");
+        // quiche also reports its own local_error; the recorded close wins.
+        c.local_error = Some(conn_err(true, 0x999, b"other"));
+        d.do_on_conn_close(&mut c);
+        match d.shared.conn_terminal.get().as_deref() {
+            Some(ConnTerminal::AppClose {
+                origin: CloseOrigin::Local,
+                error_code: 0x321,
+                reason,
+            }) => assert_eq!(&reason[..], b"quit"),
+            other => panic!("expected recorded local close, got {other:?}"),
+        }
+    }
+
+    /// §8.3: a `qconn.close` returning an unexpected error is an adapter bug —
+    /// the barrier fails `process_writes` and the terminal classifies `Internal`.
+    #[test]
+    fn unexpected_close_error_is_internal_bug() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        c.close_result = Some(quiche::Error::TlsFail);
+        d.last_handle_teardown = true;
+        let err = d.do_process_writes(&mut c);
+        assert!(err.is_err(), "unexpected close error must fail the callback");
+        assert!(d.close_bug.is_some());
+        d.do_on_conn_close(&mut c);
+        assert!(matches!(
+            d.shared.conn_terminal.get().as_deref(),
+            Some(ConnTerminal::Internal(_))
+        ));
+    }
+
+    /// §5.2 finding 4: `ConnectionDropped` cleans parked/pending peer streams
+    /// with a direction-aware `stream_shutdown` and drops their bookkeeping.
+    #[test]
+    fn connection_dropped_cleans_parked_peer_streams() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        // A parked peer bidi (id 0) and a pending-admit peer uni (id 2).
+        d.admit.insert(0, AdmitState::Parked(PeerStream::new(0)));
+        d.parked_bidi.push_back(0);
+        d.pending_admit.insert(2, PeerStream::new(2));
+        d.pending_admit_order.push_back(2);
+
+        d.inbox.push_back(DriverCommand::ConnectionDropped);
+        d.apply_inbox(&mut c);
+
+        assert!(!d.admit.contains_key(&0), "parked bidi dropped");
+        assert!(d.parked_bidi.is_empty());
+        assert!(d.pending_admit.is_empty());
+        assert!(d.pending_admit_order.is_empty());
+        // Peer bidi shut down BOTH directions; peer uni only read.
+        assert!(c.shutdowns.iter().any(|s| s.id == 0 && s.is_write));
+        assert!(c.shutdowns.iter().any(|s| s.id == 0 && !s.is_write));
+        assert!(c.shutdowns.iter().any(|s| s.id == 2 && !s.is_write));
+        assert!(!c.shutdowns.iter().any(|s| s.id == 2 && s.is_write));
+    }
 }
 
 /// Phase 2 loopback: a real handshake reaches `on_conn_established` on both
@@ -2482,6 +3134,7 @@ mod loopback_tests {
             accept_uni_rx: _c_uni,
             established_rx: client_established_rx,
             shared: _c_shared,
+            ..
         } = client_handles;
         let DriverHandles {
             cmd_tx: server_cmd_tx,
@@ -2489,6 +3142,7 @@ mod loopback_tests {
             accept_uni_rx: _s_uni,
             established_rx: server_established_rx,
             shared: _s_shared,
+            ..
         } = server_handles;
 
         // The `established` oneshot fires from on_conn_established in the worker.
