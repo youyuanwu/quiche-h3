@@ -1,5 +1,9 @@
 # quiche-h3
 
+> ⚠️ **Experimental / work in progress.** This crate is pre-1.0 and under active
+> development. The API is unstable and may change without notice, and it is not
+> yet recommended for production use.
+
 An [`h3::quic`](https://docs.rs/h3) transport-adapter bridge that runs hyperium
 [`h3`](https://github.com/hyperium/h3) (HTTP/3) over Cloudflare
 [`quiche`](https://github.com/cloudflare/quiche), driven asynchronously by
