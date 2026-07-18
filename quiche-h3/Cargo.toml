@@ -1,0 +1,31 @@
+[package]
+name = "quiche-h3"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "An h3::quic bridge that runs hyperium h3 over Cloudflare quiche via tokio-quiche"
+
+# Version policy (design §10): depend on semver-compatible ranges and pin exact
+# builds via the committed Cargo.lock, rather than `=` pins in the manifest.
+# tokio-quiche 0.19 re-exports quiche (0.29); h3 0.0.8.
+[dependencies]
+tokio-quiche = "0.19"
+h3 = "0.0.8"
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
+tracing = { version = "0.1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+rcgen = "0.13"
+futures = "0.3"
+
+[features]
+default = []
+# Instrumentation, mirroring msquic-h3.
+tracing = ["dep:tracing"]
+# Pass-through toggles for tokio-quiche congestion control / raw public keys.
+gcongestion = ["tokio-quiche/gcongestion"]
+rpk = ["tokio-quiche/rpk"]

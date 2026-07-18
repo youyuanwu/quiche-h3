@@ -1,9 +1,12 @@
 # Design: `quiche-h3` — an `h3::quic` bridge over `tokio-quiche`
 
-Status: draft / proposal — **NOT yet approved for implementation.** This design is
-**BLOCKED** behind a set of pre-implementation verifications that are *correctness
-gates*, not follow-ups, and must have their outcomes recorded in this document
-before coding begins (§5.5, §14):
+Status: draft / proposal — **pre-implementation spike gates RESOLVED** (pinned
+`tokio-quiche 0.19.1` / `quiche 0.29.3`, recorded 2026-07-17; loopback spikes in
+`quiche-h3/tests/spike_harness.rs`, full outcomes in
+`quiche-h3/tests/SPIKE_OUTCOMES.md`). The design was previously **BLOCKED** behind
+a set of pre-implementation verifications that are *correctness gates*, not
+follow-ups; their outcomes are now recorded in this document (§5.5, §14). The
+original gate list:
 
 1. the **zero-send-capacity writable-only peer bidi discovery** blocker (§5.5
    BLOCKER) — closed by spike outcome 1 or 2, or the correctness claim explicitly
@@ -18,11 +21,29 @@ before coding begins (§5.5, §14):
    visibility, `Connection::close` result semantics, and the h3 0.0.8 error
    surface).
 
-Items 1 and 2 are hard correctness gates: the design **may not be considered
-implementable/approved** until both are resolved by a recorded spike outcome.
-Item 3's API/behavior checks (§14) have been pre-verified against the published
-0.x docs where possible; unverified behavior remains a pinned-build correctness
-gate and verified surfaces retain CI compatibility tests.
+**Resolution (recorded 2026-07-17; pinned `tokio-quiche 0.19.1` / `quiche 0.29.3`;
+loopback spikes in `quiche-h3/tests/spike_harness.rs`, outcomes in
+`quiche-h3/tests/SPIKE_OUTCOMES.md`):** all gates are resolved and implementation
+may proceed per `docs/design/quiche-h3-implementation-plan.md`.
+
+- **Item 1 (zero-send-capacity writable-only discovery blocker) — CONFIRMED as a
+  real gap → design adopts §5.5 outcome 3.** `stream_writable_next()` and
+  `writable()` return nothing when connection `tx_cap == 0` (the guard runs
+  *before* the STOP_SENDING-stopped branch, so even a stopped stream is not
+  surfaced). No public quiche 0.29 API enumerates the unknown id at zero capacity.
+  The drop-in correctness claim is therefore **explicitly narrowed** for the
+  pathological case where a peer opens a bidi stream while our connection-level
+  send capacity is exhausted (see §5.5).
+- **Item 2 (admission-tombstone premise, committed contract A) — CONFIRMED** for
+  the normal full-completion path: a fully-terminal id does not reappear in
+  `readable()`/`writable()`/`stream_*_next()` discovery. Contract A ships as-is;
+  the upstream `stream_collected(id)` fallback is reserved only if the adversarial
+  late-`STOP_SENDING` path is later shown to resurrect an id (see §5.5).
+- **Item 3 (§14 API/behavior checks) — all CONFIRMED** on the pinned build, with
+  two recorded nuances: T2a's client cert-rejection surfaces as an `io::TimedOut`
+  (not a TLS-typed error), and T4's malformed datagrams are silently dropped below
+  the accept stream rather than surfaced as per-item errors. Verified surfaces
+  retain CI compatibility tests (§10).
 
 This document incorporates seventeen rounds of design review. A subsequent
 external code-review round then made queued bytes and accepted streams win over
@@ -1463,6 +1484,19 @@ One of the following must hold, verified by a spike, before coding:
    full drop-in for this pathological case) rather than left as an ordinary
    follow-up under the current goal.
 
+> **✅ SPIKE OUTCOME (pinned `quiche 0.29.3`, 2026-07-17) — outcome 3.** Confirmed
+> refuted: with the client at `tx_cap == 0` (server `initial_max_data = 0`), a
+> materialized stream with stream-level capacity is **known** (`stream_capacity(0)
+> = Ok(0)`) but **invisible** to both `stream_writable_next() = None` and
+> `writable().count() = 0`. The `tx_cap == 0` guard runs *before* the
+> stopped-stream branch (`quiche-0.29.3/src/lib.rs:6403` and `:6643`), so even a
+> STOP_SENDING-stopped stream is not surfaced at zero connection capacity —
+> outcome 1 is refuted. Absent an upstream enumeration API (outcome 2, an
+> external-feasibility/scope decision), the design **adopts outcome 3**: the
+> drop-in correctness claim is explicitly narrowed for the case where a peer opens
+> a bidi stream while our connection-level send capacity is exhausted. Test:
+> `spike_5_5_blocker_zero_txcap_hides_writable_discovery`.
+
 Note that `stream_capacity(id)`/`stream_writable(id)` can only probe a **known**
 id; they do **not** enumerate the unknown id, and no public quiche 0.29 API
 exposes the peer's highest opened stream sequence \u2014 so they cannot substitute
@@ -1484,6 +1518,19 @@ version) that lets the entry be retained until *real* collection — because
 never be used to remove state. The bridge does **not** carry a speculative
 in-crate tombstone sweep; the choice is A-now or A-plus-upstream-API, never a
 `stream_closed`-based sweep. Record this outcome alongside the discovery outcome.
+
+> **✅ SPIKE OUTCOME (pinned `quiche 0.29.3`, 2026-07-17) — contract A confirmed.**
+> After a full bidirectional completion (client `ping`+FIN, server `pong`+FIN, both
+> sides read to FIN and the stream collected), id 0 does **not** reappear in
+> `readable()`, `writable()`, `stream_readable_next()`, or `stream_writable_next()`
+> — on the immediate probe or a later idle re-probe. Contract A's premise holds for
+> the normal full-completion path, so the design ships **contract A as-is** (drop
+> `admit[id]` at the terminal edge, no reclaim subsystem). The only doubtful path
+> in §5.5 — a late `STOP_SENDING` re-marking an already-finished stream writable —
+> is not reproducible on loopback with the standard completion order; the upstream
+> `stream_collected(id)` fallback (A-plus-upstream-API) stays reserved solely for
+> the case that adversarial path is later shown to resurrect an id. Test:
+> `spike_5_5_tombstone_terminal_id_never_reappears`.
 
 **Third spike (load-bearing quiche stream-cursor calls — finding: quiche API
 dependency).** The destructive-intake cursor model (§5) and open materialization
@@ -2773,11 +2820,29 @@ recorded outcome.
 | **Q5** | quiche `0.29` `stream_send(id, &[], fin=true)` acceptance/flush at zero connection send capacity | **spike** | **Unverified external-crate assumption:** a pure FIN carries no stream data, so a `Finish` submitted (or a partial-write stream finished) while stream/connection send capacity is zero should still be accepted and the FIN flushed without waiting for `MAX_DATA`/`MAX_STREAM_DATA`. Verify the return value for FIN at zero capacity, whether the FIN is emitted in the ordinary output flush, and the interaction with a queued partial `Write`. §5.3a completes a `Finish` at the transport-acceptance boundary; if quiche defers FIN under zero capacity, revise the completion point (the FIN may complete only when capacity opens) and record the resulting `poll_finish` latency — but **never** treat connection close as the FIN mechanism. A §11 regression test guards the recorded outcome. |
 | **H1** | h3 `0.0.8` error surface | **verified (docs) + CI test** | `StreamErrorIncoming::{StreamTerminated { error_code: u64 }, ConnectionErrorIncoming { connection_error }}` and `ConnectionErrorIncoming::{ApplicationClose { error_code: u64 }, Timeout, InternalError(String), Undefined(Arc<dyn Error + Send + Sync>)}` all confirmed present in `0.0.8`. A CI compatibility test constructs one of each mapped variant (§8.4, §10) so a minor bump that reshapes any of them fails the build. |
 
-**Gating.** T1b, T2, T4, Q1 (credit + discovery), Q2, Q3, Q4, Q5, and the §5.5
-discovery/tombstone spikes are correctness gates: implementation may not begin
-until their spike outcomes are recorded here (see the status banner at the top
-of this document). T4 (item-error taxonomy) and Q5 (zero-capacity FIN) each have a
-documented safe default — continue-on-item-error (§7.1) and transport-acceptance
-FIN completion (§5.3a) — but their pinned outcomes must still be recorded so the
-server-loop availability contract and FIN completion point are finalized, not
-discovered during implementation.
+**Gating — RESOLVED.** T1b, T2, T4, Q1 (credit + discovery), Q2, Q3, Q4, Q5, and
+the §5.5 discovery/tombstone spikes were correctness gates: implementation could
+not begin until their pinned-build outcomes were recorded. Those outcomes are now
+recorded below in **§14.1** (and in `quiche-h3/tests/SPIKE_OUTCOMES.md`), so the
+"**spike**" status cells above are superseded by §14.1; the gates are closed.
+
+### 14.1 Recorded spike outcomes (pinned `tokio-quiche 0.19.1` / `quiche 0.29.3`, 2026-07-17)
+
+Observed by the loopback probes in `quiche-h3/tests/spike_harness.rs` (run:
+`cargo test -p quiche-h3 --test spike_harness -- --ignored --nocapture`). Source
+line references are to the pinned crates in the cargo registry.
+
+| gate | verdict | observed |
+|---|---|---|
+| **T1b** | ✅ confirmed (peer-observed close) | `qconn.close(true, 0x1234, "t1b-bye")` inside `process_writes` → peer `on_conn_close` sees `peer_error=(app=true, 0x1234, "t1b-bye")`, driven purely by the ordinary flush. Raw single-packet `CONNECTION_CLOSE` capture and the saturated-write permutation deferred to the Phase 8 close-flush loopback test. |
+| **T2** | ✅ confirmed | After `drop(QuicConnection)` on a live client, both peers remain `(is_established=true, is_closed=false)` and the worker keeps running jobs — the metadata handle drop is independent of worker lifetime. |
+| **T2a** | ✅ confirmed, **nuance** | Client with `verify_peer=true` + no trust root → `connect_with_config` resolves `Err`, `on_conn_established` never runs. **Nuance:** the raw error is a `std::io::Error` of kind `TimedOut` (idle-timeout path), **not** a TLS-typed variant — §7.2/§8.4 client-error mapping must treat it as opaque/unclassified. |
+| **T4** | ✅ confirmed, **refined** | Garbage/undecryptable datagrams are **silently dropped by the router** — they never surface as a `Some(Err)` accept-stream item; the listener keeps yielding real `Ok(conn)` connections. So the continue-on-item-error policy (§7.1) is safe, and a genuinely fatal socket condition would surface as stream end (`None`), not a per-item `Err`. |
+| **Q1** | ✅ confirmed | `stream_readable_next()` is destructive (`Some(3)` then `None`). `stream_priority(id,·,·)` materializes a fresh id (`peer_streams_left_bidi 100→99`, exactly one credit) and is idempotent on repeat. |
+| **Q2** | ✅ confirmed | First `close()` → `Ok(())`; repeat → `Err(Done)` (source: `close()` returns `Done` once `local_error` is set). |
+| **Q3** | ✅ confirmed (zero-cap) | At client `tx_cap=0` (server `initial_max_data=0`): data `stream_send`→`Err(Done)`, but `stream_shutdown(Write, 0x1)`→`Ok(())` and the peer sees `StreamReset(1)` — RESET flushed with no `MAX_DATA` grant. §5.3a's "shutdown ahead of the remainder" is safe. |
+| **Q4** | ✅ confirmed | Peer `stream_shutdown(Read, 0x42)` → stopped side `stream_capacity(id)`→`Err(StreamStopped(66))`; the stop code round-trips (0x42==66). Idle/queued/partial permutations deferred to Phase 4 regressions. |
+| **Q5** | ✅ confirmed (zero-cap) | At `tx_cap=0`: data `stream_send`→`Err(Done)`, but pure FIN `stream_send(id,&[],true)`→`Ok(0)` and the peer reads `Ok((0,true))` — FIN accepted and flushed with no `MAX_DATA` grant. §5.3a completes `Finish` at the transport-acceptance boundary. |
+
+The two §5.5 spikes (BLOCKER → **outcome 3**; admission-tombstone → **contract A
+confirmed**) are recorded inline in §5.5.
