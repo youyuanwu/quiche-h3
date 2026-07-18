@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "An h3::quic bridge that runs hyperium h3 over Cloudflare quiche via tokio-quiche"
+readme = "README.md"
 
 # Version policy (design §10): depend on semver-compatible ranges and pin exact
 # builds via the committed Cargo.lock, rather than `=` pins in the manifest.
@@ -21,6 +22,16 @@ tracing = { version = "0.1", optional = true }
 tokio = { version = "1", features = ["full"] }
 rcgen = "0.13"
 futures = "0.3"
+# Test-only: `h3` does not re-export `http`, so the end-to-end loopback tests
+# depend on it directly to build `http::Request`/`Response` and read status
+# codes. Dev-only scope leaves the production dependency set unchanged.
+http = "1"
+# Test-only: exposes h3's `proto`/`frame` modules so unit tests can construct
+# `h3::quic::WriteBuf` fixtures. Dev-dependency scope leaves the production
+# public API and non-test builds unchanged.
+h3 = { version = "0.0.8", features = [
+    "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+] }
 
 [features]
 default = []
