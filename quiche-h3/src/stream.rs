@@ -48,7 +48,7 @@ fn conn_terminal_stream_err(term: &Arc<ConnTerminal>) -> StreamErrorIncoming {
 /// channel first, then reads the out-of-band terminal; a producer-coalesced
 /// resume bit is flipped false→true when capacity is freed. `B` appears only in
 /// the `cmd_tx` type — the received `Buf` is always [`Bytes`].
-pub(crate) struct H3RecvStream<B: Buf> {
+pub struct H3RecvStream<B: Buf> {
     id: u64,
     bytes: mpsc::Receiver<Bytes>,
     terminal: TerminalCell<RecvEnd>,
@@ -171,7 +171,7 @@ impl<B: Buf> Drop for H3RecvStream<B> {
 /// send contract: `send_data` stashes exactly one `WriteBuf`, `poll_ready`
 /// flushes it through the worker and reports the recorded completion once, and
 /// `poll_finish`/`reset` drive an idempotent finalization state machine.
-pub(crate) struct H3SendStream<B: Buf> {
+pub struct H3SendStream<B: Buf> {
     id: u64,
     status: TerminalCell<SendEnd>,
     cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
@@ -416,7 +416,7 @@ impl<B: Buf> Drop for H3SendStream<B> {
 
 /// A bidirectional stream: an `H3SendStream` + `H3RecvStream` that also
 /// implements `BidiStream` so h3 can `split()` it into its two halves (§6).
-pub(crate) struct H3Stream<B: Buf> {
+pub struct H3Stream<B: Buf> {
     send: H3SendStream<B>,
     recv: H3RecvStream<B>,
 }
@@ -480,7 +480,7 @@ impl<B: Buf> quic::BidiStream<B> for H3Stream<B> {
 /// worker-owned; `poll_open_*` only submit an `OpenBidi`/`OpenUni` request
 /// through the close-admission submit helper and await the worker's handoff.
 /// A single-slot `pending_*` receiver makes repeated polls idempotent.
-pub(crate) struct StreamOpener<B: Buf> {
+pub struct StreamOpener<B: Buf> {
     cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
     shared: Arc<ConnShared>,
     pending_bidi: Option<oneshot::Receiver<Result<BidiHandoff<B>, Arc<ConnTerminal>>>>,
@@ -618,7 +618,7 @@ impl<B: Buf> quic::OpenStreams<B> for StreamOpener<B> {
 /// The `h3::quic::Connection` front-end (§6): the two bounded accept receivers,
 /// their per-direction accept-terminal cells and resume bits, and an embedded
 /// `StreamOpener` it delegates `OpenStreams` to.
-pub(crate) struct Connection<B: Buf> {
+pub struct Connection<B: Buf> {
     accept_bidi_rx: mpsc::Receiver<BidiHandoff<B>>,
     accept_uni_rx: mpsc::Receiver<RecvHandoff<B>>,
     accept_terminal_bidi: TerminalCell<Arc<ConnTerminal>>,

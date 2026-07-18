@@ -324,6 +324,19 @@ pub(crate) enum SetupFailure {
     PreHandshakeWorkerExit,
 }
 
+impl std::fmt::Display for SetupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetupFailure::PreHandshakeWorkerExit => write!(
+                f,
+                "connection setup failed: worker exited before the handshake completed"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SetupFailure {}
+
 /// The front-end-facing handles produced alongside a [`QuicheDriver`]. The
 /// driver itself is moved into `tokio_quiche` (`start`/`connect_with_config`);
 /// these handles are what the acceptor/connector (Phase 7) hand to the front
@@ -372,6 +385,45 @@ impl<B: Buf + Send + 'static> DriverHandles<B> {
             self.accept_uni_resume,
             opener,
         )
+    }
+
+    /// Await handshake establishment, then materialize the front-end
+    /// [`crate::stream::Connection`] (§7.1, §7.2). Resolves the `established_rx`
+    /// oneshot: `Ok(())` builds the connection, `Err(SetupFailure)` is returned
+    /// verbatim, and a *cancelled* oneshot (the worker dropped the sender
+    /// without sending — an adapter inconsistency the worker's `Drop` is
+    /// designed to prevent) is mapped to
+    /// [`SetupFailure::PreHandshakeWorkerExit`] (§8.4).
+    pub(crate) async fn into_established_connection(
+        self,
+    ) -> Result<crate::stream::Connection<B>, SetupFailure> {
+        let DriverHandles {
+            cmd_tx,
+            accept_bidi_rx,
+            accept_uni_rx,
+            established_rx,
+            shared,
+            accept_terminal_bidi,
+            accept_terminal_uni,
+            accept_bidi_resume,
+            accept_uni_resume,
+        } = self;
+
+        match established_rx.await {
+            Ok(res) => res?,
+            Err(_cancelled) => return Err(SetupFailure::PreHandshakeWorkerExit),
+        }
+
+        let opener = crate::stream::StreamOpener::from_parts(cmd_tx, shared);
+        Ok(crate::stream::Connection::from_parts(
+            accept_bidi_rx,
+            accept_uni_rx,
+            accept_terminal_bidi,
+            accept_terminal_uni,
+            accept_bidi_resume,
+            accept_uni_resume,
+            opener,
+        ))
     }
 }
 
