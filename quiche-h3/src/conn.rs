@@ -154,6 +154,8 @@ pub(crate) mod mock {
 
         // --- stream_recv scripting (per id, consumed front-to-back) ---
         pub recv_script: HashMap<u64, VecDeque<RecvStep>>,
+        /// Ids passed to `stream_recv`, in call order (reserve-before-read proof).
+        pub recv_calls: Vec<u64>,
 
         // --- stream_send scripting ---
         /// Bytes `stream_send` accepts per call, per id (default: all offered).
@@ -205,6 +207,7 @@ pub(crate) mod mock {
 
     impl QuicConn for MockConn {
         fn stream_recv(&mut self, id: u64, out: &mut [u8]) -> QResult<(usize, bool)> {
+            self.recv_calls.push(id);
             let q = self
                 .recv_script
                 .get_mut(&id)
