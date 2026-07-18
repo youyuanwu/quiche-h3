@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "An h3::quic bridge that runs hyperium h3 over Cloudflare quiche via tokio-quiche"
 readme = "README.md"
+# MSRV: the lower bound exercised by CI (.github/workflows/build.yaml).
+rust-version = "1.90"
+keywords = ["http3", "quic", "h3", "quiche", "tokio-quiche"]
+categories = ["network-programming", "asynchronous", "web-programming"]
 
 # Version policy (design §10): depend on semver-compatible ranges and pin exact
 # builds via the committed Cargo.lock, rather than `=` pins in the manifest.
@@ -40,3 +44,8 @@ tracing = ["dep:tracing"]
 # Pass-through toggles for tokio-quiche congestion control / raw public keys.
 gcongestion = ["tokio-quiche/gcongestion"]
 rpk = ["tokio-quiche/rpk"]
+
+# Document all optional features on docs.rs so `tracing`/`gcongestion`/`rpk`
+# APIs are visible.
+[package.metadata.docs.rs]
+all-features = true

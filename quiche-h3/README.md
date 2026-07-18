@@ -12,7 +12,7 @@ into `h3::client` / `h3::server`.
 ## Design
 
 The full design lives in
-[`docs/design/quiche-h3-bridge.md`](../docs/design/quiche-h3-bridge.md). In short:
+[`docs/design/quiche-h3-bridge.md`](https://github.com/youyuanwu/quiche-h3/blob/main/docs/design/quiche-h3-bridge.md). In short:
 
 - A single-task **`QuicheDriver`** worker (`tokio_quiche::ApplicationOverQuic`) is
   the sole toucher of `quiche::Connection`. It owns all cross-task state and never
