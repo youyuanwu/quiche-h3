@@ -15,5 +15,6 @@ pub use tokio_quiche::quiche;
 mod buffer;
 mod connector;
 mod driver;
+mod error;
 mod listener;
 mod stream;
