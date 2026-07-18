@@ -47,7 +47,10 @@ pub(crate) enum ConnTerminal {
         reason: Bytes,
     },
     /// `is_app == false`, or a transport-layer failure.
-    Transport { origin: CloseOrigin, error_code: u64 },
+    Transport {
+        origin: CloseOrigin,
+        error_code: u64,
+    },
     /// `conn.is_timed_out()`.
     Timeout,
     /// Our own contract violation / adapter bug — never a normal peer event.
@@ -88,7 +91,11 @@ struct LocalConnectionClose {
 
 impl fmt::Display for LocalConnectionClose {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let kind = if self.is_app { "application" } else { "transport" };
+        let kind = if self.is_app {
+            "application"
+        } else {
+            "transport"
+        };
         write!(
             f,
             "connection closed locally ({kind} error code {:#x})",
@@ -289,7 +296,9 @@ mod tests {
     fn conn_terminal_maps_peer_app_close_to_application_close() {
         let t = app_close(CloseOrigin::Peer, 0x10a, b"boom");
         match t.to_h3() {
-            ConnectionErrorIncoming::ApplicationClose { error_code } => assert_eq!(error_code, 0x10a),
+            ConnectionErrorIncoming::ApplicationClose { error_code } => {
+                assert_eq!(error_code, 0x10a)
+            }
             other => panic!("expected ApplicationClose, got {other:?}"),
         }
     }
@@ -342,7 +351,9 @@ mod tests {
     #[test]
     fn recv_end_reset_is_stream_terminated() {
         match (RecvEnd::Reset { error_code: 42 }).to_h3() {
-            Some(StreamErrorIncoming::StreamTerminated { error_code }) => assert_eq!(error_code, 42),
+            Some(StreamErrorIncoming::StreamTerminated { error_code }) => {
+                assert_eq!(error_code, 42)
+            }
             other => panic!("expected StreamTerminated, got {other:?}"),
         }
     }
@@ -366,7 +377,9 @@ mod tests {
             (SendEnd::Reset { error_code: 9 }, 9u64),
         ] {
             match end.to_h3() {
-                StreamErrorIncoming::StreamTerminated { error_code } => assert_eq!(error_code, code),
+                StreamErrorIncoming::StreamTerminated { error_code } => {
+                    assert_eq!(error_code, code)
+                }
                 other => panic!("expected StreamTerminated, got {other:?}"),
             }
         }

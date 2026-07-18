@@ -223,7 +223,11 @@ pub(crate) struct HandoffCleanup<B: Buf> {
 }
 
 impl<B: Buf> HandoffCleanup<B> {
-    pub(crate) fn new(id: u64, is_recv: bool, cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>) -> Self {
+    pub(crate) fn new(
+        id: u64,
+        is_recv: bool,
+        cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
+    ) -> Self {
         HandoffCleanup {
             id,
             is_recv,
@@ -245,9 +249,10 @@ impl<B: Buf> Drop for HandoffCleanup<B> {
             return;
         }
         if self.is_recv {
-            let _ = self
-                .cmd_tx
-                .send(DriverCommand::StopSending { id: self.id, code: 0 });
+            let _ = self.cmd_tx.send(DriverCommand::StopSending {
+                id: self.id,
+                code: 0,
+            });
         } else {
             let (done, _rx) = oneshot::channel();
             let _ = self
@@ -276,6 +281,10 @@ pub(crate) struct StreamRecvState {
 /// One ordered send operation queued for a stream (§5.3a). `Write` carries the
 /// caller's `WriteBuf` cursor (partial-consumed across turns) and its completion
 /// oneshot; `Finish` carries only its completion oneshot.
+// The `Write` variant is intentionally larger than `Finish`: boxing the
+// `WriteBuf` would add a heap allocation per queued write on the send hot path,
+// which we deliberately avoid.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum SendOp<B: Buf> {
     Write {
         buf: h3::quic::WriteBuf<B>,
@@ -818,8 +827,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             || !self.pending_readable.is_empty()
             || !self.pending_admit_order.is_empty()
             || !self.runnable_send.is_empty()
-            || (!self.parked_bidi.is_empty()
-                && self.accept_bidi_resume.load(Ordering::Relaxed))
+            || (!self.parked_bidi.is_empty() && self.accept_bidi_resume.load(Ordering::Relaxed))
             || (!self.parked_uni.is_empty() && self.accept_uni_resume.load(Ordering::Relaxed))
     }
 
@@ -956,7 +964,10 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                             .map(|s| s.pending_reset.is_some() || s.terminal.is_some())
                             .unwrap_or(false);
                         if !owns_reset {
-                            self.send_terminal_transition(id, SendEnd::Stopped { error_code: code });
+                            self.send_terminal_transition(
+                                id,
+                                SendEnd::Stopped { error_code: code },
+                            );
                         }
                     }
                     _ => {
@@ -985,7 +996,9 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             // `StreamStopped(code)` immediately after the frame). Merge it into
             // the owned PeerStream so admission never loses the send terminal.
             let stopped = match qconn.stream_capacity(id) {
-                Err(quiche::Error::StreamStopped(code)) => Some(SendEnd::Stopped { error_code: code }),
+                Err(quiche::Error::StreamStopped(code)) => {
+                    Some(SendEnd::Stopped { error_code: code })
+                }
                 _ => None,
             };
             if let Some(peer) = self.pending_admit.get_mut(&id) {
@@ -1304,8 +1317,13 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             if let Some(state) = send_state {
                 self.send.insert(id, state);
             }
-            self.admit
-                .insert(id, AdmitState::Registered { send_done, recv_done });
+            self.admit.insert(
+                id,
+                AdmitState::Registered {
+                    send_done,
+                    recv_done,
+                },
+            );
             permit.send(BidiHandoff {
                 send: send_handoff,
                 recv: recv_handoff,
@@ -1453,7 +1471,10 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
     /// and release cursor memberships. No reclaim subsystem, no `stream_closed`.
     fn terminal_transition(&mut self, id: u64) {
         let all_terminal = match self.admit.get(&id) {
-            Some(AdmitState::Registered { send_done, recv_done }) => {
+            Some(AdmitState::Registered {
+                send_done,
+                recv_done,
+            }) => {
                 if is_bidi(id) {
                     *send_done && *recv_done
                 } else {
@@ -1929,7 +1950,10 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             return TurnOutcome::Drop;
         }
         // 3. Service the head op with exactly one transport call.
-        let is_write = matches!(self.send.get(&id).and_then(|s| s.send_ops.front()), Some(SendOp::Write { .. }));
+        let is_write = matches!(
+            self.send.get(&id).and_then(|s| s.send_ops.front()),
+            Some(SendOp::Write { .. })
+        );
         if is_write {
             self.service_write_turn(qconn, id)
         } else {
@@ -2276,6 +2300,9 @@ impl<B: Buf + Send + 'static> ApplicationOverQuic for QuicheDriver<B> {
         &mut self.pkt_buf
     }
 
+    // The explicit `impl Future + Send` return type (rather than `async fn`)
+    // documents the `Send` bound the `ApplicationOverQuic` trait requires.
+    #[allow(clippy::manual_async_fn)]
     fn wait_for_data(
         &mut self,
         _qconn: &mut QuicheConnection,
@@ -2429,7 +2456,10 @@ mod tests {
         let mut ho = h.accept_bidi_rx.try_recv().expect("one bidi handoff");
         assert_eq!(ho.recv.id, 0);
         // The byte arrives before the terminal (sealing edge: Fin set after send).
-        assert_eq!(ho.recv.bytes.try_recv().unwrap(), Bytes::from_static(b"hello"));
+        assert_eq!(
+            ho.recv.bytes.try_recv().unwrap(),
+            Bytes::from_static(b"hello")
+        );
         assert!(matches!(ho.recv.terminal.get(), Some(RecvEnd::Fin)));
         // Nothing enqueued after the seal; no second admission.
         assert!(ho.recv.bytes.try_recv().is_err());
@@ -2442,13 +2472,22 @@ mod tests {
     fn queued_bytes_then_reset_delivers_then_seals() {
         let (mut d, mut h) = driver();
         let mut c = MockConn::new();
-        c.script_recv(0, [data(b"data", false), RecvStep::Err(crate::quiche::Error::StreamReset(7))]);
+        c.script_recv(
+            0,
+            [
+                data(b"data", false),
+                RecvStep::Err(crate::quiche::Error::StreamReset(7)),
+            ],
+        );
         c.queue_readable([0]);
         d.read_budget = READ_BUDGET;
         d.run_read_pump(&mut c);
 
         let mut ho = h.accept_bidi_rx.try_recv().expect("one bidi handoff");
-        assert_eq!(ho.recv.bytes.try_recv().unwrap(), Bytes::from_static(b"data"));
+        assert_eq!(
+            ho.recv.bytes.try_recv().unwrap(),
+            Bytes::from_static(b"data")
+        );
         assert!(matches!(
             ho.recv.terminal.get(),
             Some(RecvEnd::Reset { error_code: 7 })
@@ -2634,11 +2673,17 @@ mod tests {
         d.read_budget = READ_BUDGET;
         d.run_read_pump(&mut c);
 
-        let ho = h.accept_bidi_rx.try_recv().expect("admitted via writable path");
+        let ho = h
+            .accept_bidi_rx
+            .try_recv()
+            .expect("admitted via writable path");
         assert_eq!(ho.recv.id, 0);
         assert!(matches!(
             d.admit.get(&0),
-            Some(AdmitState::Registered { send_done: true, .. })
+            Some(AdmitState::Registered {
+                send_done: true,
+                ..
+            })
         ));
         assert!(matches!(
             ho.send.status.get(),
@@ -2716,8 +2761,13 @@ mod tests {
                 blocked: false,
             },
         );
-        d.admit
-            .insert(0, AdmitState::Registered { send_done: true, recv_done: false });
+        d.admit.insert(
+            0,
+            AdmitState::Registered {
+                send_done: true,
+                recv_done: false,
+            },
+        );
         d.pending_readable.push_back(0);
         d.readable_set.insert(0);
 
@@ -2779,10 +2829,7 @@ mod tests {
         rx
     }
 
-    fn push_finish(
-        d: &mut QuicheDriver<Bytes>,
-        id: u64,
-    ) -> oneshot::Receiver<Result<(), SendEnd>> {
+    fn push_finish(d: &mut QuicheDriver<Bytes>, id: u64) -> oneshot::Receiver<Result<(), SendEnd>> {
         let (tx, rx) = oneshot::channel();
         d.inbox.push_back(DriverCommand::Finish { id, done: tx });
         rx
@@ -2803,8 +2850,16 @@ mod tests {
         d.stage_send(&mut c);
 
         // Not fully accepted yet: no completion, and the blocked write re-armed.
-        assert!(matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
-        let rearms: Vec<usize> = c.rearms.iter().filter(|(id, _)| *id == 0).map(|(_, len)| *len).collect();
+        assert!(matches!(
+            done.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        let rearms: Vec<usize> = c
+            .rearms
+            .iter()
+            .filter(|(id, _)| *id == 0)
+            .map(|(_, len)| *len)
+            .collect();
         assert!(!rearms.is_empty(), "blocked write must low-water re-arm");
         assert_eq!(*rearms.last().unwrap(), REARM_THRESHOLD);
         let after_first = sent_len(&c, 0);
@@ -2823,7 +2878,10 @@ mod tests {
             c.writable_next.push_back(0);
         }
         assert_eq!(sent_len(&c, 0), total, "all bytes eventually accepted");
-        assert!(matches!(done.try_recv(), Ok(Ok(()))), "exactly one Ok at full acceptance");
+        assert!(
+            matches!(done.try_recv(), Ok(Ok(()))),
+            "exactly one Ok at full acceptance"
+        );
     }
 
     /// §11 / Q5: `Finish` acceptance completes once, even at **zero** send
@@ -2842,7 +2900,10 @@ mod tests {
         // Idempotent single completion: op popped, nothing more runnable.
         assert!(d.runnable_send.is_empty());
         d.stage_send(&mut c);
-        assert!(matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
+        assert!(matches!(
+            done.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
     }
 
     /// §11: `Reset` preempts an in-flight/queued `Write` — the queued op is
@@ -2857,7 +2918,10 @@ mod tests {
         let mut done1 = push_send(&mut d, 0, b"a");
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
-        assert!(matches!(done1.try_recv(), Ok(Ok(()))), "Write1 accepted before reset");
+        assert!(
+            matches!(done1.try_recv(), Ok(Ok(()))),
+            "Write1 accepted before reset"
+        );
 
         // Write2 queued, then Reset preempts it in the same stage (a).
         let mut done2 = push_send(&mut d, 0, b"bcde");
@@ -2905,8 +2969,13 @@ mod tests {
     #[test]
     fn accepted_fin_marks_send_done_and_enables_contract_a() {
         let (mut d, _h) = driver();
-        d.admit
-            .insert(0, AdmitState::Registered { send_done: false, recv_done: true });
+        d.admit.insert(
+            0,
+            AdmitState::Registered {
+                send_done: false,
+                recv_done: true,
+            },
+        );
         d.send.insert(0, StreamSendState::new());
         let mut c = MockConn::new();
         let mut fin = push_finish(&mut d, 0);
@@ -2914,7 +2983,10 @@ mod tests {
         d.stage_send(&mut c);
         assert!(matches!(fin.try_recv(), Ok(Ok(()))));
         // recv already done + send now done → contract A reclaimed admit + recv.
-        assert!(!d.admit.contains_key(&0), "both directions terminal → admit dropped");
+        assert!(
+            !d.admit.contains_key(&0),
+            "both directions terminal → admit dropped"
+        );
         assert!(!d.recv.contains_key(&0));
     }
 
@@ -2928,7 +3000,7 @@ mod tests {
         d.inbox.push_back(DriverCommand::Reset { id: 0, code: 7 });
         d.apply_inbox(&mut c);
         d.stage_send(&mut c); // services the reset → one RESET_STREAM
-        // A second reset with a different code must be a no-op.
+                              // A second reset with a different code must be a no-op.
         d.inbox.push_back(DriverCommand::Reset { id: 0, code: 9 });
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
@@ -2943,8 +3015,13 @@ mod tests {
     #[test]
     fn deferred_send_after_contract_a_completes_with_sticky_terminal() {
         let (mut d, _h) = driver();
-        d.admit
-            .insert(0, AdmitState::Registered { send_done: false, recv_done: true });
+        d.admit.insert(
+            0,
+            AdmitState::Registered {
+                send_done: false,
+                recv_done: true,
+            },
+        );
         let mut c = MockConn::new();
         // Peer STOP_SENDING on the send half → send terminal + contract A (recv
         // already done) reclaims admit/recv but retains self.send's terminal.
@@ -2955,7 +3032,10 @@ mod tests {
             .push_back(quiche::Error::StreamStopped(55));
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
-        assert!(matches!(w1.try_recv(), Ok(Err(SendEnd::Stopped { error_code: 55 }))));
+        assert!(matches!(
+            w1.try_recv(),
+            Ok(Err(SendEnd::Stopped { error_code: 55 }))
+        ));
         assert!(!d.admit.contains_key(&0), "contract A reclaimed admit");
         assert!(d.send.contains_key(&0), "send retained for deferred ops");
 
@@ -2998,7 +3078,10 @@ mod tests {
             Some(SendEnd::Stopped { error_code: 9 })
         ));
         assert!(d.send.get(&0).unwrap().send_ops.is_empty());
-        assert!(!d.runnable_send_set.contains(&0), "runnable membership released");
+        assert!(
+            !d.runnable_send_set.contains(&0),
+            "runnable membership released"
+        );
     }
 
     /// §11 / invariant 13: peer `STOP_SENDING` surfaced on the **writable** path
@@ -3048,9 +3131,15 @@ mod tests {
         d.stage_send(&mut c);
 
         // The small stream got its turn and completed despite the bulk backlog.
-        assert!(matches!(small_done.try_recv(), Ok(Ok(()))), "small stream serviced");
+        assert!(
+            matches!(small_done.try_recv(), Ok(Ok(()))),
+            "small stream serviced"
+        );
         // The bulk stream is still in flight (not completed, still runnable).
-        assert!(matches!(bulk_done.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        assert!(matches!(
+            bulk_done.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
         assert!(d.runnable_send_set.contains(&0) || d.needs_iteration);
     }
 
@@ -3073,7 +3162,10 @@ mod tests {
             Ok(Err(SendEnd::Reset { error_code: 5 })) => {}
             other => panic!("late Send must complete once with sticky terminal, got {other:?}"),
         }
-        assert!(d.send.get(&0).unwrap().send_ops.is_empty(), "late op not enqueued");
+        assert!(
+            d.send.get(&0).unwrap().send_ops.is_empty(),
+            "late op not enqueued"
+        );
         // No new transport send call was made for the late op.
         assert!(c.sent.iter().all(|(_, b, _)| b != b"late"));
     }
@@ -3205,7 +3297,10 @@ mod tests {
         d.last_handle_teardown = true;
         // Barrier must NOT issue a synthetic close (a peer terminal exists).
         d.do_process_writes(&mut c).expect("no synthetic close");
-        assert_eq!(c.closed, None, "synthetic close suppressed by peer terminal");
+        assert_eq!(
+            c.closed, None,
+            "synthetic close suppressed by peer terminal"
+        );
         // Classification surfaces the peer app-close.
         d.do_on_conn_close(&mut c);
         match d.shared.conn_terminal.get().as_deref() {
@@ -3291,7 +3386,10 @@ mod tests {
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
         // Not completed, not pinned: op retained, status cell empty.
-        assert!(matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        assert!(matches!(
+            done.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
         assert!(!d.send.get(&0).unwrap().send_ops.is_empty());
         assert!(d.send.get(&0).unwrap().status.get().is_none());
         // on_conn_close classifies and drains it with SendEnd::Conn.
@@ -3379,7 +3477,8 @@ mod tests {
             reason: Bytes::from_static(b"local"),
         });
         d.apply_inbox(&mut c);
-        d.apply_close_barrier(&mut c).expect("done defers, not a bug");
+        d.apply_close_barrier(&mut c)
+            .expect("done defers, not a bug");
 
         assert!(d.explicit_close_attempted);
         assert!(d.graceful_close_issued);
@@ -3430,7 +3529,10 @@ mod tests {
         c.close_result = Some(quiche::Error::TlsFail);
         d.last_handle_teardown = true;
         let err = d.do_process_writes(&mut c);
-        assert!(err.is_err(), "unexpected close error must fail the callback");
+        assert!(
+            err.is_err(),
+            "unexpected close error must fail the callback"
+        );
         assert!(d.close_bug.is_some());
         d.do_on_conn_close(&mut c);
         assert!(matches!(
@@ -3493,7 +3595,10 @@ mod tests {
         c.streams_left_bidi = 4;
         let mut reply = push_open_bidi(&mut d);
         d.apply_inbox(&mut c);
-        assert_eq!(d.next_bidi_id, 0, "counter unchanged before materialization");
+        assert_eq!(
+            d.next_bidi_id, 0,
+            "counter unchanged before materialization"
+        );
         d.stage_open(&mut c);
 
         // Exactly one materialization call, at the h3 default priority.
@@ -3546,7 +3651,10 @@ mod tests {
         d.apply_inbox(&mut c);
         d.stage_open(&mut c);
 
-        assert!(c.priorities.is_empty(), "no id materialized for a dead reply");
+        assert!(
+            c.priorities.is_empty(),
+            "no id materialized for a dead reply"
+        );
         assert_eq!(d.next_bidi_id, 0, "counter not advanced");
         assert!(d.open_bidi.is_empty());
         assert!(!d.send.contains_key(&0));
@@ -3592,16 +3700,22 @@ mod tests {
         d.cleanup_undeliverable_open(&mut c, 0, true);
         assert!(!d.recv.contains_key(&0));
         assert!(!d.send.contains_key(&0));
-        let bidi_shuts: Vec<&crate::conn::mock::ShutdownCall> = c.shutdowns.iter().filter(|s| s.id == 0).collect();
-        assert!(bidi_shuts.iter().any(|s| s.is_write && s.code == H3_REQUEST_CANCELLED));
-        assert!(bidi_shuts.iter().any(|s| !s.is_write && s.code == H3_REQUEST_CANCELLED));
+        let bidi_shuts: Vec<&crate::conn::mock::ShutdownCall> =
+            c.shutdowns.iter().filter(|s| s.id == 0).collect();
+        assert!(bidi_shuts
+            .iter()
+            .any(|s| s.is_write && s.code == H3_REQUEST_CANCELLED));
+        assert!(bidi_shuts
+            .iter()
+            .any(|s| !s.is_write && s.code == H3_REQUEST_CANCELLED));
 
         // Uni: only Shutdown::Write.
         let (_sh, send_state, _sd) = build_send(2, d.cmd_tx_weak.upgrade().unwrap(), None);
         d.send.insert(2, send_state.unwrap());
         d.cleanup_undeliverable_open(&mut c, 2, false);
         assert!(!d.send.contains_key(&2));
-        let uni_shuts: Vec<&crate::conn::mock::ShutdownCall> = c.shutdowns.iter().filter(|s| s.id == 2).collect();
+        let uni_shuts: Vec<&crate::conn::mock::ShutdownCall> =
+            c.shutdowns.iter().filter(|s| s.id == 2).collect();
         assert_eq!(uni_shuts.len(), 1);
         assert!(uni_shuts[0].is_write && uni_shuts[0].code == H3_REQUEST_CANCELLED);
     }
@@ -3627,8 +3741,10 @@ mod tests {
         let (mut d, _h) = driver();
         let mut c = MockConn::new();
         c.streams_left_bidi = u64::MAX; // ample credit
-        // Keep the reply receivers alive (a dropped reply is skipped as closed).
-        let _replies: Vec<_> = (0..(OPEN_BUDGET + 4)).map(|_| push_open_bidi(&mut d)).collect();
+                                        // Keep the reply receivers alive (a dropped reply is skipped as closed).
+        let _replies: Vec<_> = (0..(OPEN_BUDGET + 4))
+            .map(|_| push_open_bidi(&mut d))
+            .collect();
         d.apply_inbox(&mut c);
         d.needs_iteration = false;
         d.stage_open(&mut c);
@@ -3657,8 +3773,14 @@ mod tests {
         c.peer_error = Some(conn_err(true, 0x3, b""));
         d.do_on_conn_close(&mut c);
 
-        assert!(matches!(bidi_reply.try_recv(), Ok(Err(_))), "staged bidi open resolved");
-        assert!(matches!(uni_reply.try_recv(), Ok(Err(_))), "staged uni open resolved");
+        assert!(
+            matches!(bidi_reply.try_recv(), Ok(Err(_))),
+            "staged bidi open resolved"
+        );
+        assert!(
+            matches!(uni_reply.try_recv(), Ok(Err(_))),
+            "staged uni open resolved"
+        );
         assert!(d.open_bidi.is_empty());
         assert!(d.open_uni.is_empty());
     }
@@ -3670,8 +3792,13 @@ mod tests {
     #[test]
     fn send_entry_reclaimed_when_send_finishes_after_recv() {
         let (mut d, _h) = driver();
-        d.admit
-            .insert(0, AdmitState::Registered { send_done: false, recv_done: false });
+        d.admit.insert(
+            0,
+            AdmitState::Registered {
+                send_done: false,
+                recv_done: false,
+            },
+        );
         let (tx, _rx) = mpsc::channel(BYTE_CHANNEL_DEPTH);
         d.recv.insert(
             0,

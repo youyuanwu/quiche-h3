@@ -1,0 +1,54 @@
+name: build
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ windows-latest, ubuntu-latest ]
+        rust: [ 1.90.0, 1.97.0 ]
+    steps:
+    - uses: actions/checkout@v7
+
+    # quiche builds BoringSSL from source, which requires CMake on every OS.
+    - name: Get latest version of CMake
+      uses: lukka/get-cmake@latest
+
+    # BoringSSL's assembly requires NASM on Windows.
+    - name: Install nasm (windows)
+      if: runner.os == 'Windows'
+      run: winget install nasm --accept-package-agreements --accept-source-agreements --disable-interactivity
+
+    - name: Install rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ matrix.rust }}
+        components: rustfmt, clippy
+
+    - name: Run Rust cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Run cargo check
+      run: cargo +${{ matrix.rust }} check --all-targets
+
+    - name: Run cargo fmt
+      run: cargo +${{ matrix.rust }} fmt --all -- --check
+
+    - name: Run cargo clippy
+      run: cargo +${{ matrix.rust }} clippy --all-targets -- -D warnings
+
+    - name: Run cargo build
+      run: cargo +${{ matrix.rust }} build --all-targets
+
+    - name: Run cargo test
+      run: cargo +${{ matrix.rust }} test --all-targets
+
+    # The loopback / end-to-end tests bind UDP sockets and run real QUIC
+    # handshakes; they are #[ignore]d by default. Exercise them on Linux where
+    # loopback networking in CI is reliable.
+    - name: Run ignored loopback/e2e tests (linux)
+      if: runner.os == 'Linux'
+      run: cargo +${{ matrix.rust }} test --all-targets -- --ignored

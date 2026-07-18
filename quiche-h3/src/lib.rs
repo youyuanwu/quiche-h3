@@ -42,14 +42,16 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 /// insufficient: it succeeds for directories and does not prove the contents
 /// are readable, deferring the failure to the asynchronous per-connection path.
 pub(crate) fn ensure_readable_file(path: &str, label: &str) -> Result<(), Error> {
-    let meta = std::fs::metadata(path)
-        .map_err(|e| -> Error { format!("quiche-h3: {label} {path:?} is not accessible: {e}").into() })?;
+    let meta = std::fs::metadata(path).map_err(|e| -> Error {
+        format!("quiche-h3: {label} {path:?} is not accessible: {e}").into()
+    })?;
     if !meta.is_file() {
         return Err(format!("quiche-h3: {label} {path:?} is not a regular file").into());
     }
     // Opening proves the contents are actually readable.
-    std::fs::File::open(path)
-        .map_err(|e| -> Error { format!("quiche-h3: {label} {path:?} is not readable: {e}").into() })?;
+    std::fs::File::open(path).map_err(|e| -> Error {
+        format!("quiche-h3: {label} {path:?} is not readable: {e}").into()
+    })?;
     Ok(())
 }
 

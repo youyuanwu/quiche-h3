@@ -160,12 +160,12 @@ fn quiche_application_protocol_is_stable() {
 #[test]
 fn tokio_quiche_items_are_reachable() {
     // Path references: a renamed or removed export fails to resolve here.
-    use tokio_quiche::ApplicationOverQuic as _ApplicationOverQuic;
-    use tokio_quiche::{ConnectionParams as _ConnectionParams, QuicConnection as _QuicConnection};
     use tokio_quiche::settings::{
         CertificateKind as _CertificateKind, QuicSettings as _QuicSettings,
         TlsCertificatePaths as _TlsCertificatePaths,
     };
+    use tokio_quiche::ApplicationOverQuic as _ApplicationOverQuic;
+    use tokio_quiche::{ConnectionParams as _ConnectionParams, QuicConnection as _QuicConnection};
 
     // Bind the entrypoint-referencing helpers so their signature guards run at
     // type-check time (they are never actually called).

@@ -45,9 +45,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use quiche_h3::{
-    H3QuicheAcceptor, H3QuicheClientConfig, H3QuicheConnector, H3QuicheServerConfig,
-};
+use quiche_h3::{H3QuicheAcceptor, H3QuicheClientConfig, H3QuicheConnector, H3QuicheServerConfig};
 use tokio::net::UdpSocket;
 
 /// Reset code the server sends and the client must observe.
@@ -131,8 +129,8 @@ async fn reset_stream_surfaces_as_remote_terminate() {
     // --- server ---
     let server_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let server_addr = server_udp.local_addr().unwrap();
-    let mut acceptors = H3QuicheAcceptor::bind([server_udp], &server_config(&certs))
-        .expect("bind acceptor");
+    let mut acceptors =
+        H3QuicheAcceptor::bind([server_udp], &server_config(&certs)).expect("bind acceptor");
     let mut acceptor = acceptors.pop().unwrap();
 
     let server_task = tokio::spawn(async move {
@@ -173,12 +171,10 @@ async fn reset_stream_surfaces_as_remote_terminate() {
     });
 
     // --- client ---
-    let connector =
-        H3QuicheConnector::new(server_addr, "localhost".to_string(), client_config())
-            .expect("build connector");
+    let connector = H3QuicheConnector::new(server_addr, "localhost".to_string(), client_config())
+        .expect("build connector");
     let conn = connector.connect().await.expect("client connect ok");
-    let (mut driver, mut send_request) =
-        h3::client::new(conn).await.expect("h3 client handshake");
+    let (mut driver, mut send_request) = h3::client::new(conn).await.expect("h3 client handshake");
     let drive = tokio::spawn(async move {
         let _ = futures::future::poll_fn(|cx| driver.poll_close(cx)).await;
     });

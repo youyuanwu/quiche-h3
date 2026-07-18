@@ -22,12 +22,10 @@ use std::time::Duration;
 use tokio_quiche::metrics::{DefaultMetrics, Metrics};
 use tokio_quiche::quic::connect_with_config;
 use tokio_quiche::quic::QuicheConnection;
-use tokio_quiche::QuicConnection;
 use tokio_quiche::quiche;
-use tokio_quiche::settings::{
-    CertificateKind, Hooks, QuicSettings, TlsCertificatePaths,
-};
+use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificatePaths};
 use tokio_quiche::socket::Socket;
+use tokio_quiche::QuicConnection;
 use tokio_quiche::{ApplicationOverQuic, ConnectionParams};
 
 use futures::StreamExt;
@@ -97,7 +95,8 @@ impl MinimalApp {
 
 impl ApplicationOverQuic for MinimalApp {
     fn on_conn_established(
-        &mut self, _qconn: &mut QuicheConnection,
+        &mut self,
+        _qconn: &mut QuicheConnection,
         _hs: &tokio_quiche::quic::HandshakeInfo,
     ) -> tokio_quiche::QuicResult<()> {
         self.established.store(true, Ordering::SeqCst);
@@ -113,21 +112,18 @@ impl ApplicationOverQuic for MinimalApp {
     }
 
     fn wait_for_data(
-        &mut self, _qconn: &mut QuicheConnection,
+        &mut self,
+        _qconn: &mut QuicheConnection,
     ) -> impl Future<Output = tokio_quiche::QuicResult<()>> + Send {
         // Idle: only packet/timer events drive the loop.
         std::future::pending()
     }
 
-    fn process_reads(
-        &mut self, _qconn: &mut QuicheConnection,
-    ) -> tokio_quiche::QuicResult<()> {
+    fn process_reads(&mut self, _qconn: &mut QuicheConnection) -> tokio_quiche::QuicResult<()> {
         Ok(())
     }
 
-    fn process_writes(
-        &mut self, _qconn: &mut QuicheConnection,
-    ) -> tokio_quiche::QuicResult<()> {
+    fn process_writes(&mut self, _qconn: &mut QuicheConnection) -> tokio_quiche::QuicResult<()> {
         Ok(())
     }
 }
@@ -170,8 +166,7 @@ async fn spike_foundation_handshake_completes() {
 
     let srv_est = server_established.clone();
     let mut listeners =
-        tokio_quiche::listen([server_udp], server_params(&certs), DefaultMetrics)
-            .expect("listen");
+        tokio_quiche::listen([server_udp], server_params(&certs), DefaultMetrics).expect("listen");
 
     let server_task = tokio::spawn(async move {
         let stream = &mut listeners[0];
@@ -221,8 +216,7 @@ async fn spike_foundation_handshake_completes() {
 
 /// Poll an `AtomicBool` until true or `timeout_ms` elapses.
 async fn wait_flag(flag: &Arc<AtomicBool>, timeout_ms: u64) -> bool {
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     while std::time::Instant::now() < deadline {
         if flag.load(Ordering::SeqCst) {
             return true;
@@ -313,7 +307,8 @@ impl ProbeHandle {
 
     /// Run a closure against `qconn` in the worker and await its return value.
     async fn call<R: Send + 'static>(
-        &self, f: impl FnOnce(&mut QuicheConnection) -> R + Send + 'static,
+        &self,
+        f: impl FnOnce(&mut QuicheConnection) -> R + Send + 'static,
     ) -> R {
         let (otx, orx) = oneshot::channel();
         self.submit(move |q| {
@@ -325,7 +320,8 @@ impl ProbeHandle {
     /// Convenience: `call` with a timeout so a torn-down worker can't hang the
     /// test. Returns `None` on timeout / worker gone.
     async fn try_call<R: Send + 'static>(
-        &self, timeout_ms: u64,
+        &self,
+        timeout_ms: u64,
         f: impl FnOnce(&mut QuicheConnection) -> R + Send + 'static,
     ) -> Option<R> {
         tokio::time::timeout(Duration::from_millis(timeout_ms), self.call(f))
@@ -335,8 +331,7 @@ impl ProbeHandle {
 
     /// Poll for a captured close observation.
     async fn wait_close(&self, timeout_ms: u64) -> Option<CloseObs> {
-        let deadline = std::time::Instant::now()
-            + Duration::from_millis(timeout_ms);
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
         loop {
             if let Some(obs) = self.close_obs.lock().unwrap().clone() {
                 return Some(obs);
@@ -351,7 +346,8 @@ impl ProbeHandle {
 
 impl ApplicationOverQuic for ProbeApp {
     fn on_conn_established(
-        &mut self, _qconn: &mut QuicheConnection,
+        &mut self,
+        _qconn: &mut QuicheConnection,
         _hs: &tokio_quiche::quic::HandshakeInfo,
     ) -> tokio_quiche::QuicResult<()> {
         self.established.store(true, Ordering::SeqCst);
@@ -366,8 +362,10 @@ impl ApplicationOverQuic for ProbeApp {
         &mut self.pkt_buf
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn wait_for_data(
-        &mut self, _qconn: &mut QuicheConnection,
+        &mut self,
+        _qconn: &mut QuicheConnection,
     ) -> impl Future<Output = tokio_quiche::QuicResult<()>> + Send {
         async move {
             // `mpsc::Receiver::recv` is cancel-safe: if a packet/timer wakes the
@@ -383,15 +381,11 @@ impl ApplicationOverQuic for ProbeApp {
         }
     }
 
-    fn process_reads(
-        &mut self, _qconn: &mut QuicheConnection,
-    ) -> tokio_quiche::QuicResult<()> {
+    fn process_reads(&mut self, _qconn: &mut QuicheConnection) -> tokio_quiche::QuicResult<()> {
         Ok(())
     }
 
-    fn process_writes(
-        &mut self, qconn: &mut QuicheConnection,
-    ) -> tokio_quiche::QuicResult<()> {
+    fn process_writes(&mut self, qconn: &mut QuicheConnection) -> tokio_quiche::QuicResult<()> {
         while let Some(job) = self.pending.pop_front() {
             job(qconn);
         }
@@ -399,7 +393,9 @@ impl ApplicationOverQuic for ProbeApp {
     }
 
     fn on_conn_close<M: Metrics>(
-        &mut self, qconn: &mut QuicheConnection, _metrics: &M,
+        &mut self,
+        qconn: &mut QuicheConnection,
+        _metrics: &M,
         connection_result: &tokio_quiche::QuicResult<()>,
     ) {
         let obs = CloseObs {
@@ -434,16 +430,21 @@ fn server_params_zero_grant(certs: &TestCerts) -> ConnectionParams<'_> {
 /// their test-side handles plus the client's `QuicConnection` metadata and the
 /// server accept task. `certs` must outlive the returned values.
 async fn probe_loopback(
-    _certs: &TestCerts, client_params: &ConnectionParams<'_>,
+    _certs: &TestCerts,
+    client_params: &ConnectionParams<'_>,
     server_params: ConnectionParams<'_>,
-) -> (ProbeHandle, ProbeHandle, QuicConnection, tokio::task::JoinHandle<()>) {
+) -> (
+    ProbeHandle,
+    ProbeHandle,
+    QuicConnection,
+    tokio::task::JoinHandle<()>,
+) {
     let server_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let server_addr = server_udp.local_addr().unwrap();
     let (server_app, server_handle) = ProbeApp::pair();
 
     let mut listeners =
-        tokio_quiche::listen([server_udp], server_params, DefaultMetrics)
-            .expect("listen");
+        tokio_quiche::listen([server_udp], server_params, DefaultMetrics).expect("listen");
 
     let server_task = tokio::spawn(async move {
         let mut app = Some(server_app);
@@ -462,10 +463,9 @@ async fn probe_loopback(
     let client_socket = Socket::try_from(client_udp).expect("socket");
     let (client_app, client_handle) = ProbeApp::pair();
 
-    let conn =
-        connect_with_config(client_socket, Some("localhost"), client_params, client_app)
-            .await
-            .expect("client handshake completed");
+    let conn = connect_with_config(client_socket, Some("localhost"), client_params, client_app)
+        .await
+        .expect("client handshake completed");
 
     (client_handle, server_handle, conn, server_task)
 }
@@ -484,8 +484,7 @@ async fn spike_t2a_client_rejecting_cert_resolves_err() {
     let server_established = Arc::new(AtomicBool::new(false));
     let srv_est = server_established.clone();
     let mut listeners =
-        tokio_quiche::listen([server_udp], server_params(&certs), DefaultMetrics)
-            .expect("listen");
+        tokio_quiche::listen([server_udp], server_params(&certs), DefaultMetrics).expect("listen");
     let server_task = tokio::spawn(async move {
         if let Some(Ok(conn)) = listeners[0].next().await {
             conn.start(MinimalApp::new(srv_est));
@@ -538,8 +537,7 @@ async fn spike_t2_handle_drop_keeps_worker_alive() {
     let certs = TestCerts::generate();
     let cparams = client_params();
     let sparams = server_params(&certs);
-    let (client, server, conn, server_task) =
-        probe_loopback(&certs, &cparams, sparams).await;
+    let (client, server, conn, server_task) = probe_loopback(&certs, &cparams, sparams).await;
 
     assert!(client.wait_established(2000).await, "client established");
     assert!(server.wait_established(2000).await, "server established");
@@ -589,8 +587,7 @@ async fn spike_t1b_peer_observes_application_close() {
     let certs = TestCerts::generate();
     let cparams = client_params();
     let sparams = server_params(&certs);
-    let (client, server, conn, server_task) =
-        probe_loopback(&certs, &cparams, sparams).await;
+    let (client, server, conn, server_task) = probe_loopback(&certs, &cparams, sparams).await;
 
     assert!(client.wait_established(2000).await, "client established");
     assert!(server.wait_established(2000).await, "server established");
@@ -628,14 +625,16 @@ async fn spike_t4_garbage_datagram_then_real_connection() {
     let server_addr = server_udp.local_addr().unwrap();
     let (server_app, server_handle) = ProbeApp::pair();
     let mut listeners =
-        tokio_quiche::listen([server_udp], server_params(&certs), DefaultMetrics)
-            .expect("listen");
+        tokio_quiche::listen([server_udp], server_params(&certs), DefaultMetrics).expect("listen");
 
     // Fire garbage UDP at the server port BEFORE any real handshake.
     let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let garbage = vec![0xABu8; 1200];
     attacker.send_to(&garbage, server_addr).await.unwrap();
-    attacker.send_to(&[0x00, 0x01, 0x02, 0x03], server_addr).await.unwrap();
+    attacker
+        .send_to(&[0x00, 0x01, 0x02, 0x03], server_addr)
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Drive the accept stream and record item kinds (Ok vs Err variant).
@@ -643,12 +642,7 @@ async fn spike_t4_garbage_datagram_then_real_connection() {
     let server_task = tokio::spawn(async move {
         let mut app = Some(server_app);
         loop {
-            match tokio::time::timeout(
-                Duration::from_secs(4),
-                listeners[0].next(),
-            )
-            .await
-            {
+            match tokio::time::timeout(Duration::from_secs(4), listeners[0].next()).await {
                 Ok(Some(Ok(conn))) => {
                     let _ = item_tx.send(Ok(()));
                     if let Some(app) = app.take() {
@@ -688,8 +682,7 @@ async fn spike_t4_garbage_datagram_then_real_connection() {
         conn.err()
     );
     assert!(
-        client_handle.wait_established(2000).await
-            && server_handle.wait_established(2000).await,
+        client_handle.wait_established(2000).await && server_handle.wait_established(2000).await,
         "both sides establish after garbage"
     );
 
@@ -707,7 +700,10 @@ async fn spike_t4_garbage_datagram_then_real_connection() {
         "[T4] accept-stream items: Ok(conn)={} Err-item-variants={:?}",
         oks, errs
     );
-    assert!(oks >= 1, "listener must yield the real connection after garbage");
+    assert!(
+        oks >= 1,
+        "listener must yield the real connection after garbage"
+    );
 
     let _ = conn.map(drop);
     server_task.abort();
@@ -723,8 +719,7 @@ async fn spike_q1_readable_destructive_and_priority_materialize() {
     let certs = TestCerts::generate();
     let cparams = client_params();
     let sparams = server_params(&certs);
-    let (client, server, conn, server_task) =
-        probe_loopback(&certs, &cparams, sparams).await;
+    let (client, server, conn, server_task) = probe_loopback(&certs, &cparams, sparams).await;
 
     assert!(client.wait_established(2000).await, "client established");
     assert!(server.wait_established(2000).await, "server established");
@@ -750,8 +745,14 @@ async fn spike_q1_readable_destructive_and_priority_materialize() {
     assert!(!mat.0, "stream 0 must not exist before stream_priority");
     assert!(mat.1.starts_with("Ok"), "first stream_priority Ok");
     assert!(mat.2.starts_with("Ok"), "stream 0 known after priority");
-    assert!(mat.3.starts_with("Ok"), "second stream_priority idempotent Ok");
-    assert!(mat.4.starts_with("Ok"), "stream 0 still known after 2nd priority");
+    assert!(
+        mat.3.starts_with("Ok"),
+        "second stream_priority idempotent Ok"
+    );
+    assert!(
+        mat.4.starts_with("Ok"),
+        "stream 0 still known after 2nd priority"
+    );
 
     // Positive control for the §5.5 blocker: under a normal grant a
     // materialized+written stream IS surfaced by writable discovery.
@@ -789,7 +790,11 @@ async fn spike_q1_readable_destructive_and_priority_materialize() {
         "[Q1a] stream_readable_next first={:?} second={:?}",
         rd.0, rd.1
     );
-    assert_eq!(rd.0, Some(3), "first readable_next returns the armed stream");
+    assert_eq!(
+        rd.0,
+        Some(3),
+        "first readable_next returns the armed stream"
+    );
     assert_eq!(rd.1, None, "second readable_next is dearmed (destructive)");
 
     drop(conn);
@@ -806,8 +811,7 @@ async fn spike_q2_close_first_ok_repeat_done() {
     let certs = TestCerts::generate();
     let cparams = client_params();
     let sparams = server_params(&certs);
-    let (client, _server, conn, server_task) =
-        probe_loopback(&certs, &cparams, sparams).await;
+    let (client, _server, conn, server_task) = probe_loopback(&certs, &cparams, sparams).await;
 
     assert!(client.wait_established(2000).await, "client established");
 
@@ -836,8 +840,7 @@ async fn spike_q3_stream_shutdown_write_resets_without_capacity() {
     let certs = TestCerts::generate();
     let cparams = client_params();
     let sparams = server_params_zero_grant(&certs);
-    let (client, server, conn, server_task) =
-        probe_loopback(&certs, &cparams, sparams).await;
+    let (client, server, conn, server_task) = probe_loopback(&certs, &cparams, sparams).await;
 
     assert!(client.wait_established(2000).await, "client established");
     assert!(server.wait_established(2000).await, "server established");
@@ -895,8 +898,7 @@ async fn spike_q4_stop_sending_surfaces_stream_stopped() {
     let certs = TestCerts::generate();
     let cparams = client_params();
     let sparams = server_params(&certs);
-    let (client, server, conn, server_task) =
-        probe_loopback(&certs, &cparams, sparams).await;
+    let (client, server, conn, server_task) = probe_loopback(&certs, &cparams, sparams).await;
 
     assert!(client.wait_established(2000).await, "client established");
     assert!(server.wait_established(2000).await, "server established");
@@ -922,10 +924,11 @@ async fn spike_q4_stop_sending_surfaces_stream_stopped() {
 
     // Client's send side must now report StreamStopped(0x42) (66 decimal).
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let cap = client
-        .call(|q| format!("{:?}", q.stream_capacity(0)))
-        .await;
-    println!("[Q4] client stream_capacity(0) after STOP_SENDING = {}", cap);
+    let cap = client.call(|q| format!("{:?}", q.stream_capacity(0))).await;
+    println!(
+        "[Q4] client stream_capacity(0) after STOP_SENDING = {}",
+        cap
+    );
     assert!(
         cap.contains("StreamStopped(66)"),
         "client must see StreamStopped with the peer's code 0x42=66, got {cap}"
@@ -945,8 +948,7 @@ async fn spike_q5_zero_capacity_fin_accepted_and_flushed() {
     let certs = TestCerts::generate();
     let cparams = client_params();
     let sparams = server_params_zero_grant(&certs);
-    let (client, server, conn, server_task) =
-        probe_loopback(&certs, &cparams, sparams).await;
+    let (client, server, conn, server_task) = probe_loopback(&certs, &cparams, sparams).await;
 
     assert!(client.wait_established(2000).await, "client established");
     assert!(server.wait_established(2000).await, "server established");
@@ -995,7 +997,8 @@ async fn spike_q5_zero_capacity_fin_accepted_and_flushed() {
     assert!(
         peer.1 || peer.2,
         "server must observe the FIN on stream 0, got recv={} finished={}",
-        peer.0, peer.2
+        peer.0,
+        peer.2
     );
 
     drop(conn);
@@ -1012,8 +1015,7 @@ async fn spike_5_5_blocker_zero_txcap_hides_writable_discovery() {
     let certs = TestCerts::generate();
     let cparams = client_params();
     let sparams = server_params_zero_grant(&certs);
-    let (client, _server, conn, server_task) =
-        probe_loopback(&certs, &cparams, sparams).await;
+    let (client, _server, conn, server_task) = probe_loopback(&certs, &cparams, sparams).await;
 
     assert!(client.wait_established(2000).await, "client established");
 
@@ -1060,8 +1062,7 @@ async fn spike_5_5_tombstone_terminal_id_never_reappears() {
     let certs = TestCerts::generate();
     let cparams = client_params();
     let sparams = server_params(&certs);
-    let (client, server, conn, server_task) =
-        probe_loopback(&certs, &cparams, sparams).await;
+    let (client, server, conn, server_task) = probe_loopback(&certs, &cparams, sparams).await;
 
     assert!(client.wait_established(2000).await, "client established");
     assert!(server.wait_established(2000).await, "server established");
@@ -1091,7 +1092,14 @@ async fn spike_5_5_tombstone_terminal_id_never_reappears() {
             let writable_next = q.stream_writable_next();
             let readable_has0 = q.readable().any(|id| id == 0);
             let writable_has0 = q.writable().any(|id| id == 0);
-            (recv, finished, readable_next, writable_next, readable_has0, writable_has0)
+            (
+                recv,
+                finished,
+                readable_next,
+                writable_next,
+                readable_has0,
+                writable_has0,
+            )
         })
         .await;
     println!(
@@ -1118,7 +1126,10 @@ async fn spike_5_5_tombstone_terminal_id_never_reappears() {
             )
         })
         .await;
-    println!("[§5.5 tombstone] second pass readable_has0={} writable_has0={}", again.0, again.1);
+    println!(
+        "[§5.5 tombstone] second pass readable_has0={} writable_has0={}",
+        again.0, again.1
+    );
     assert!(!again.0 && !again.1, "terminal id 0 stays absent");
 
     drop(conn);

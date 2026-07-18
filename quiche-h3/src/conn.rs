@@ -234,14 +234,22 @@ pub(crate) mod mock {
                     // If we couldn't deliver the whole chunk, push the remainder
                     // back so a subsequent call continues it.
                     if n < bytes.len() {
-                        self.recv_script.entry(id).or_default().push_front(RecvStep::Data {
-                            bytes: bytes[n..].to_vec(),
-                            fin,
-                        });
+                        self.recv_script
+                            .entry(id)
+                            .or_default()
+                            .push_front(RecvStep::Data {
+                                bytes: bytes[n..].to_vec(),
+                                fin,
+                            });
                         return Ok((n, false));
                     }
                     // Once drained (no more steps), the id is no longer readable.
-                    if self.recv_script.get(&id).map(|q| q.is_empty()).unwrap_or(true) {
+                    if self
+                        .recv_script
+                        .get(&id)
+                        .map(|q| q.is_empty())
+                        .unwrap_or(true)
+                    {
                         self.readable_ids.remove(&id);
                     }
                     Ok((n, fin))
@@ -263,12 +271,17 @@ pub(crate) mod mock {
                 .copied()
                 .unwrap_or(buf.len())
                 .min(buf.len());
-            self.sent.push((id, buf[..accept].to_vec(), fin && accept == buf.len()));
+            self.sent
+                .push((id, buf[..accept].to_vec(), fin && accept == buf.len()));
             Ok(accept)
         }
 
         fn stream_shutdown(&mut self, id: u64, direction: Shutdown, err: u64) -> QResult<()> {
-            if let Some(e) = self.shutdown_errors.get_mut(&id).and_then(|q| q.pop_front()) {
+            if let Some(e) = self
+                .shutdown_errors
+                .get_mut(&id)
+                .and_then(|q| q.pop_front())
+            {
                 return Err(e);
             }
             self.shutdowns.push(ShutdownCall {
@@ -313,7 +326,11 @@ pub(crate) mod mock {
         }
 
         fn stream_priority(&mut self, id: u64, urgency: u8, incremental: bool) -> QResult<()> {
-            if let Some(e) = self.priority_errors.get_mut(&id).and_then(|q| q.pop_front()) {
+            if let Some(e) = self
+                .priority_errors
+                .get_mut(&id)
+                .and_then(|q| q.pop_front())
+            {
                 return Err(e);
             }
             self.priorities.push((id, urgency, incremental));
@@ -356,19 +373,34 @@ pub(crate) mod mock {
         #[test]
         fn mock_recv_delivers_then_done() {
             let mut c = MockConn::new();
-            c.script_recv(4, [RecvStep::Data { bytes: b"abc".to_vec(), fin: true }]);
+            c.script_recv(
+                4,
+                [RecvStep::Data {
+                    bytes: b"abc".to_vec(),
+                    fin: true,
+                }],
+            );
             assert!(c.stream_readable(4));
             let mut out = [0u8; 16];
             assert_eq!(c.stream_recv(4, &mut out).unwrap(), (3, true));
             assert_eq!(&out[..3], b"abc");
             assert!(!c.stream_readable(4));
-            assert!(matches!(c.stream_recv(4, &mut out), Err(quiche::Error::Done)));
+            assert!(matches!(
+                c.stream_recv(4, &mut out),
+                Err(quiche::Error::Done)
+            ));
         }
 
         #[test]
         fn mock_recv_truncates_to_out_len() {
             let mut c = MockConn::new();
-            c.script_recv(0, [RecvStep::Data { bytes: b"abcdef".to_vec(), fin: true }]);
+            c.script_recv(
+                0,
+                [RecvStep::Data {
+                    bytes: b"abcdef".to_vec(),
+                    fin: true,
+                }],
+            );
             let mut out = [0u8; 4];
             assert_eq!(c.stream_recv(0, &mut out).unwrap(), (4, false));
             assert_eq!(&out, b"abcd");

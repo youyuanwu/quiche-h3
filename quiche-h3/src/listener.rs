@@ -256,7 +256,9 @@ mod tests {
     fn default_handshake_cap_is_256() {
         assert_eq!(DEFAULT_MAX_IN_FLIGHT_HANDSHAKES, 256);
         assert_eq!(
-            H3QuicheServerConfig::default().max_in_flight_handshakes.get(),
+            H3QuicheServerConfig::default()
+                .max_in_flight_handshakes
+                .get(),
             256
         );
     }

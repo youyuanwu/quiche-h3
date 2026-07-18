@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn send_from_buf_partial_consume_contiguous() {
         let mut buf = Bytes::from_static(b"hello world"); // 11 bytes
-        // First turn: transport accepts only 5 bytes.
+                                                          // First turn: transport accepts only 5 bytes.
         let n = send_from_buf(&mut buf, |chunk| {
             assert_eq!(chunk, b"hello world");
             Ok(5)
@@ -251,8 +251,7 @@ mod tests {
             value: 55,
         });
         let hook_ptr = Box::into_raw(hook);
-        let waker =
-            unsafe { Waker::from_raw(RawWaker::new(hook_ptr as *const (), &RACE_VTABLE)) };
+        let waker = unsafe { Waker::from_raw(RawWaker::new(hook_ptr as *const (), &RACE_VTABLE)) };
         let mut cx = Context::from_waker(&waker);
         // Fast path sees empty; register clones the waker → hook sets value;
         // recheck must observe it.

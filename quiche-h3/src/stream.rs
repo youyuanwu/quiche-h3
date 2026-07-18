@@ -143,9 +143,10 @@ impl<B: Buf> quic::RecvStream for H3RecvStream<B> {
 
     fn stop_sending(&mut self, error_code: u64) {
         self.stop_sent = true;
-        let _ = self
-            .cmd_tx
-            .send(DriverCommand::StopSending { id: self.id, code: error_code });
+        let _ = self.cmd_tx.send(DriverCommand::StopSending {
+            id: self.id,
+            code: error_code,
+        });
     }
 
     fn recv_id(&self) -> StreamId {
@@ -160,9 +161,10 @@ impl<B: Buf> Drop for H3RecvStream<B> {
         if self.stop_sent || self.terminal_seen || self.terminal.get().is_some() {
             return;
         }
-        let _ = self
-            .cmd_tx
-            .send(DriverCommand::StopSending { id: self.id, code: 0 });
+        let _ = self.cmd_tx.send(DriverCommand::StopSending {
+            id: self.id,
+            code: 0,
+        });
     }
 }
 
@@ -258,10 +260,9 @@ impl<B: Buf> quic::SendStream<B> for H3SendStream<B> {
                 }
                 Poll::Ready(Err(_)) => {
                     self.send_completion = None;
-                    return Poll::Ready(Err(self.sticky_or_internal(
-                        cx,
-                        "send completion cancelled without a terminal",
-                    )));
+                    return Poll::Ready(Err(
+                        self.sticky_or_internal(cx, "send completion cancelled without a terminal")
+                    ));
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -279,7 +280,11 @@ impl<B: Buf> quic::SendStream<B> for H3SendStream<B> {
         let (done_tx, done_rx) = oneshot::channel();
         if self
             .cmd_tx
-            .send(DriverCommand::Send { id: self.id, buf, done: done_tx })
+            .send(DriverCommand::Send {
+                id: self.id,
+                buf,
+                done: done_tx,
+            })
             .is_err()
         {
             return Poll::Ready(Err(
@@ -294,9 +299,10 @@ impl<B: Buf> quic::SendStream<B> for H3SendStream<B> {
             }
             Poll::Ready(Err(_)) => {
                 self.send_completion = None;
-                Poll::Ready(Err(
-                    self.sticky_or_internal(cx, "send completion cancelled without a terminal")
-                ))
+                Poll::Ready(Err(self.sticky_or_internal(
+                    cx,
+                    "send completion cancelled without a terminal",
+                )))
             }
             Poll::Pending => Poll::Pending,
         }
@@ -330,8 +336,10 @@ impl<B: Buf> quic::SendStream<B> for H3SendStream<B> {
                     self.finish_completion = None;
                     // Persist the failure so a later poll cannot default to Ok
                     // via the `finalized` branch below.
-                    let end =
-                        self.sticky_send_end_or_internal(cx, "finish completion cancelled without a terminal");
+                    let end = self.sticky_send_end_or_internal(
+                        cx,
+                        "finish completion cancelled without a terminal",
+                    );
                     self.finish_result = Some(Err(end.clone()));
                     return Poll::Ready(Err(end.to_h3()));
                 }
@@ -357,10 +365,14 @@ impl<B: Buf> quic::SendStream<B> for H3SendStream<B> {
         self.finalized = true;
         if self
             .cmd_tx
-            .send(DriverCommand::Finish { id: self.id, done: done_tx })
+            .send(DriverCommand::Finish {
+                id: self.id,
+                done: done_tx,
+            })
             .is_err()
         {
-            let end = self.sticky_send_end_or_internal(cx, "finish channel closed without a terminal");
+            let end =
+                self.sticky_send_end_or_internal(cx, "finish channel closed without a terminal");
             self.finish_result = Some(Err(end.clone()));
             return Poll::Ready(Err(end.to_h3()));
         }
@@ -373,8 +385,10 @@ impl<B: Buf> quic::SendStream<B> for H3SendStream<B> {
             }
             Poll::Ready(Err(_)) => {
                 self.finish_completion = None;
-                let end =
-                    self.sticky_send_end_or_internal(cx, "finish completion cancelled without a terminal");
+                let end = self.sticky_send_end_or_internal(
+                    cx,
+                    "finish completion cancelled without a terminal",
+                );
                 self.finish_result = Some(Err(end.clone()));
                 Poll::Ready(Err(end.to_h3()))
             }
@@ -392,12 +406,15 @@ impl<B: Buf> quic::SendStream<B> for H3SendStream<B> {
         // or connection close): only install the local reset when none exists
         // yet, so a conflicting poll reports the earlier peer code, not ours.
         if self.status.get().is_none() {
-            self.local_terminal = Some(SendEnd::Reset { error_code: reset_code });
+            self.local_terminal = Some(SendEnd::Reset {
+                error_code: reset_code,
+            });
         }
         // Does not drop an existing send/finish completion receiver (§5.3a).
-        let _ = self
-            .cmd_tx
-            .send(DriverCommand::Reset { id: self.id, code: reset_code });
+        let _ = self.cmd_tx.send(DriverCommand::Reset {
+            id: self.id,
+            code: reset_code,
+        });
     }
 
     fn send_id(&self) -> StreamId {
@@ -414,9 +431,10 @@ impl<B: Buf> Drop for H3SendStream<B> {
         }
         self.finalized = true;
         let (done_tx, _done_rx) = oneshot::channel();
-        let _ = self
-            .cmd_tx
-            .send(DriverCommand::Finish { id: self.id, done: done_tx });
+        let _ = self.cmd_tx.send(DriverCommand::Finish {
+            id: self.id,
+            done: done_tx,
+        });
     }
 }
 
@@ -810,12 +828,17 @@ mod tests {
     }
 
     fn noop_waker_ref() -> &'static Waker {
-        static VTABLE: RawWakerVTable =
-            RawWakerVTable::new(|_| RawWaker::new(std::ptr::null(), &VTABLE), |_| {}, |_| {}, |_| {});
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |_| RawWaker::new(std::ptr::null(), &VTABLE),
+            |_| {},
+            |_| {},
+            |_| {},
+        );
         static WAKER: std::sync::OnceLock<Waker> = std::sync::OnceLock::new();
         WAKER.get_or_init(|| unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) })
     }
 
+    #[allow(clippy::type_complexity)]
     fn recv_channel() -> (
         mpsc::Sender<Bytes>,
         TerminalCell<RecvEnd>,
@@ -956,7 +979,10 @@ mod tests {
         let (_btx, terminal, _r, recv, mut crx) = recv_channel();
         terminal.set(RecvEnd::Fin);
         drop(recv);
-        assert!(crx.try_recv().is_err(), "terminal recv must not stop-send on drop");
+        assert!(
+            crx.try_recv().is_err(),
+            "terminal recv must not stop-send on drop"
+        );
     }
 
     // ---- H3SendStream ----
@@ -1075,7 +1101,10 @@ mod tests {
         send.reset(3);
         let _ = crx.try_recv(); // the Reset
         drop(send);
-        assert!(crx.try_recv().is_err(), "finalized send must not finish on drop");
+        assert!(
+            crx.try_recv().is_err(),
+            "finalized send must not finish on drop"
+        );
     }
 
     // Regression (final review, GPT): a materialized handoff dropped BEFORE the
@@ -1123,7 +1152,10 @@ mod tests {
         // disarmed, so conversion enqueues nothing; only the STREAM object's own
         // Drop later enqueues cleanup.
         let (_btx, _terminal, _resume, recv, mut crx) = recv_channel();
-        assert!(crx.try_recv().is_err(), "conversion must not fire the guard");
+        assert!(
+            crx.try_recv().is_err(),
+            "conversion must not fire the guard"
+        );
         drop(recv);
         assert!(
             matches!(crx.try_recv(), Ok(DriverCommand::StopSending { .. })),
@@ -1133,22 +1165,28 @@ mod tests {
 
     // ---- StreamOpener ----
 
-    fn opener() -> (StreamOpener<Bytes>, mpsc::UnboundedReceiver<DriverCommand<Bytes>>, Arc<ConnShared>) {
+    fn opener() -> (
+        StreamOpener<Bytes>,
+        mpsc::UnboundedReceiver<DriverCommand<Bytes>>,
+        Arc<ConnShared>,
+    ) {
         let (ctx, crx) = mpsc::unbounded_channel();
         let shared = ConnShared::new();
-        (StreamOpener::from_parts(ctx, Arc::clone(&shared)), crx, shared)
+        (
+            StreamOpener::from_parts(ctx, Arc::clone(&shared)),
+            crx,
+            shared,
+        )
     }
 
     #[test]
     fn stream_opener_submit_helper_resolves_terminal_when_conn_terminal_preset() {
         let (mut op, mut crx, shared) = opener();
-        shared
-            .conn_terminal
-            .set(Arc::new(ConnTerminal::AppClose {
-                origin: CloseOrigin::Peer,
-                error_code: 0x101,
-                reason: Bytes::new(),
-            }));
+        shared.conn_terminal.set(Arc::new(ConnTerminal::AppClose {
+            origin: CloseOrigin::Peer,
+            error_code: 0x101,
+            reason: Bytes::new(),
+        }));
         let mut cx = noop_cx();
         match op.poll_open_bidi(&mut cx) {
             Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
@@ -1157,7 +1195,10 @@ mod tests {
             _ => panic!("expected preset terminal resolution"),
         }
         // No doomed OpenBidi was enqueued.
-        assert!(crx.try_recv().is_err(), "must not submit under a preset terminal");
+        assert!(
+            crx.try_recv().is_err(),
+            "must not submit under a preset terminal"
+        );
     }
 
     #[test]
@@ -1212,6 +1253,7 @@ mod tests {
 
     // ---- Connection ----
 
+    #[allow(clippy::type_complexity)]
     fn connection() -> (
         Connection<Bytes>,
         mpsc::Sender<BidiHandoff<Bytes>>,

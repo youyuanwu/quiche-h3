@@ -13,9 +13,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use h3::quic::Connection as _;
-use quiche_h3::{
-    H3QuicheAcceptor, H3QuicheClientConfig, H3QuicheConnector, H3QuicheServerConfig,
-};
+use quiche_h3::{H3QuicheAcceptor, H3QuicheClientConfig, H3QuicheConnector, H3QuicheServerConfig};
 use tokio::net::UdpSocket;
 
 /// A self-signed cert + key written to temp PEM files (mirrors spike_harness).
@@ -97,9 +95,8 @@ async fn acceptor_and_connector_complete_handshake() {
         verify_peer: false,
         ..H3QuicheClientConfig::default()
     };
-    let connector =
-        H3QuicheConnector::new(server_addr, "localhost".to_string(), client_config)
-            .expect("build connector");
+    let connector = H3QuicheConnector::new(server_addr, "localhost".to_string(), client_config)
+        .expect("build connector");
 
     let conn = connector.connect().await.expect("client connect ok");
     // `connect_with_config` resolves only after the handshake completes, so a
