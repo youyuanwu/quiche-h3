@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use h3::quic::{self, ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf};
 
-use crate::buffer::TerminalCell;
+use crate::buffer::{TerminalCell, WriteCompletion, WriteOutcome};
 use crate::driver::{BidiHandoff, ConnShared, DriverCommand, RecvHandoff, SendHandoff};
 use crate::error::{internal_stream_error, ConnTerminal, RecvEnd, SendEnd};
 
@@ -196,9 +196,14 @@ pub struct H3SendStream<B: Buf> {
     cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
     /// The single pending `WriteBuf` awaiting a `poll_ready` flush.
     stash: Option<WriteBuf<B>>,
-    /// Completion of the in-flight `Send`, resolved exactly once by the worker.
-    send_completion: Option<oneshot::Receiver<Result<(), SendEnd>>>,
-    /// Completion of the in-flight `Finish`.
+    /// Reusable per-stream write-completion cell (SF-3): each `Send` reuses this
+    /// `Arc`-shared cell (a refcount bump) instead of allocating a `oneshot` per
+    /// chunk. Completion is generation-guarded (set-if-current-generation).
+    write_completion: WriteCompletion<SendEnd>,
+    /// Generation of the in-flight `Send` awaiting completion, if any. `None`
+    /// once the completion has been consumed (single-outstanding contract).
+    send_gen: Option<u64>,
+    /// Completion of the in-flight `Finish` (still a per-stream one-shot).
     finish_completion: Option<oneshot::Receiver<Result<(), SendEnd>>>,
     /// Retained `poll_finish` result, returned on every later poll.
     finish_result: Option<Result<(), SendEnd>>,
@@ -218,7 +223,8 @@ impl<B: Buf> H3SendStream<B> {
             status: h.status,
             cmd_tx: h.cmd_tx,
             stash: None,
-            send_completion: None,
+            write_completion: WriteCompletion::new(),
+            send_gen: None,
             finish_completion: None,
             finish_result: None,
             finalized: false,
@@ -252,6 +258,30 @@ impl<B: Buf> H3SendStream<B> {
         }
     }
 
+    /// Test-only: the reusable write-completion cell's current generation,
+    /// which advances exactly once per `poll_ready` flush (SF-3 / SC-004).
+    #[cfg(test)]
+    pub(crate) fn write_generation(&self) -> u64 {
+        self.write_completion.generation()
+    }
+
+    /// Map a reusable-cell [`WriteOutcome`] (SF-3) to the `poll_ready` result,
+    /// preserving the old per-write `oneshot` semantics exactly: a delivered
+    /// `Result` is returned as-is; a `Cancelled` carrier (dropped without
+    /// completing) resolves through the sticky terminal — never a bare cancel.
+    fn resolve_write(
+        &self,
+        outcome: WriteOutcome<SendEnd>,
+        cx: &mut Context<'_>,
+    ) -> Result<(), StreamErrorIncoming> {
+        match outcome {
+            WriteOutcome::Done(result) => result.map_err(|e| e.to_h3()),
+            WriteOutcome::Cancelled => {
+                Err(self.sticky_or_internal(cx, "send completion cancelled without a terminal"))
+            }
+        }
+    }
+
     /// Like [`sticky_or_internal`](Self::sticky_or_internal) but yields a
     /// [`SendEnd`] so the failure can be **retained** (e.g. as `finish_result`),
     /// ensuring a later poll returns the same error and never defaults to `Ok`.
@@ -266,17 +296,11 @@ impl<B: Buf> H3SendStream<B> {
 impl<B: Buf> quic::SendStream<B> for H3SendStream<B> {
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
         // (1) An in-flight write completion outranks everything: report it once.
-        if self.send_completion.is_some() {
-            match Pin::new(self.send_completion.as_mut().unwrap()).poll(cx) {
-                Poll::Ready(Ok(result)) => {
-                    self.send_completion = None;
-                    return Poll::Ready(result.map_err(|e| e.to_h3()));
-                }
-                Poll::Ready(Err(_)) => {
-                    self.send_completion = None;
-                    return Poll::Ready(Err(
-                        self.sticky_or_internal(cx, "send completion cancelled without a terminal")
-                    ));
+        if let Some(generation) = self.send_gen {
+            match self.write_completion.poll(generation, cx) {
+                Poll::Ready(outcome) => {
+                    self.send_gen = None;
+                    return Poll::Ready(self.resolve_write(outcome, cx));
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -290,33 +314,32 @@ impl<B: Buf> quic::SendStream<B> for H3SendStream<B> {
             None => return Poll::Ready(Ok(())),
             Some(buf) => buf,
         };
-        // (4) Flush the stash as exactly one `Send`, store + poll its completion.
-        let (done_tx, done_rx) = oneshot::channel();
+        // (4) Flush the stash as exactly one `Send`. Reuse the per-stream cell:
+        // begin a fresh generation (clears any consumed prior slot — safe under
+        // the single-outstanding-write contract) and hand the worker a completer
+        // stamped with it, instead of allocating a `oneshot` per chunk (SF-3).
+        let generation = self.write_completion.begin();
+        let done = self.write_completion.completer(generation);
         if self
             .cmd_tx
             .send(DriverCommand::Send {
                 id: self.id,
                 buf,
-                done: done_tx,
+                done,
             })
             .is_err()
         {
+            // The dropped command's completer fires `Cancelled` into the cell,
+            // but we resolve the failure directly via the sticky terminal here.
             return Poll::Ready(Err(
                 self.sticky_or_internal(cx, "send channel closed without a terminal")
             ));
         }
-        self.send_completion = Some(done_rx);
-        match Pin::new(self.send_completion.as_mut().unwrap()).poll(cx) {
-            Poll::Ready(Ok(result)) => {
-                self.send_completion = None;
-                Poll::Ready(result.map_err(|e| e.to_h3()))
-            }
-            Poll::Ready(Err(_)) => {
-                self.send_completion = None;
-                Poll::Ready(Err(self.sticky_or_internal(
-                    cx,
-                    "send completion cancelled without a terminal",
-                )))
+        self.send_gen = Some(generation);
+        match self.write_completion.poll(generation, cx) {
+            Poll::Ready(outcome) => {
+                self.send_gen = None;
+                Poll::Ready(self.resolve_write(outcome, cx))
             }
             Poll::Pending => Poll::Pending,
         }
@@ -1058,12 +1081,73 @@ mod tests {
         };
         // Worker records success; even if a terminal arrives afterward, the
         // recorded result is reported once.
-        done.send(Ok(())).unwrap();
+        done.complete(Ok(()));
         status.set(SendEnd::Stopped { error_code: 7 });
         assert!(matches!(send.poll_ready(&mut cx), Poll::Ready(Ok(()))));
         // Subsequent idle poll now sees the sticky terminal.
         match send.poll_ready(&mut cx) {
             Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code: 7 })) => {}
+            other => panic!("expected sticky StreamTerminated, got {other:?}"),
+        }
+    }
+
+    /// SF-3 / SC-004: K sequential `send_data`→`poll_ready` cycles reuse a single
+    /// per-stream completion cell (no per-chunk `oneshot` allocation). Each flush
+    /// advances the cell one generation and completes exactly once, in order.
+    #[test]
+    fn poll_ready_reuses_one_completion_cell_across_writes() {
+        let (_status, mut send, mut crx) = send_half(0);
+        let mut cx = noop_cx();
+        const K: u64 = 6;
+        for expected_gen in 1..=K {
+            send.send_data(wbuf(b"chunk")).unwrap();
+            // Flush enqueues a Send and awaits its completion (worker not yet run).
+            assert!(matches!(send.poll_ready(&mut cx), Poll::Pending));
+            assert_eq!(
+                send.write_generation(),
+                expected_gen,
+                "one generation bump per write — the cell is reused, not reallocated"
+            );
+            let done = match crx.try_recv() {
+                Ok(DriverCommand::Send { id: 0, done, .. }) => done,
+                other => panic!("expected Send, got {other:?}"),
+            };
+            // Worker completes this generation; the front end reports it once.
+            done.complete(Ok(()));
+            assert!(matches!(send.poll_ready(&mut cx), Poll::Ready(Ok(()))));
+            // Idle readiness afterward — completion consumed exactly once.
+            assert!(matches!(send.poll_ready(&mut cx), Poll::Ready(Ok(()))));
+        }
+        assert_eq!(
+            send.write_generation(),
+            K,
+            "one cell reused for all K writes"
+        );
+    }
+
+    /// SF-3: a `Send` still queued (unapplied) when the connection closes resolves
+    /// its generation exactly once through the reusable completer — never a bare
+    /// cancel, never a hang (gpt#7 lifecycle). Here the completer is dropped
+    /// without completing (mirroring an unapplied command dropped at close), so
+    /// `poll_ready` resolves through the sticky terminal.
+    #[test]
+    fn poll_ready_unapplied_send_resolves_via_sticky_terminal() {
+        let (status, mut send, mut crx) = send_half(0);
+        let mut cx = noop_cx();
+        send.send_data(wbuf(b"body")).unwrap();
+        assert!(matches!(send.poll_ready(&mut cx), Poll::Pending));
+        // Intercept and DROP the Send's completer without completing it, as the
+        // driver would when a command is dropped unapplied at connection close.
+        let done = match crx.try_recv() {
+            Ok(DriverCommand::Send { id: 0, done, .. }) => done,
+            other => panic!("expected Send, got {other:?}"),
+        };
+        drop(done); // fires Cancelled into the reusable cell
+                    // A terminal is published (as on_conn_close would). poll_ready resolves
+                    // the cancelled completion through the sticky terminal exactly once.
+        status.set(SendEnd::Stopped { error_code: 9 });
+        match send.poll_ready(&mut cx) {
+            Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code: 9 })) => {}
             other => panic!("expected sticky StreamTerminated, got {other:?}"),
         }
     }

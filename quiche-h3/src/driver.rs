@@ -22,7 +22,7 @@ use tokio_quiche::quic::HandshakeInfo;
 use tokio_quiche::quic::QuicheConnection;
 use tokio_quiche::{ApplicationOverQuic, QuicResult};
 
-use crate::buffer::{send_from_buf, TerminalCell, MAX_CHUNK, PKT_BUF_LEN};
+use crate::buffer::{send_from_buf, TerminalCell, WriteCompleter, MAX_CHUNK, PKT_BUF_LEN};
 use crate::conn::QuicConn;
 use crate::error::{
     classify_stream_recv_error, classify_stream_send_error, conn_terminal_from_error, CloseOrigin,
@@ -122,6 +122,11 @@ fn is_bidi(id: u64) -> bool {
 /// control channel (§5.2). Unbounded because the emitting trait methods cannot
 /// exert backpressure or fail (`reset`/`stop_sending` return `()`), and the
 /// resume signals are correctness-critical and must never be dropped.
+// The `Send` variant is intentionally larger than the lifecycle variants: it
+// carries the caller's `WriteBuf` inline. Boxing it would add a heap allocation
+// per queued write on the send hot path, which we deliberately avoid (cf.
+// `SendOp`).
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum DriverCommand<B: Buf> {
     /// `OpenStreams::poll_open_bidi` — returns both halves.
     OpenBidi {
@@ -133,10 +138,13 @@ pub(crate) enum DriverCommand<B: Buf> {
         reply: oneshot::Sender<Result<SendHandoff<B>, Arc<ConnTerminal>>>,
     },
     /// `SendStream::send_data` — stash one `WriteBuf` in the stream's send slot.
+    /// The completion is delivered through the stream's **reusable**
+    /// [`WriteCompleter`] (SF-3), stamped with the write's generation, rather
+    /// than a freshly allocated per-chunk `oneshot`.
     Send {
         id: u64,
         buf: h3::quic::WriteBuf<B>,
-        done: oneshot::Sender<Result<(), SendEnd>>,
+        done: WriteCompleter<SendEnd>,
     },
     /// `SendStream::poll_finish` — queue a FIN after any buffered writes.
     Finish {
@@ -316,8 +324,8 @@ pub(crate) struct StreamRecvState {
 }
 
 /// One ordered send operation queued for a stream (§5.3a). `Write` carries the
-/// caller's `WriteBuf` cursor (partial-consumed across turns) and its completion
-/// oneshot; `Finish` carries only its completion oneshot.
+/// caller's `WriteBuf` cursor (partial-consumed across turns) and its reusable
+/// [`WriteCompleter`] (SF-3); `Finish` carries only its completion oneshot.
 // The `Write` variant is intentionally larger than `Finish`: boxing the
 // `WriteBuf` would add a heap allocation per queued write on the send hot path,
 // which we deliberately avoid.
@@ -325,7 +333,7 @@ pub(crate) struct StreamRecvState {
 pub(crate) enum SendOp<B: Buf> {
     Write {
         buf: h3::quic::WriteBuf<B>,
-        done: oneshot::Sender<Result<(), SendEnd>>,
+        done: WriteCompleter<SendEnd>,
     },
     Finish {
         done: oneshot::Sender<Result<(), SendEnd>>,
@@ -333,14 +341,17 @@ pub(crate) enum SendOp<B: Buf> {
 }
 
 impl<B: Buf> SendOp<B> {
-    /// Resolve this op's completion oneshot exactly once (§5.3a exactly-once).
+    /// Resolve this op's completion exactly once (§5.3a exactly-once). A `Write`
+    /// completes through its reusable [`WriteCompleter`] (set-if-current-
+    /// generation, SF-3); a `Finish` stays a per-stream one-shot `oneshot`.
     fn complete(self, result: Result<(), SendEnd>) {
-        let done = match self {
-            SendOp::Write { done, .. } => done,
-            SendOp::Finish { done } => done,
-        };
-        // Ignore send error: the front end may have stopped polling (drop).
-        let _ = done.send(result);
+        match self {
+            SendOp::Write { done, .. } => done.complete(result),
+            // Ignore send error: the front end may have stopped polling (drop).
+            SendOp::Finish { done } => {
+                let _ = done.send(result);
+            }
+        }
     }
 }
 
@@ -2424,7 +2435,13 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
     /// own cells already carry it. Never a bare oneshot cancel.
     fn complete_command_on_close(&self, cmd: DriverCommand<B>, terminal: &Arc<ConnTerminal>) {
         match cmd {
-            DriverCommand::Send { done, .. } | DriverCommand::Finish { done, .. } => {
+            // A `Send` still queued at close resolves its generation exactly once
+            // through its reusable completer (set-if-current-generation); a
+            // `Finish` resolves its per-stream oneshot. Never a bare cancel.
+            DriverCommand::Send { done, .. } => {
+                done.complete(Err(SendEnd::Conn(Arc::clone(terminal))));
+            }
+            DriverCommand::Finish { done, .. } => {
                 let _ = done.send(Err(SendEnd::Conn(Arc::clone(terminal))));
             }
             DriverCommand::OpenBidi { reply } => {
@@ -2578,6 +2595,7 @@ impl<B: Buf> Drop for QuicheDriver<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::WriteOutcome;
 
     fn driver() -> (QuicheDriver<Bytes>, DriverHandles<Bytes>) {
         // Default to the client convention (locally-opened bidi `0,4,8…`).
@@ -3468,18 +3486,58 @@ mod tests {
         c.sent.iter().any(|(sid, _, fin)| *sid == id && *fin)
     }
 
-    fn push_send(
+    /// Test-only view over a reusable [`WriteCompletion`](crate::buffer)
+    /// generation (SF-3): mirrors the old per-write `oneshot` receiver so send
+    /// tests can assert pending / `Ok` / `Err` / cancelled completion states.
+    struct SendProbe {
+        cell: crate::buffer::WriteCompletion<SendEnd>,
+        generation: u64,
+    }
+
+    #[derive(Debug)]
+    enum ProbeState {
+        Pending,
+        Ok,
+        Err(SendEnd),
+        Cancelled,
+    }
+
+    impl SendProbe {
+        /// Non-consuming when pending; consumes the outcome once resolved.
+        fn state(&self) -> ProbeState {
+            match self.cell.try_take(self.generation) {
+                None => ProbeState::Pending,
+                Some(WriteOutcome::Done(Ok(()))) => ProbeState::Ok,
+                Some(WriteOutcome::Done(Err(e))) => ProbeState::Err(e),
+                Some(WriteOutcome::Cancelled) => ProbeState::Cancelled,
+            }
+        }
+    }
+
+    /// Enqueue a `Send` carrying a completer for `cell`'s next generation and
+    /// return a [`SendProbe`] for it. When `cell` is shared across calls this
+    /// proves the reusable-cell contract (SC-004): no per-chunk allocation.
+    fn push_send_on(
         d: &mut QuicheDriver<Bytes>,
+        cell: &crate::buffer::WriteCompletion<SendEnd>,
         id: u64,
         payload: &'static [u8],
-    ) -> oneshot::Receiver<Result<(), SendEnd>> {
-        let (tx, rx) = oneshot::channel();
+    ) -> SendProbe {
+        let generation = cell.begin();
         d.inbox.push_back(DriverCommand::Send {
             id,
             buf: wbuf(payload),
-            done: tx,
+            done: cell.completer(generation),
         });
-        rx
+        SendProbe {
+            cell: cell.clone(),
+            generation,
+        }
+    }
+
+    fn push_send(d: &mut QuicheDriver<Bytes>, id: u64, payload: &'static [u8]) -> SendProbe {
+        let cell = crate::buffer::WriteCompletion::new();
+        push_send_on(d, &cell, id, payload)
     }
 
     fn push_finish(d: &mut QuicheDriver<Bytes>, id: u64) -> oneshot::Receiver<Result<(), SendEnd>> {
@@ -3498,15 +3556,12 @@ mod tests {
         let total = wbuf_len(b"hello world");
         // Accept at most 3 bytes per stream_send call.
         c.send_capacity.insert(0, 3);
-        let mut done = push_send(&mut d, 0, b"hello world");
+        let done = push_send(&mut d, 0, b"hello world");
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
 
         // Not fully accepted yet: no completion, and the blocked write re-armed.
-        assert!(matches!(
-            done.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
+        assert!(matches!(done.state(), ProbeState::Pending));
         let rearms: Vec<usize> = c
             .rearms
             .iter()
@@ -3532,7 +3587,7 @@ mod tests {
         }
         assert_eq!(sent_len(&c, 0), total, "all bytes eventually accepted");
         assert!(
-            matches!(done.try_recv(), Ok(Ok(()))),
+            matches!(done.state(), ProbeState::Ok),
             "exactly one Ok at full acceptance"
         );
     }
@@ -3568,20 +3623,20 @@ mod tests {
         let (mut d, _h) = driver();
         let mut c = MockConn::new();
         // Write1 is small and fully accepted this turn.
-        let mut done1 = push_send(&mut d, 0, b"a");
+        let done1 = push_send(&mut d, 0, b"a");
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
         assert!(
-            matches!(done1.try_recv(), Ok(Ok(()))),
+            matches!(done1.state(), ProbeState::Ok),
             "Write1 accepted before reset"
         );
 
         // Write2 queued, then Reset preempts it in the same stage (a).
-        let mut done2 = push_send(&mut d, 0, b"bcde");
+        let done2 = push_send(&mut d, 0, b"bcde");
         d.inbox.push_back(DriverCommand::Reset { id: 0, code: 42 });
         d.apply_inbox(&mut c);
-        match done2.try_recv() {
-            Ok(Err(SendEnd::Reset { error_code: 42 })) => {}
+        match done2.state() {
+            ProbeState::Err(SendEnd::Reset { error_code: 42 }) => {}
             other => panic!("Write2 must be cancelled once with local reset, got {other:?}"),
         }
         // Sticky status published for the front end.
@@ -3678,7 +3733,7 @@ mod tests {
         let mut c = MockConn::new();
         // Peer STOP_SENDING on the send half → send terminal + contract A (recv
         // already done) reclaims admit/recv but retains self.send's terminal.
-        let mut w1 = push_send(&mut d, 0, b"aa");
+        let w1 = push_send(&mut d, 0, b"aa");
         c.send_errors
             .entry(0)
             .or_default()
@@ -3686,19 +3741,19 @@ mod tests {
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
         assert!(matches!(
-            w1.try_recv(),
-            Ok(Err(SendEnd::Stopped { error_code: 55 }))
+            w1.state(),
+            ProbeState::Err(SendEnd::Stopped { error_code: 55 })
         ));
         assert!(!d.admit.contains_key(&0), "contract A reclaimed admit");
         assert!(d.send.contains_key(&0), "send retained for deferred ops");
 
         // A Send that was deferred past the terminal edge completes with the
         // sticky Stopped terminal (never a fabricated Internal / bare cancel).
-        let mut late = push_send(&mut d, 0, b"bb");
+        let late = push_send(&mut d, 0, b"bb");
         d.apply_inbox(&mut c);
         assert!(matches!(
-            late.try_recv(),
-            Ok(Err(SendEnd::Stopped { error_code: 55 }))
+            late.state(),
+            ProbeState::Err(SendEnd::Stopped { error_code: 55 })
         ));
     }
 
@@ -3709,8 +3764,8 @@ mod tests {
     fn stop_sending_on_send_drains_all_ops_once() {
         let (mut d, _h) = driver();
         let mut c = MockConn::new();
-        let mut w1 = push_send(&mut d, 0, b"aa");
-        let mut w2 = push_send(&mut d, 0, b"bb");
+        let w1 = push_send(&mut d, 0, b"aa");
+        let w2 = push_send(&mut d, 0, b"bb");
         let mut fin = push_finish(&mut d, 0);
         d.apply_inbox(&mut c);
         // The first stream_send call reports the peer stopped us.
@@ -3720,11 +3775,15 @@ mod tests {
             .push_back(quiche::Error::StreamStopped(9));
         d.stage_send(&mut c);
 
-        for (label, rx) in [("w1", &mut w1), ("w2", &mut w2), ("fin", &mut fin)] {
-            match rx.try_recv() {
-                Ok(Err(SendEnd::Stopped { error_code: 9 })) => {}
+        for (label, st) in [("w1", w1.state()), ("w2", w2.state())] {
+            match st {
+                ProbeState::Err(SendEnd::Stopped { error_code: 9 }) => {}
                 other => panic!("{label} must complete once with Stopped, got {other:?}"),
             }
+        }
+        match fin.try_recv() {
+            Ok(Err(SendEnd::Stopped { error_code: 9 })) => {}
+            other => panic!("fin must complete once with Stopped, got {other:?}"),
         }
         assert!(matches!(
             d.send.get(&0).unwrap().status.get(),
@@ -3744,17 +3803,17 @@ mod tests {
     fn stop_sending_via_writable_probe_drains_ops() {
         let (mut d, _h) = driver();
         let mut c = MockConn::new();
-        let mut w1 = push_send(&mut d, 0, b"aa");
-        let mut w2 = push_send(&mut d, 0, b"bb");
+        let w1 = push_send(&mut d, 0, b"aa");
+        let w2 = push_send(&mut d, 0, b"bb");
         d.apply_inbox(&mut c);
         // Stage (d) probes capacity and finds the stream stopped.
         c.writable_next.push_back(0);
         c.capacity.insert(0, Err(quiche::Error::StreamStopped(13)));
         d.stage_writable(&mut c);
 
-        for (label, rx) in [("w1", &mut w1), ("w2", &mut w2)] {
-            match rx.try_recv() {
-                Ok(Err(SendEnd::Stopped { error_code: 13 })) => {}
+        for (label, st) in [("w1", w1.state()), ("w2", w2.state())] {
+            match st {
+                ProbeState::Err(SendEnd::Stopped { error_code: 13 }) => {}
                 other => panic!("{label} must complete once with Stopped, got {other:?}"),
             }
         }
@@ -3772,27 +3831,29 @@ mod tests {
         // (WRITE_BUDGET turns × MAX_WRITE_CHUNK = 512 KiB), so it cannot finish
         // within a single batch even if it takes every remaining turn.
         static BULK: [u8; 1024 * 1024] = [b'x'; 1024 * 1024];
-        let (bulk_tx, mut bulk_done) = oneshot::channel();
+        let bulk_cell = crate::buffer::WriteCompletion::<SendEnd>::new();
+        let bulk_gen = bulk_cell.begin();
         d.inbox.push_back(DriverCommand::Send {
             id: 0,
             buf: WriteBuf::from(h3::proto::frame::Frame::Data(Bytes::from_static(&BULK))),
-            done: bulk_tx,
+            done: bulk_cell.completer(bulk_gen),
         });
+        let bulk = SendProbe {
+            cell: bulk_cell,
+            generation: bulk_gen,
+        };
         // Small stream 4 enqueued behind it.
-        let mut small_done = push_send(&mut d, 4, b"z");
+        let small_done = push_send(&mut d, 4, b"z");
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
 
         // The small stream got its turn and completed despite the bulk backlog.
         assert!(
-            matches!(small_done.try_recv(), Ok(Ok(()))),
+            matches!(small_done.state(), ProbeState::Ok),
             "small stream serviced"
         );
         // The bulk stream is still in flight (not completed, still runnable).
-        assert!(matches!(
-            bulk_done.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
+        assert!(matches!(bulk.state(), ProbeState::Pending));
         assert!(d.runnable_send_set.contains(&0) || d.needs_iteration);
     }
 
@@ -3809,10 +3870,10 @@ mod tests {
         d.stage_send(&mut c); // service the reset shutdown
 
         // A late Send resolves immediately with the sticky reset terminal.
-        let mut late = push_send(&mut d, 0, b"late");
+        let late = push_send(&mut d, 0, b"late");
         d.apply_inbox(&mut c);
-        match late.try_recv() {
-            Ok(Err(SendEnd::Reset { error_code: 5 })) => {}
+        match late.state() {
+            ProbeState::Err(SendEnd::Reset { error_code: 5 }) => {}
             other => panic!("late Send must complete once with sticky terminal, got {other:?}"),
         }
         assert!(
@@ -4010,17 +4071,41 @@ mod tests {
         let (mut d, _h) = driver();
         let mut c = MockConn::new();
         // Queue a Send op WITHOUT running stage (e), so it stays in send_ops.
-        let mut done = push_send(&mut d, 0, b"payload");
+        let done = push_send(&mut d, 0, b"payload");
         d.apply_inbox(&mut c);
         assert!(!d.send.get(&0).unwrap().send_ops.is_empty());
 
         c.peer_error = Some(conn_err(true, 0x7, b""));
         d.do_on_conn_close(&mut c);
 
-        match done.try_recv() {
-            Ok(Err(SendEnd::Conn(_))) => {}
+        match done.state() {
+            ProbeState::Err(SendEnd::Conn(_)) => {}
             other => panic!("expected SendEnd::Conn, got {other:?}"),
         }
+    }
+
+    /// SF-3 (gpt#7 lifecycle): a `Send` still **unapplied** in the inbox at close
+    /// resolves its generation exactly once via `complete_command_on_close` — the
+    /// reusable completer delivers the connection terminal, never a bare cancel.
+    #[test]
+    fn unapplied_send_at_close_completes_generation_once() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        // Queue a Send but do NOT apply_inbox: it never reaches send_ops, so the
+        // on_conn_close command-drain loop must resolve it directly.
+        let done = push_send(&mut d, 0, b"payload");
+        assert!(
+            !d.send.contains_key(&0),
+            "precondition: Send not yet applied into send_ops"
+        );
+        c.peer_error = Some(conn_err(true, 0x9, b""));
+        d.do_on_conn_close(&mut c);
+        match done.state() {
+            ProbeState::Err(SendEnd::Conn(_)) => {}
+            other => panic!("expected SendEnd::Conn for unapplied Send, got {other:?}"),
+        }
+        // Exactly once: nothing left to consume.
+        assert!(matches!(done.state(), ProbeState::Pending));
     }
 
     // Regression (review finding): a Send that hits `ConnGone` in the closing
@@ -4031,7 +4116,7 @@ mod tests {
     fn send_conngone_in_closing_window_defers_to_on_conn_close() {
         let (mut d, _h) = driver();
         let mut c = MockConn::new();
-        let mut done = push_send(&mut d, 0, b"x");
+        let done = push_send(&mut d, 0, b"x");
         c.send_errors
             .entry(0)
             .or_default()
@@ -4039,17 +4124,14 @@ mod tests {
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
         // Not completed, not pinned: op retained, status cell empty.
-        assert!(matches!(
-            done.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
+        assert!(matches!(done.state(), ProbeState::Pending));
         assert!(!d.send.get(&0).unwrap().send_ops.is_empty());
         assert!(d.send.get(&0).unwrap().status.get().is_none());
         // on_conn_close classifies and drains it with SendEnd::Conn.
         c.peer_error = Some(conn_err(true, 0x101, b""));
         d.do_on_conn_close(&mut c);
-        match done.try_recv() {
-            Ok(Err(SendEnd::Conn(_))) => {}
+        match done.state() {
+            ProbeState::Err(SendEnd::Conn(_)) => {}
             other => panic!("expected SendEnd::Conn after close, got {other:?}"),
         }
     }
