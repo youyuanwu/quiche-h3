@@ -178,6 +178,9 @@ pub(crate) struct RecvHandoff<B: Buf> {
     pub(crate) terminal: TerminalCell<RecvEnd>,
     /// Producer-coalesced resume bit shared with the worker (§5.1).
     pub(crate) resume: Arc<AtomicBool>,
+    /// Worker "parked on a full byte channel" flag shared with the worker so the
+    /// consumer only emits a resume when the worker had genuinely blocked (SF-2).
+    pub(crate) blocked: Arc<AtomicBool>,
     /// For `stop_sending` and drop cleanup.
     pub(crate) cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
     /// Armed cleanup if this handoff is dropped before conversion (§6.2).
@@ -275,7 +278,11 @@ pub(crate) struct StreamRecvState {
     /// Producer-coalesced resume bit shared with the front end (§5.1, finding 3).
     pub(crate) resume: Arc<AtomicBool>,
     /// The byte channel was full on the last drain; parked until `RecvResume`.
-    pub(crate) blocked: bool,
+    /// Shared `Arc<AtomicBool>` with the front-end handle so the consumer can
+    /// gate its resume signal on genuine worker blocking (SF-2): the worker
+    /// publishes `true` (Release) when it parks and the consumer observes-and-
+    /// clears it (AcqRel swap) when it frees a slot.
+    pub(crate) blocked: Arc<AtomicBool>,
 }
 
 /// One ordered send operation queued for a stream (§5.3a). `Write` carries the
@@ -1099,7 +1106,10 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             match self.recv.get_mut(&id) {
                 Some(state) => {
                     state.resume.store(false, Ordering::Relaxed);
-                    state.blocked = false;
+                    // Defensive: the consumer already cleared `blocked` via its
+                    // AcqRel swap when it emitted this resume; reset it here too
+                    // so a fresh park cycle starts from a known-clear flag (SF-2).
+                    state.blocked.store(false, Ordering::Relaxed);
                 }
                 None => continue,
             }
@@ -1155,11 +1165,36 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 Ok(permit) => permit,
                 Err(TrySendError::Full(())) => {
                     // Full: leave bytes in quiche (flow control backpressures the
-                    // peer); park until RecvResume. No stream_recv, no loss.
-                    if let Some(state) = self.recv.get_mut(&id) {
-                        state.blocked = true;
+                    // peer); park until RecvResume. SF-2 lost-wakeup closure
+                    // (§5.1): publish `blocked=true` with Release BEFORE a final
+                    // capacity re-check. This forms an atomic handshake with the
+                    // consumer's `blocked.swap(false, AcqRel)`:
+                    //   * if the consumer freed a slot and swapped before our
+                    //     store, its swap saw `false` (no resume) — but our
+                    //     re-check below then observes the freed slot and we do
+                    //     NOT park (so no wakeup is needed);
+                    //   * if the consumer frees after our store, its swap sees
+                    //     `true` and emits exactly one resume.
+                    // Either way we never park with a slot already free, so a
+                    // genuine resume can never be dropped (correctness > perf).
+                    if let Some(state) = self.recv.get(&id) {
+                        state.blocked.store(true, Ordering::Release);
                     }
-                    return;
+                    match tx.try_reserve() {
+                        Ok(permit) => {
+                            // A slot was freed in the window: clear the park flag
+                            // and proceed with the read instead of parking.
+                            if let Some(state) = self.recv.get(&id) {
+                                state.blocked.store(false, Ordering::Release);
+                            }
+                            permit
+                        }
+                        Err(TrySendError::Full(())) => return,
+                        Err(TrySendError::Closed(())) => {
+                            self.abandon_recv(qconn, id);
+                            return;
+                        }
+                    }
                 }
                 Err(TrySendError::Closed(())) => {
                     // Dropped H3RecvStream: normal local abandonment (invariant 1).
@@ -1460,6 +1495,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         let (tx, rx) = mpsc::channel(BYTE_CHANNEL_DEPTH);
         let terminal = TerminalCell::new();
         let resume = Arc::new(AtomicBool::new(false));
+        let blocked = Arc::new(AtomicBool::new(false));
         let recv_done = retained.is_some();
         if let Some(end) = retained {
             terminal.set(end);
@@ -1469,6 +1505,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             bytes: rx,
             terminal: terminal.clone(),
             resume: Arc::clone(&resume),
+            blocked: Arc::clone(&blocked),
             cmd_tx: cmd_tx.clone(),
             cleanup: HandoffCleanup::new(id, true, cmd_tx),
         };
@@ -1479,7 +1516,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 bytes: tx,
                 terminal,
                 resume,
-                blocked: false,
+                blocked,
             })
         };
         (state, handoff, recv_done)
@@ -2595,7 +2632,7 @@ mod tests {
                 bytes: tx,
                 terminal: terminal.clone(),
                 resume,
-                blocked: false,
+                blocked: Arc::new(AtomicBool::new(false)),
             },
         );
         d.admit.insert(
@@ -2615,7 +2652,7 @@ mod tests {
 
         // Full channel: stream_recv never called, stream parked blocked.
         assert!(c.recv_calls.is_empty());
-        assert!(d.recv.get(&0).unwrap().blocked);
+        assert!(d.recv.get(&0).unwrap().blocked.load(Ordering::Relaxed));
 
         // Free capacity, then RecvResume drains the pending read.
         for _ in 0..BYTE_CHANNEL_DEPTH {
@@ -2631,8 +2668,91 @@ mod tests {
         assert!(matches!(terminal.get(), Some(RecvEnd::Fin)));
     }
 
-    /// §11: destructive intake + admission — a new peer id is admitted exactly
-    /// once; re-running the pump does not re-admit (membership).
+    /// SF-2 §5.1: the worker's capacity re-check under the lost-wakeup handshake
+    /// must NOT park when a slot is already free. Here `blocked` is pre-set (as if
+    /// a prior park), but the channel has room, so the drain proceeds and clears
+    /// the park flag — never leaving the stream parked with a free slot.
+    #[test]
+    fn sf2_worker_recheck_does_not_park_with_free_slot() {
+        let (mut d, _h) = driver();
+        let (tx, mut rx) = mpsc::channel::<Bytes>(BYTE_CHANNEL_DEPTH);
+        // Channel has capacity (empty). Pre-set blocked to model the race window
+        // where the consumer's swap-clear has not yet been observed.
+        let blocked = Arc::new(AtomicBool::new(true));
+        let terminal = TerminalCell::new();
+        d.recv.insert(
+            0,
+            StreamRecvState {
+                bytes: tx,
+                terminal: terminal.clone(),
+                resume: Arc::new(AtomicBool::new(false)),
+                blocked: Arc::clone(&blocked),
+            },
+        );
+        d.admit.insert(
+            0,
+            AdmitState::Registered {
+                send_done: false,
+                recv_done: false,
+            },
+        );
+        d.pending_readable.push_back(0);
+        d.readable_set.insert(0);
+
+        let mut c = MockConn::new();
+        c.script_recv(0, [data(b"ok", true)]);
+        d.read_budget = READ_BUDGET;
+        d.run_read_pump(&mut c);
+
+        // Slot was free → the read proceeded (bytes delivered), and the drain did
+        // not leave the stream parked.
+        assert_eq!(c.recv_calls, vec![0]);
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"ok"));
+        assert!(matches!(terminal.get(), Some(RecvEnd::Fin)));
+    }
+
+    /// SF-2 §5.1: on a genuinely full channel the worker publishes `blocked=true`
+    /// (Release) so a subsequent consumer free can observe it and emit a resume.
+    /// This proves the park flag is set for the lost-wakeup handshake.
+    #[test]
+    fn sf2_worker_publishes_blocked_on_full_channel() {
+        let (mut d, _h) = driver();
+        let (tx, _rx) = mpsc::channel::<Bytes>(BYTE_CHANNEL_DEPTH);
+        for _ in 0..BYTE_CHANNEL_DEPTH {
+            tx.try_send(Bytes::from_static(b"x")).unwrap();
+        }
+        let blocked = Arc::new(AtomicBool::new(false));
+        d.recv.insert(
+            0,
+            StreamRecvState {
+                bytes: tx,
+                terminal: TerminalCell::new(),
+                resume: Arc::new(AtomicBool::new(false)),
+                blocked: Arc::clone(&blocked),
+            },
+        );
+        d.admit.insert(
+            0,
+            AdmitState::Registered {
+                send_done: false,
+                recv_done: false,
+            },
+        );
+        d.pending_readable.push_back(0);
+        d.readable_set.insert(0);
+
+        let mut c = MockConn::new();
+        c.script_recv(0, [data(b"late", true)]);
+        d.read_budget = READ_BUDGET;
+        d.run_read_pump(&mut c);
+
+        // Full → no read, park flag published with Release for the consumer.
+        assert!(c.recv_calls.is_empty());
+        assert!(
+            blocked.load(Ordering::Acquire),
+            "park flag must be published"
+        );
+    }
     #[test]
     fn destructive_intake_admits_new_peer_once() {
         let (mut d, mut h) = driver();
@@ -2982,7 +3102,7 @@ mod tests {
                 bytes: tx,
                 terminal: TerminalCell::new(),
                 resume: Arc::new(AtomicBool::new(false)),
-                blocked: false,
+                blocked: Arc::new(AtomicBool::new(false)),
             },
         );
         d.admit.insert(
@@ -3035,7 +3155,7 @@ mod tests {
                 bytes: tx,
                 terminal: TerminalCell::new(),
                 resume: Arc::new(AtomicBool::new(false)),
-                blocked: false,
+                blocked: Arc::new(AtomicBool::new(false)),
             },
         );
         d.admit.insert(
@@ -3693,7 +3813,7 @@ mod tests {
                 bytes: tx,
                 terminal: terminal_cell.clone(),
                 resume: Arc::new(AtomicBool::new(false)),
-                blocked: false,
+                blocked: Arc::new(AtomicBool::new(false)),
             },
         );
         d.pending_readable.push_back(0);
@@ -4083,7 +4203,7 @@ mod tests {
                 bytes: tx,
                 terminal: TerminalCell::new(),
                 resume: Arc::new(AtomicBool::new(false)),
-                blocked: false,
+                blocked: Arc::new(AtomicBool::new(false)),
             },
         );
         d.send.insert(0, StreamSendState::new());

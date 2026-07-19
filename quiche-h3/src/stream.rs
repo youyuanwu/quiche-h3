@@ -53,6 +53,10 @@ pub struct H3RecvStream<B: Buf> {
     bytes: mpsc::Receiver<Bytes>,
     terminal: TerminalCell<RecvEnd>,
     resume: Arc<AtomicBool>,
+    /// Shared worker "parked on a full byte channel" flag (SF-2). Gates
+    /// `signal_resume` so a resume command+wake is only emitted when the worker
+    /// had genuinely blocked, not on every consumed chunk.
+    blocked: Arc<AtomicBool>,
     cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
     /// A terminal has been observed and returned; `Drop` need not stop-send.
     terminal_seen: bool,
@@ -70,16 +74,26 @@ impl<B: Buf> H3RecvStream<B> {
             bytes: h.bytes,
             terminal: h.terminal,
             resume: h.resume,
+            blocked: h.blocked,
             cmd_tx: h.cmd_tx,
             terminal_seen: false,
             stop_sent: false,
         }
     }
 
-    /// Freed one byte-channel slot: flip the shared resume bit and nudge the
-    /// worker **only** on the false→true edge (§5.1 coalescing).
+    /// Freed one byte-channel slot: nudge the worker **only** if it had genuinely
+    /// parked on a full channel (SF-2). The outer `blocked.swap(false, AcqRel)`
+    /// observes-and-clears the worker's Release-published park flag, so exactly
+    /// one resume is emitted per park and a burst of frees after a single park
+    /// cannot emit more than one. The inner `resume` bit preserves the existing
+    /// producer-coalescing (§5.1) and pairs with the worker's clear in
+    /// `drain_resumed`. Correctness > perf: the worker's capacity re-check under
+    /// the same handshake guarantees it never parks with a slot already free, so
+    /// this gate can never drop a genuine resume — at worst a spurious wake is
+    /// elided when the worker never blocked.
     fn signal_resume(&self) {
-        if !self.resume.swap(true, Ordering::Relaxed) {
+        if self.blocked.swap(false, Ordering::AcqRel) && !self.resume.swap(true, Ordering::Relaxed)
+        {
             let _ = self.cmd_tx.send(DriverCommand::RecvResume { id: self.id });
         }
     }
@@ -843,6 +857,7 @@ mod tests {
         mpsc::Sender<Bytes>,
         TerminalCell<RecvEnd>,
         Arc<AtomicBool>,
+        Arc<AtomicBool>,
         H3RecvStream<Bytes>,
         mpsc::UnboundedReceiver<DriverCommand<Bytes>>,
     ) {
@@ -850,15 +865,17 @@ mod tests {
         let (ctx, crx) = mpsc::unbounded_channel();
         let terminal = TerminalCell::new();
         let resume = Arc::new(AtomicBool::new(false));
+        let blocked = Arc::new(AtomicBool::new(false));
         let recv = H3RecvStream::from_handoff(RecvHandoff {
             id: 0,
             bytes: brx,
             terminal: terminal.clone(),
             resume: Arc::clone(&resume),
+            blocked: Arc::clone(&blocked),
             cmd_tx: ctx.clone(),
             cleanup: crate::driver::HandoffCleanup::new(0, true, ctx),
         });
-        (btx, terminal, resume, recv, crx)
+        (btx, terminal, resume, blocked, recv, crx)
     }
 
     fn send_half(
@@ -887,7 +904,7 @@ mod tests {
 
     #[test]
     fn poll_data_delivers_buffered_bytes_before_terminal() {
-        let (btx, terminal, _resume, mut recv, _crx) = recv_channel();
+        let (btx, terminal, _resume, _blocked, mut recv, _crx) = recv_channel();
         // A byte is buffered AND the terminal is set: bytes win (§5.1 sealing).
         btx.try_send(Bytes::from_static(b"hi")).unwrap();
         terminal.set(RecvEnd::Fin);
@@ -905,13 +922,13 @@ mod tests {
         let mut cx = noop_cx();
         // Fin → Ok(None)
         {
-            let (_btx, terminal, _r, mut recv, _c) = recv_channel();
+            let (_btx, terminal, _r, _blocked, mut recv, _c) = recv_channel();
             terminal.set(RecvEnd::Fin);
             assert!(matches!(recv.poll_data(&mut cx), Poll::Ready(Ok(None))));
         }
         // Reset → StreamTerminated
         {
-            let (_btx, terminal, _r, mut recv, _c) = recv_channel();
+            let (_btx, terminal, _r, _blocked, mut recv, _c) = recv_channel();
             terminal.set(RecvEnd::Reset { error_code: 42 });
             match recv.poll_data(&mut cx) {
                 Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code })) => {
@@ -922,7 +939,7 @@ mod tests {
         }
         // Conn → ConnectionErrorIncoming
         {
-            let (_btx, terminal, _r, mut recv, _c) = recv_channel();
+            let (_btx, terminal, _r, _blocked, mut recv, _c) = recv_channel();
             terminal.set(RecvEnd::Conn(Arc::new(ConnTerminal::Timeout)));
             match recv.poll_data(&mut cx) {
                 Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
@@ -935,7 +952,7 @@ mod tests {
 
     #[test]
     fn poll_data_closed_channel_without_terminal_is_internal_error() {
-        let (btx, _terminal, _r, mut recv, _c) = recv_channel();
+        let (btx, _terminal, _r, _blocked, mut recv, _c) = recv_channel();
         drop(btx); // channel closed, no terminal published: adapter bug.
         let mut cx = noop_cx();
         match recv.poll_data(&mut cx) {
@@ -947,26 +964,53 @@ mod tests {
     }
 
     #[test]
-    fn recv_resume_sent_once_on_false_to_true() {
-        let (btx, _terminal, resume, mut recv, mut crx) = recv_channel();
+    fn recv_resume_gated_when_worker_never_blocked() {
+        // SF-2: consuming chunks while the worker was NOT parked must emit no
+        // RecvResume — the wake is pure overhead if nobody is waiting.
+        let (btx, _terminal, resume, blocked, mut recv, mut crx) = recv_channel();
+        assert!(!blocked.load(Ordering::Relaxed));
         btx.try_send(Bytes::from_static(b"a")).unwrap();
         btx.try_send(Bytes::from_static(b"b")).unwrap();
         let mut cx = noop_cx();
-        // First drain flips false→true and sends one RecvResume.
+        assert!(matches!(recv.poll_data(&mut cx), Poll::Ready(Ok(Some(_)))));
+        assert!(matches!(recv.poll_data(&mut cx), Poll::Ready(Ok(Some(_)))));
+        // Never blocked → resume bit untouched and no command emitted.
+        assert!(!resume.load(Ordering::Relaxed));
+        assert!(
+            crx.try_recv().is_err(),
+            "must not emit RecvResume when worker never blocked"
+        );
+    }
+
+    #[test]
+    fn recv_resume_sent_once_when_worker_blocked() {
+        // SF-2: when the worker had parked (blocked=true), the first freed slot
+        // emits exactly one RecvResume and clears the park flag; further frees in
+        // the same park cycle do not resend.
+        let (btx, _terminal, resume, blocked, mut recv, mut crx) = recv_channel();
+        blocked.store(true, Ordering::Release);
+        btx.try_send(Bytes::from_static(b"a")).unwrap();
+        btx.try_send(Bytes::from_static(b"b")).unwrap();
+        let mut cx = noop_cx();
+        // First drain observes blocked → one RecvResume, blocked cleared.
         assert!(matches!(recv.poll_data(&mut cx), Poll::Ready(Ok(Some(_)))));
         assert!(resume.load(Ordering::Relaxed));
+        assert!(
+            !blocked.load(Ordering::Relaxed),
+            "park flag must be cleared"
+        );
         match crx.try_recv() {
             Ok(DriverCommand::RecvResume { id: 0 }) => {}
             other => panic!("expected one RecvResume, got {other:?}"),
         }
-        // Second drain: bit already true → no duplicate.
+        // Second drain: still in the same (now-cleared) cycle → no duplicate.
         assert!(matches!(recv.poll_data(&mut cx), Poll::Ready(Ok(Some(_)))));
         assert!(crx.try_recv().is_err(), "must not resend RecvResume");
     }
 
     #[test]
     fn recv_drop_enqueues_stop_sending_zero() {
-        let (_btx, _terminal, _r, recv, mut crx) = recv_channel();
+        let (_btx, _terminal, _r, _blocked, recv, mut crx) = recv_channel();
         drop(recv);
         match crx.try_recv() {
             Ok(DriverCommand::StopSending { id: 0, code: 0 }) => {}
@@ -976,7 +1020,7 @@ mod tests {
 
     #[test]
     fn recv_drop_after_terminal_does_not_stop_send() {
-        let (_btx, terminal, _r, recv, mut crx) = recv_channel();
+        let (_btx, terminal, _r, _blocked, recv, mut crx) = recv_channel();
         terminal.set(RecvEnd::Fin);
         drop(recv);
         assert!(
@@ -1120,6 +1164,7 @@ mod tests {
             bytes: brx,
             terminal: TerminalCell::new(),
             resume: Arc::new(AtomicBool::new(false)),
+            blocked: Arc::new(AtomicBool::new(false)),
             cmd_tx: ctx.clone(),
             cleanup: crate::driver::HandoffCleanup::new(8, true, ctx),
         };
@@ -1151,7 +1196,7 @@ mod tests {
         // recv_channel()/send_half() convert via from_handoff → the guard is
         // disarmed, so conversion enqueues nothing; only the STREAM object's own
         // Drop later enqueues cleanup.
-        let (_btx, _terminal, _resume, recv, mut crx) = recv_channel();
+        let (_btx, _terminal, _resume, _blocked, recv, mut crx) = recv_channel();
         assert!(
             crx.try_recv().is_err(),
             "conversion must not fire the guard"
@@ -1239,6 +1284,7 @@ mod tests {
                 bytes: brx,
                 terminal: TerminalCell::new(),
                 resume: Arc::new(AtomicBool::new(false)),
+                blocked: Arc::new(AtomicBool::new(false)),
                 cmd_tx: ictx.clone(),
                 cleanup: crate::driver::HandoffCleanup::new(0, true, ictx),
             },
@@ -1297,6 +1343,7 @@ mod tests {
                 bytes: brx,
                 terminal: TerminalCell::new(),
                 resume: Arc::new(AtomicBool::new(false)),
+                blocked: Arc::new(AtomicBool::new(false)),
                 cmd_tx: ictx.clone(),
                 cleanup: crate::driver::HandoffCleanup::new(0, true, ictx),
             },
