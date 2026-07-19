@@ -584,13 +584,23 @@ pub(crate) struct QuicheDriver<B: Buf = Bytes> {
     pending_resume: VecDeque<u64>,
     resume_set: HashSet<u64>,
     /// New peer ids awaiting admission. `pending_admit` **owns** each captured
-    /// `PeerStream`; `pending_admit_order` defines bounded admission order and
-    /// its membership. Both are updated atomically on every exit (iter11 f6).
+    /// `PeerStream`; the per-class `pending_admit_bidi`/`pending_admit_uni`
+    /// queues define bounded admission order and its membership. Both are
+    /// updated atomically on every exit (iter11 f6). Admission order is split
+    /// per class so a class that parks on a full accept channel can be skipped
+    /// without rescanning its backlog, bounding per-pump work to O(ADMIT_BUDGET)
+    /// regardless of how many same-class ids are blocked (MF-1).
     pending_admit: HashMap<u64, PeerStream>,
-    pending_admit_order: VecDeque<u64>,
+    pending_admit_bidi: VecDeque<u64>,
+    pending_admit_uni: VecDeque<u64>,
     /// Per-class parked promotion queues (parking is independent per class, §5).
     parked_bidi: VecDeque<u64>,
     parked_uni: VecDeque<u64>,
+    /// Test-only counter of ids popped/examined by `phase2_admission` in the
+    /// most recent pump. Proves the MF-1 fix bounds per-pump admission work to
+    /// O(ADMIT_BUDGET) instead of re-scanning the accept-blocked backlog.
+    #[cfg(test)]
+    phase2_pops: usize,
 
     // ----- setup signalling (§7.1) -----
     established: Option<oneshot::Sender<Result<(), SetupFailure>>>,
@@ -689,9 +699,12 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             pending_resume: VecDeque::new(),
             resume_set: HashSet::new(),
             pending_admit: HashMap::new(),
-            pending_admit_order: VecDeque::new(),
+            pending_admit_bidi: VecDeque::new(),
+            pending_admit_uni: VecDeque::new(),
             parked_bidi: VecDeque::new(),
             parked_uni: VecDeque::new(),
+            #[cfg(test)]
+            phase2_pops: 0,
             established: Some(est_tx),
             acting: false,
             pkt_buf: vec![0u8; PKT_BUF_LEN],
@@ -842,10 +855,40 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
     fn has_runnable_remainder(&self) -> bool {
         !self.pending_resume.is_empty()
             || !self.pending_readable.is_empty()
-            || !self.pending_admit_order.is_empty()
+            // A class with pending admits re-arms the worker only if it is not
+            // currently accept-blocked-waiting: either it has never parked
+            // (`parked_*` empty — capacity may be free) or its accept-resume bit
+            // has since been set. A class that parked on a full accept channel
+            // (parked non-empty, resume bit still clear) is NOT reported runnable
+            // until the matching `Accept*Resume` arrives, so a capacity-blocked
+            // class can no longer self-reschedule the worker (MF-1, FR-002). A
+            // fresh never-parked class with pending ids still reports runnable so
+            // no admission is stalled. The accept-resume bit is set by the accept
+            // consumer (`stream.rs`) and read here on the worker; a Relaxed load
+            // suffices because the actual happens-before + wakeup is carried by
+            // the paired `Accept*Resume` command over the control channel (the
+            // bit only coalesces re-arm signals), matching the parked-promotion
+            // checks below.
+            || (!self.pending_admit_bidi.is_empty()
+                && (self.parked_bidi.is_empty()
+                    || self.accept_bidi_resume.load(Ordering::Relaxed)))
+            || (!self.pending_admit_uni.is_empty()
+                && (self.parked_uni.is_empty()
+                    || self.accept_uni_resume.load(Ordering::Relaxed)))
             || !self.runnable_send.is_empty()
             || (!self.parked_bidi.is_empty() && self.accept_bidi_resume.load(Ordering::Relaxed))
             || (!self.parked_uni.is_empty() && self.accept_uni_resume.load(Ordering::Relaxed))
+    }
+
+    /// Route a discovered peer id into its per-class admission queue (§5.1). The
+    /// split lets `phase2_admission` skip a parked (accept-full) class without
+    /// rescanning its backlog (MF-1); FIFO order is preserved within each class.
+    fn push_pending_admit(&mut self, id: u64) {
+        if is_bidi(id) {
+            self.pending_admit_bidi.push_back(id);
+        } else {
+            self.pending_admit_uni.push_back(id);
+        }
     }
 
     /// The mandatory explicit-close barrier (§5.2, §8.3, invariant 10), run
@@ -939,7 +982,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             } else {
                 // A new peer id: own a fresh PeerStream awaiting admission.
                 self.pending_admit.insert(id, PeerStream::new(id));
-                self.pending_admit_order.push_back(id);
+                self.push_pending_admit(id);
             }
         }
         if n == DISCOVERY_BUDGET {
@@ -1030,7 +1073,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 let mut peer = PeerStream::new(id);
                 peer.pending_send_terminal = stopped;
                 self.pending_admit.insert(id, peer);
-                self.pending_admit_order.push_back(id);
+                self.push_pending_admit(id);
                 // A new admission is pending: ensure stage (b) runs next iteration.
                 self.needs_iteration = true;
             }
@@ -1178,28 +1221,49 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         }
     }
 
-    /// Phase 2: admit up to `ADMIT_BUDGET` ids from `pending_admit_order`
-    /// (§5.1). A full accept queue parks **only that class**; the other class
-    /// keeps admitting (parking is independent per class).
+    /// Phase 2: admit up to `ADMIT_BUDGET` ids from the per-class admission
+    /// queues (§5.1). A full accept queue parks **only that class**; the other
+    /// class keeps admitting (parking is independent per class). The two queues
+    /// are serviced in an alternating (round-robin) fashion so a flood of one
+    /// class cannot starve the other. Crucially, once a class parks it is not
+    /// serviced again this pump and its remaining backlog is left in place
+    /// **without being rescanned** — this bounds per-pump work to O(ADMIT_BUDGET)
+    /// regardless of how many same-class ids are accept-blocked (MF-1).
     fn phase2_admission<C: QuicConn>(&mut self, qconn: &mut C) {
         let mut budget = ADMIT_BUDGET;
         let mut bidi_blocked = false;
         let mut uni_blocked = false;
-        // Ids of a blocked class are carried and restored to the front so their
-        // relative order survives to the next pump.
-        let mut carry: VecDeque<u64> = VecDeque::new();
+        #[cfg(test)]
+        {
+            self.phase2_pops = 0;
+        }
+        // Alternate the preferred class each iteration for fair cross-class
+        // servicing (FR-003). Skip a class that is blocked (parked this pump) or
+        // empty; stop when neither class can be served.
+        let mut prefer_bidi = true;
         while budget > 0 {
-            if bidi_blocked && uni_blocked {
-                break;
-            }
-            let id = match self.pending_admit_order.pop_front() {
-                Some(id) => id,
-                None => break,
+            let bidi_ready = !bidi_blocked && !self.pending_admit_bidi.is_empty();
+            let uni_ready = !uni_blocked && !self.pending_admit_uni.is_empty();
+            let bidi = match (bidi_ready, uni_ready) {
+                (false, false) => break,
+                (true, false) => true,
+                (false, true) => false,
+                (true, true) => prefer_bidi,
             };
-            let bidi = is_bidi(id);
-            if (bidi && bidi_blocked) || (!bidi && uni_blocked) {
-                carry.push_back(id);
-                continue;
+            // Alternate for the next iteration so the two queues share the budget.
+            prefer_bidi = !bidi;
+            let id = if bidi {
+                self.pending_admit_bidi.pop_front()
+            } else {
+                self.pending_admit_uni.pop_front()
+            };
+            let id = match id {
+                Some(id) => id,
+                None => continue,
+            };
+            #[cfg(test)]
+            {
+                self.phase2_pops += 1;
             }
             // Already admitted (defensive; membership should prevent it).
             if self.admit.contains_key(&id) || self.recv.contains_key(&id) {
@@ -1231,9 +1295,6 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                     }
                 }
             }
-        }
-        while let Some(id) = carry.pop_back() {
-            self.pending_admit_order.push_front(id);
         }
     }
 
@@ -1639,8 +1700,12 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 self.admit.remove(&id);
             }
         }
-        // Discovered-but-not-yet-admitted streams.
-        let pending: Vec<u64> = self.pending_admit_order.drain(..).collect();
+        // Discovered-but-not-yet-admitted streams (both per-class queues).
+        let pending: Vec<u64> = self
+            .pending_admit_bidi
+            .drain(..)
+            .chain(self.pending_admit_uni.drain(..))
+            .collect();
         for id in pending {
             if self.pending_admit.remove(&id).is_some() {
                 self.shutdown_peer_directions(qconn, id, is_bidi(id));
@@ -2629,6 +2694,201 @@ mod tests {
         assert!(h.accept_bidi_rx.try_recv().is_err()); // no duplicate promotion
     }
 
+    /// MF-1: a class that parks on a full accept channel must bound per-pump work
+    /// to O(ADMIT_BUDGET) — the blocked-class backlog is left in place, never
+    /// rescanned — and must NOT keep the worker runnable until its
+    /// `Accept*Resume` arrives. FIFO order within the class is preserved across
+    /// the parked queue + the pending backlog.
+    #[test]
+    fn mf1_parked_class_bounds_scan_and_quiesces_worker() {
+        // Accept capacity 1: fill the single bidi slot, then leave it full.
+        let (mut d, _h) = QuicheDriver::<Bytes>::new(false, 1, 1);
+        let mut c = MockConn::new();
+        d.pending_admit.insert(0, PeerStream::new(0));
+        d.pending_admit_bidi.push_back(0);
+        d.phase2_admission(&mut c);
+        assert!(matches!(
+            d.admit.get(&0),
+            Some(AdmitState::Registered { .. })
+        ));
+
+        // Seed a large fresh backlog of the SAME class (bidi ids 4, 8, …).
+        const N: u64 = 64;
+        for k in 1..=N {
+            let id = k * 4; // is_bidi(id) == true
+            assert!(is_bidi(id));
+            d.pending_admit.insert(id, PeerStream::new(id));
+            d.pending_admit_bidi.push_back(id);
+        }
+        assert_eq!(d.pending_admit_bidi.len() as u64, N);
+
+        // One admission pump: the first backlog id (4) attempts admission, hits
+        // the full accept channel, and PARKS the class. Critically, only ONE id
+        // is examined — the remaining backlog is NOT scanned (the old carry loop
+        // drained/examined all N every pump → O(N²) across re-pumps).
+        d.phase2_admission(&mut c);
+        assert_eq!(
+            d.phase2_pops, 1,
+            "bounded scan: exactly one id examined, not the whole backlog (MF-1)"
+        );
+        assert_eq!(d.parked_bidi.len(), 1, "exactly one id parked");
+        assert_eq!(
+            *d.parked_bidi.front().unwrap(),
+            4,
+            "FIFO: id 4 parked first"
+        );
+        assert_eq!(
+            d.pending_admit_bidi.len() as u64,
+            N - 1,
+            "blocked-class backlog left in place, not rescanned (MF-1)"
+        );
+        // FIFO preserved in the retained backlog (front is the next-oldest, 8).
+        assert_eq!(*d.pending_admit_bidi.front().unwrap(), 8);
+
+        // FR-002: an accept-blocked class must NOT self-reschedule the worker.
+        assert!(
+            !d.has_runnable_remainder(),
+            "capacity-blocked class must not keep the worker runnable"
+        );
+
+        // A second pump likewise examines only O(1) ids (no unbounded self-scan),
+        // and the class still does not report runnable → no re-pump spin.
+        d.phase2_admission(&mut c);
+        assert_eq!(
+            d.phase2_pops, 1,
+            "repeated pumps stay O(1) while the class is accept-blocked"
+        );
+        assert!(!d.has_runnable_remainder());
+
+        // Only once the matching AcceptBidiResume arrives is the class runnable.
+        d.accept_bidi_resume.store(true, Ordering::Relaxed);
+        assert!(
+            d.has_runnable_remainder(),
+            "AcceptBidiResume re-arms the worker for the parked class"
+        );
+    }
+
+    /// MF-1: after `AcceptBidiResume` + freed capacity, a parked class resumes in
+    /// FIFO order (the earliest-parked id is admitted before later backlog ids).
+    #[test]
+    fn mf1_parked_class_resumes_in_fifo_order() {
+        let (mut d, mut h) = QuicheDriver::<Bytes>::new(false, 1, 1);
+        let mut c = MockConn::new();
+        // Fill the single slot with id 0, then seed backlog 4, 8.
+        for id in [0u64, 4, 8] {
+            d.pending_admit.insert(id, PeerStream::new(id));
+            d.pending_admit_bidi.push_back(id);
+        }
+        d.phase2_admission(&mut c);
+        // id 0 admitted; id 4 parked; id 8 still pending.
+        assert!(matches!(
+            d.admit.get(&0),
+            Some(AdmitState::Registered { .. })
+        ));
+        assert_eq!(d.parked_bidi.front().copied(), Some(4));
+        assert_eq!(d.pending_admit_bidi.front().copied(), Some(8));
+
+        // Free one slot (drain id 0), signal resume, pump promotion + admission.
+        let ho0 = h.accept_bidi_rx.try_recv().expect("id 0 handoff");
+        assert_eq!(ho0.recv.id, 0);
+        d.accept_bidi_resume.store(true, Ordering::Relaxed);
+        d.promote_parked(&mut c, true);
+        // The FIFO-earliest parked id (4) is promoted before the newer id (8).
+        let ho4 = h.accept_bidi_rx.try_recv().expect("id 4 promoted first");
+        assert_eq!(ho4.recv.id, 4, "FIFO: earliest-parked id promoted first");
+        assert!(matches!(
+            d.admit.get(&4),
+            Some(AdmitState::Registered { .. })
+        ));
+        // id 8 remains queued (slot re-filled by id 4) — still FIFO-next.
+        assert_eq!(d.pending_admit_bidi.front().copied(), Some(8));
+    }
+
+    /// MF-1 / FR-003: a class blocked on its own accept capacity does not starve
+    /// the other class — the unblocked class keeps admitting in the same pump.
+    #[test]
+    fn mf1_blocked_class_does_not_starve_other_class() {
+        // bidi capacity 1 (fill it), uni capacity ample.
+        let (mut d, _h) = QuicheDriver::<Bytes>::new(false, 1, 16);
+        let mut c = MockConn::new();
+        d.pending_admit.insert(0, PeerStream::new(0));
+        d.pending_admit_bidi.push_back(0);
+        d.phase2_admission(&mut c); // fills the single bidi slot
+        assert!(matches!(
+            d.admit.get(&0),
+            Some(AdmitState::Registered { .. })
+        ));
+
+        // Flood bidi (all will be blocked) and enqueue one uni (id 2).
+        for k in 1..=32u64 {
+            let id = k * 4; // bidi
+            d.pending_admit.insert(id, PeerStream::new(id));
+            d.pending_admit_bidi.push_back(id);
+        }
+        d.pending_admit.insert(2, PeerStream::new(2)); // uni (is_bidi(2)==false)
+        assert!(!is_bidi(2));
+        d.pending_admit_uni.push_back(2);
+
+        d.phase2_admission(&mut c);
+        // The uni stream is admitted despite the bidi flood + bidi park.
+        assert!(
+            matches!(d.admit.get(&2), Some(AdmitState::Registered { .. })),
+            "unblocked uni class admitted despite blocked bidi flood"
+        );
+        assert!(d.pending_admit_uni.is_empty());
+        assert_eq!(d.parked_bidi.len(), 1, "bidi parked exactly once");
+    }
+
+    /// MF-1 / MF-A: a fresh, never-parked class with pending ids MUST report the
+    /// worker runnable (the gate keys off `parked_*` non-emptiness, so it never
+    /// deadlocks a class whose accept-resume bit is still the initial `false`).
+    #[test]
+    fn mf1_fresh_never_parked_class_reports_runnable() {
+        let (mut d, _h) = driver();
+        // No pending work at all → not runnable.
+        assert!(!d.has_runnable_remainder());
+
+        // A fresh bidi class with pending ids (parked_bidi empty, resume == false).
+        d.pending_admit.insert(0, PeerStream::new(0));
+        d.pending_admit_bidi.push_back(0);
+        assert!(d.parked_bidi.is_empty());
+        assert!(!d.accept_bidi_resume.load(Ordering::Relaxed));
+        assert!(
+            d.has_runnable_remainder(),
+            "fresh never-parked class with pending ids must be runnable (MF-A)"
+        );
+
+        // Same for a fresh uni class.
+        let (mut d2, _h2) = driver();
+        d2.pending_admit.insert(2, PeerStream::new(2));
+        d2.pending_admit_uni.push_back(2);
+        assert!(d2.has_runnable_remainder());
+    }
+
+    /// MF-1 / FR-003: with both classes admissible and each holding a large
+    /// backlog, a single pump makes fair progress on BOTH classes (round-robin),
+    /// so neither is starved within `ADMIT_BUDGET`.
+    #[test]
+    fn mf1_cross_class_fair_servicing() {
+        let (mut d, _h) = QuicheDriver::<Bytes>::new(false, 128, 128);
+        let mut c = MockConn::new();
+        for k in 0..40u64 {
+            let bidi = k * 4; // bidi
+            let uni = k * 4 + 2; // uni
+            d.pending_admit.insert(bidi, PeerStream::new(bidi));
+            d.pending_admit_bidi.push_back(bidi);
+            d.pending_admit.insert(uni, PeerStream::new(uni));
+            d.pending_admit_uni.push_back(uni);
+        }
+        d.phase2_admission(&mut c);
+        // ADMIT_BUDGET (32) split evenly by round-robin → 16 admits per class.
+        let admitted_bidi = 40 - d.pending_admit_bidi.len();
+        let admitted_uni = 40 - d.pending_admit_uni.len();
+        assert_eq!(admitted_bidi + admitted_uni, ADMIT_BUDGET);
+        assert_eq!(admitted_bidi, ADMIT_BUDGET / 2, "bidi got a fair half");
+        assert_eq!(admitted_uni, ADMIT_BUDGET / 2, "uni got a fair half");
+    }
+
     /// §11 / §5.5 contract A: once a bidi stream's both directions are terminal,
     /// `admit[id]` (and the recv entry + cursor memberships) are dropped
     /// immediately. Per the §5.5 spike a collected id never reappears in
@@ -2649,7 +2909,7 @@ mod tests {
                 pending_recv_terminal: None,
             },
         );
-        d.pending_admit_order.push_back(0);
+        d.pending_admit_bidi.push_back(0);
         d.read_budget = READ_BUDGET;
         d.run_read_pump(&mut c);
 
@@ -3568,7 +3828,7 @@ mod tests {
         d.admit.insert(0, AdmitState::Parked(PeerStream::new(0)));
         d.parked_bidi.push_back(0);
         d.pending_admit.insert(2, PeerStream::new(2));
-        d.pending_admit_order.push_back(2);
+        d.pending_admit_uni.push_back(2);
 
         d.inbox.push_back(DriverCommand::ConnectionDropped);
         d.apply_inbox(&mut c);
@@ -3576,7 +3836,7 @@ mod tests {
         assert!(!d.admit.contains_key(&0), "parked bidi dropped");
         assert!(d.parked_bidi.is_empty());
         assert!(d.pending_admit.is_empty());
-        assert!(d.pending_admit_order.is_empty());
+        assert!(d.pending_admit_uni.is_empty());
         // Peer bidi shut down BOTH directions; peer uni only read.
         assert!(c.shutdowns.iter().any(|s| s.id == 0 && s.is_write));
         assert!(c.shutdowns.iter().any(|s| s.id == 0 && !s.is_write));
