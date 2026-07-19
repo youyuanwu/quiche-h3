@@ -59,12 +59,12 @@ pub struct H3QuicheClientConfig {
     /// passed to [`H3QuicheConnector::new`] takes precedence.
     pub server_name: Option<String>,
     /// Per-recv byte-channel depth for the connection (SF-4). Defaults to
-    /// [`BYTE_CHANNEL_DEPTH`]; the per-stream in-flight memory bound is
+    /// `BYTE_CHANNEL_DEPTH` (64); the per-stream in-flight memory bound is
     /// `recv_channel_depth × MAX_CHUNK`. **Trade-off**: lowering it saves memory
     /// at the cost of per-stream throughput/buffering.
     pub recv_channel_depth: usize,
     /// Outbound packet-buffer size in bytes for the connection (SF-5). Defaults
-    /// to [`PKT_BUF_LEN`] (64 KiB). **Do NOT shrink below a full GSO batch
+    /// to `PKT_BUF_LEN` (64 KiB). **Do NOT shrink below a full GSO batch
     /// without a datapath assessment** (§5, §12).
     pub packet_buffer_size: usize,
     /// Optional aggregate cap (bytes) on buffered outbound send data admitted to

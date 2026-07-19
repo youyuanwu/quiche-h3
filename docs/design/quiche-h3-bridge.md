@@ -1116,6 +1116,23 @@ the bit's single atomic **modification order** plus the worker clearing it
 **before** the retry; it does not rely on any default ordering. (`AcqRel` is a
 fine conservative alternative if preferred.)
 
+**Resume gating on genuine blocking (SF-2).** The `resume` bit above coalesces
+*redundant* resume commands, but it does not by itself stop a resume from being
+emitted when the worker never actually parked. To avoid a spurious
+`RecvResume` + wake on every consumed chunk, each recv half also shares the
+worker's **`blocked` state** as an `Arc<AtomicBool>` (`StreamRecvState.blocked`),
+and `poll_data` only emits a resume when that flag shows the reader had truly
+been parked. Unlike the `resume` command-gating bit, this flag is **read to
+decide emission**, so the §12 `Relaxed` rationale does **not** apply to it: the
+worker **publishes** `blocked = true` with `Release` *before* its final
+`try_reserve` re-check (so a consumer that later frees capacity cannot miss it),
+and the consumer **consumes** it with an `AcqRel` `swap(false)` — the same
+register-before-recheck / publish-before-signal discipline as the terminal
+sealing edge (M1). This closes the lost-wakeup window: a resume is emitted iff
+the reader was genuinely blocked, and a genuine block is never missed
+(correctness &gt; the saved wake). See §11 for the "no resume when never
+blocked / still resumes when blocked" regressions.
+
 ### 5.2 Command ingress and teardown
 
 All front-end → worker operations flow through **one unbounded control channel**
@@ -2772,11 +2789,42 @@ Scenario tests that must be covered explicitly (from the design reviews):
   clone + O(distinct pending signals). Worker starvation is separately bounded by
   the per-stage quotas and producer-coalesced resume bits (§5.2, findings 2/3/5).
   What remains is (a) *observability* — add depth/lag metrics for the unbounded
-  control channel (metrics observe the backlog, they are not a limit) — and (b) an
-  optional hard global ceiling if a deployment needs one: move bulk `WriteBuf`s to a
-  bounded/coalesced per-stream slot and enqueue only a `SendReady { id }`
-  notification, plus aggregate pending-open/active-stream/queued-byte admission
-  accounting. Only the data/accept queues have tunable depths today.
+  control channel (metrics observe the backlog, they are not a limit) — and (b) a
+  full hard global ceiling: move bulk `WriteBuf`s to a bounded/coalesced per-stream
+  slot and enqueue only a `SendReady { id }` notification (with the worker owning
+  the buffers), the complete redesign of the send data plane.
+
+  **Implemented (SF-4/SF-5/SF-6, additive, defaults preserve behavior):**
+  - **Per-connection buffer sizing is now tunable.** The receive byte-channel
+    depth (SF-4) and the outbound packet-buffer size (SF-5) are configurable via
+    `H3QuicheServerConfig`/`H3QuicheClientConfig` (`recv_channel_depth`,
+    `packet_buffer_size`) → `DriverBufferConfig`. Both default to the historical
+    constants (`BYTE_CHANNEL_DEPTH = 64`, `PKT_BUF_LEN = 64 KiB`), so out-of-the-box
+    behavior is byte-for-byte unchanged. These are **trade-offs**, not free wins:
+    shrinking the recv depth trades per-stream throughput/buffering for memory, and
+    the packet buffer must not be shrunk below a full GSO batch without a datapath
+    assessment. (The prior sentence "only the data/accept queues have tunable
+    depths" is superseded.)
+  - **The `MAX_CHUNK` receive scratch is allocated lazily** (SF-5) on first
+    `stream_recv`, so idle/control-only connections no longer pre-pay it.
+  - **Aggregate buffered-send bytes now have always-on accounting and an opt-in
+    finite cap** (SF-6, `max_buffered_send_bytes: Option<usize>`, default `None` =
+    unbounded → behavior unchanged). A shared `SendAccounting` counter tracks the
+    bytes **admitted** to the command/`SendOp` queues (not the front-end per-stream
+    `stash`); the front end reserves a byte-permit before enqueuing a `Send` and the
+    permit's RAII drop releases it exactly once at the same completion chokepoint as
+    the reusable write-completion cell (§5.3a). A finite cap bounds resident admitted
+    send bytes to **at most `cap + one admission unit`** (an oversize buffer / `cap
+    == 0` is admitted as the single in-flight unit for liveness); over-cap writes
+    **park** (async backpressure via `poll_ready` `Poll::Pending`, register-before-
+    recheck as in §5.1) rather than being dropped or reordered. This gives a
+    documented hard ceiling **without** the full S3 data-plane redesign.
+    - *Residual (still a follow-up):* the per-`Send` unbounded-mpsc node itself is
+      not eliminated — that is the `SendReady { id }` redesign above. The cap bounds
+      the **data bytes** buffered, not the count of small command nodes. Multi-waiter
+      wake for parked admissions uses a hand-rolled `Mutex<Vec<Waker>>` rather than
+      `tokio::sync::Notify` (whose `Notified` future borrows the `Notify` and cannot
+      be held across the synchronous `poll_ready`).
 - **Cross-socket acceptor fan-in (S1)**: v1 returns one `H3QuicheAcceptor` per
   socket (`bind -> Vec<Self>`, §7.1); a single acceptor that multiplexes all
   listener streams behind one `accept()` is a possible follow-up, not undocumented

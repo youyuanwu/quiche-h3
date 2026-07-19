@@ -344,7 +344,9 @@ impl<E> Drop for WriteCompleter<E> {
 ///
 /// `cap == None` (the default) means unlimited: `try_reserve` always succeeds
 /// and no admission ever parks, so behavior is byte-for-byte unchanged from
-/// before SF-6 apart from two relaxed atomics per write. A finite cap bounds
+/// before SF-6 apart from one atomic reserve/release pair per write (plus one
+/// uncontended waiter-lock acquisition per release that drains an always-empty
+/// waiter list — no task ever parks). A finite cap bounds
 /// residency to at most `cap + one admission unit` (the oversize/`cap == 0`
 /// exception below guarantees forward progress).
 pub(crate) struct SendAccounting {

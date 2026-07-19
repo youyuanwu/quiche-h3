@@ -66,12 +66,12 @@ pub struct H3QuicheServerConfig {
     /// Cap on concurrently-progressing handshakes per listener (§7.1).
     pub max_in_flight_handshakes: NonZeroUsize,
     /// Per-recv byte-channel depth per accepted connection (SF-4). Defaults to
-    /// [`BYTE_CHANNEL_DEPTH`]; the per-stream in-flight memory bound is
+    /// `BYTE_CHANNEL_DEPTH` (64); the per-stream in-flight memory bound is
     /// `recv_channel_depth × MAX_CHUNK`. **Trade-off**: lowering it saves memory
     /// at the cost of per-stream throughput/buffering.
     pub recv_channel_depth: usize,
     /// Outbound packet-buffer size in bytes per accepted connection (SF-5).
-    /// Defaults to [`PKT_BUF_LEN`] (64 KiB). **Do NOT shrink below a full GSO
+    /// Defaults to `PKT_BUF_LEN` (64 KiB). **Do NOT shrink below a full GSO
     /// batch without a datapath assessment** (§5, §12): it can regress egress
     /// batching/throughput.
     pub packet_buffer_size: usize,
