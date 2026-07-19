@@ -14,7 +14,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
@@ -617,8 +617,16 @@ pub(crate) struct QuicheDriver<B: Buf = Bytes> {
     acting: bool,
     /// Outbound packet buffer backing `buffer()` (§5, T3).
     pkt_buf: Vec<u8>,
-    /// `stream_recv` target, capped at `MAX_CHUNK` (§5.1).
-    scratch: Vec<u8>,
+    /// Reusable `stream_recv` target (SF-1). A single `BytesMut` grown to
+    /// `MAX_CHUNK` per read; each chunk is handed out via `split_to(len).freeze()`
+    /// (O(1) refcounted share of the backing allocation, no per-chunk memcpy).
+    /// Lazily allocated on first receive (SF-5): a connection that never receives
+    /// data never allocates it (`None`).
+    recv_buf: Option<BytesMut>,
+    /// Counts hoisted per-stream sender lookup+clone operations (SF-7): with the
+    /// clone hoisted out of the chunk loop this increments once per `drain_stream`.
+    #[cfg(test)]
+    recv_lookup_count: usize,
     /// A stage deferred runnable work under a per-iteration quota: force another
     /// iteration via the `wait_for_data` fast path (§5, finding 5).
     needs_iteration: bool,
@@ -715,7 +723,9 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             established: Some(est_tx),
             acting: false,
             pkt_buf: vec![0u8; PKT_BUF_LEN],
-            scratch: vec![0u8; MAX_CHUNK],
+            recv_buf: None,
+            #[cfg(test)]
+            recv_lookup_count: 0,
             needs_iteration: false,
             graceful_close_issued: false,
             last_handle_teardown: false,
@@ -1148,6 +1158,19 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
     /// chunks, decrementing the shared `read_budget` per chunk (§5.1). Publishes
     /// `RecvEnd::Fin` only after `Permit::send`-ing the final byte (sealing edge).
     fn drain_stream<C: QuicConn>(&mut self, qconn: &mut C, id: u64) {
+        // SF-7: hoist the per-stream sender lookup+clone out of the chunk loop.
+        // Cloning the `Sender` (a) frees `&mut self` for the receive buffer borrow
+        // and (b) is done once per drain instead of once per chunk. The clone
+        // stays valid even if the `recv` entry is later removed on a terminal
+        // path (we `return` on those paths anyway).
+        let tx = match self.recv.get(&id) {
+            Some(state) => state.bytes.clone(),
+            None => return,
+        };
+        #[cfg(test)]
+        {
+            self.recv_lookup_count += 1;
+        }
         for _ in 0..CHUNK_BUDGET {
             if self.read_budget == 0 {
                 // Requeue keeping membership so the remainder drains next pump.
@@ -1155,12 +1178,6 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 self.needs_iteration = true;
                 return;
             }
-            // Clone the sender so the reserved `Permit` does not borrow `self`,
-            // freeing `&mut self.scratch` for `stream_recv`.
-            let tx = match self.recv.get(&id) {
-                Some(state) => state.bytes.clone(),
-                None => return,
-            };
             let permit = match tx.try_reserve() {
                 Ok(permit) => permit,
                 Err(TrySendError::Full(())) => {
@@ -1202,11 +1219,36 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                     return;
                 }
             };
-            match qconn.stream_recv(id, &mut self.scratch) {
-                Ok((len, fin)) => {
-                    if len > 0 {
-                        let bytes = Bytes::copy_from_slice(&self.scratch[..len]);
-                        permit.send(bytes);
+            // SF-1: read into the reusable `BytesMut` (lazily allocated per SF-5)
+            // and hand the consumer an owned `Bytes` via `split_to(len).freeze()`.
+            // `stream_recv` requires an *initialized* `&mut [u8]`, so the buffer is
+            // grown to `MAX_CHUNK` with a safe zero-fill (`resize`) — NOT an unsafe
+            // uninitialized-slice cast. The zero-fill of the reused window is the
+            // accepted trade-off (D-1): this removes the per-chunk *memcpy*, not the
+            // fill; only the freshly-written `[..len]` region is frozen, so no
+            // uninitialized (or stale) byte is ever exposed to h3. The frozen slice
+            // shares the backing allocation with the reader buffer (O(1)); a later
+            // grow reallocates instead of overwriting bytes the consumer still holds.
+            let read = {
+                let buf = self.recv_buf.get_or_insert_with(BytesMut::new);
+                buf.resize(MAX_CHUNK, 0);
+                match qconn.stream_recv(id, &mut buf[..]) {
+                    Ok((len, fin)) => {
+                        let chunk = if len > 0 {
+                            Some(buf.split_to(len).freeze())
+                        } else {
+                            None
+                        };
+                        Ok((chunk, fin))
+                    }
+                    Err(err) => Err(err),
+                }
+            };
+            match read {
+                Ok((chunk, fin)) => {
+                    let had_bytes = chunk.is_some();
+                    if let Some(chunk) = chunk {
+                        permit.send(chunk);
                         self.read_budget -= 1;
                     } else {
                         drop(permit);
@@ -1217,7 +1259,10 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                         self.mark_recv_done(id);
                         return;
                     }
-                    if len == 0 || !qconn.stream_readable(id) {
+                    // Mirror the original semantics: a zero-length read always
+                    // stops this drain (avoids spinning on a readable-but-empty
+                    // stream); otherwise stop once quiche reports no more data.
+                    if !had_bytes || !qconn.stream_readable(id) {
                         return;
                     }
                 }
@@ -2415,7 +2460,7 @@ impl<B: Buf + Send + 'static> ApplicationOverQuic for QuicheDriver<B> {
     }
 
     fn buffer(&mut self) -> &mut [u8] {
-        // The outbound packet buffer (PKT_BUF_LEN), NOT the MAX_CHUNK scratch.
+        // The outbound packet buffer (PKT_BUF_LEN), NOT the MAX_CHUNK recv buffer.
         &mut self.pkt_buf
     }
 
@@ -2583,6 +2628,111 @@ mod tests {
         // Nothing enqueued after the seal; no second admission.
         assert!(ho.recv.bytes.try_recv().is_err());
         assert!(h.accept_bidi_rx.try_recv().is_err());
+    }
+
+    /// SF-1 (SC-002): the delivered `Bytes` shares the reusable receive buffer's
+    /// backing allocation — no per-chunk deep copy. The chunk is the front split
+    /// of the buffer, so the retained `BytesMut` begins exactly `chunk.len()`
+    /// bytes into the SAME allocation; a deep copy would place them in unrelated
+    /// allocations, so this contiguity holds iff no copy occurred.
+    #[test]
+    fn sf1_delivered_chunk_shares_recv_buffer_backing() {
+        let (mut d, mut h) = driver();
+        let mut c = MockConn::new();
+        // No FIN so the buffer retains a [len..] remainder to compare against.
+        c.script_recv(0, [data(b"zerocopy-payload", false)]);
+        c.queue_readable([0]);
+        d.read_budget = READ_BUDGET;
+        d.run_read_pump(&mut c);
+
+        let mut ho = h.accept_bidi_rx.try_recv().expect("one bidi handoff");
+        let chunk = ho.recv.bytes.try_recv().unwrap();
+        assert_eq!(&chunk[..], b"zerocopy-payload");
+        let buf = d
+            .recv_buf
+            .as_ref()
+            .expect("recv buffer allocated on first read");
+        assert_eq!(
+            chunk.as_ptr() as usize + chunk.len(),
+            buf.as_ptr() as usize,
+            "delivered chunk must be contiguous with the retained buffer (shared backing)"
+        );
+    }
+
+    /// SF-1 (SC-002): a multi-chunk drain produces distinct, byte-correct,
+    /// non-aliasing payloads across the `split_to`/re-arm cycle — an earlier
+    /// frozen chunk is never corrupted by a later read into the reused buffer.
+    #[test]
+    fn sf1_multi_chunk_drain_no_aliasing_corruption() {
+        let (mut d, mut h) = driver();
+        let mut c = MockConn::new();
+        c.script_recv(0, [data(b"AAAA", false), data(b"BBBB", true)]);
+        c.queue_readable([0]);
+        d.read_budget = READ_BUDGET;
+        d.run_read_pump(&mut c);
+
+        let mut ho = h.accept_bidi_rx.try_recv().expect("one bidi handoff");
+        let c1 = ho.recv.bytes.try_recv().unwrap();
+        let c2 = ho.recv.bytes.try_recv().unwrap();
+        // Both correct AND the first is intact after the second read reused the
+        // buffer — proves the reuse cycle does not alias/overwrite live chunks.
+        assert_eq!(&c1[..], b"AAAA");
+        assert_eq!(&c2[..], b"BBBB");
+        assert!(matches!(ho.recv.terminal.get(), Some(RecvEnd::Fin)));
+    }
+
+    /// SF-7 (SC-003): the per-stream sender lookup+clone is hoisted out of the
+    /// chunk loop — draining K chunks in one `drain_stream` performs exactly one
+    /// lookup/clone, not one per chunk.
+    #[test]
+    fn sf7_sender_lookup_hoisted_once_per_drain() {
+        let (mut d, _h) = driver();
+        let (tx, mut rx) = mpsc::channel::<Bytes>(BYTE_CHANNEL_DEPTH);
+        d.recv.insert(
+            0,
+            StreamRecvState {
+                bytes: tx,
+                terminal: TerminalCell::new(),
+                resume: Arc::new(AtomicBool::new(false)),
+                blocked: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let mut c = MockConn::new();
+        c.script_recv(0, [data(b"a", false), data(b"b", false), data(b"c", false)]);
+        d.read_budget = READ_BUDGET;
+        d.drain_stream(&mut c, 0);
+
+        // Three chunks pulled in one drain → exactly one hoisted lookup/clone.
+        assert_eq!(d.recv_lookup_count, 1);
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"a"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"b"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"c"));
+    }
+
+    /// SF-5-scratch (SC-006): the receive buffer is lazily allocated — a driver
+    /// that never receives data never allocates it; it materializes only on the
+    /// first `stream_recv`.
+    #[test]
+    fn sf5_recv_buffer_lazily_allocated() {
+        let (mut d, mut h) = driver();
+        // Fresh driver, no receives yet → buffer not allocated.
+        assert!(
+            d.recv_buf.is_none(),
+            "idle connection must not allocate the receive buffer"
+        );
+
+        let mut c = MockConn::new();
+        c.script_recv(0, [data(b"x", true)]);
+        c.queue_readable([0]);
+        d.read_budget = READ_BUDGET;
+        d.run_read_pump(&mut c);
+        let _ho = h.accept_bidi_rx.try_recv().expect("one bidi handoff");
+
+        // After the first receive it exists.
+        assert!(
+            d.recv_buf.is_some(),
+            "receive buffer must materialize on first stream_recv"
+        );
     }
 
     /// §11: queued bytes then `RESET_STREAM` — queued bytes delivered, then
