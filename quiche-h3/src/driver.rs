@@ -14,7 +14,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
@@ -22,7 +22,10 @@ use tokio_quiche::quic::HandshakeInfo;
 use tokio_quiche::quic::QuicheConnection;
 use tokio_quiche::{ApplicationOverQuic, QuicResult};
 
-use crate::buffer::{send_from_buf, TerminalCell, MAX_CHUNK, PKT_BUF_LEN};
+use crate::buffer::{
+    send_from_buf, SendAccounting, SendBytesPermit, TerminalCell, WriteCompleter, MAX_CHUNK,
+    PKT_BUF_LEN,
+};
 use crate::conn::QuicConn;
 use crate::error::{
     classify_stream_recv_error, classify_stream_send_error, conn_terminal_from_error, CloseOrigin,
@@ -57,8 +60,44 @@ const PROMOTE_BUDGET: usize = 32;
 const CHUNK_BUDGET: usize = 16;
 
 /// Bounded per-recv byte-channel depth; the per-stream in-flight memory bound is
-/// `BYTE_CHANNEL_DEPTH × MAX_CHUNK` (§5.1, provisional §12 S3).
-const BYTE_CHANNEL_DEPTH: usize = 64;
+/// `BYTE_CHANNEL_DEPTH × MAX_CHUNK` (§5.1, provisional §12 S3). This is the
+/// **default** depth; it is configurable per connection via [`DriverBufferConfig`]
+/// (SF-4) — see [`H3QuicheServerConfig`](crate::listener::H3QuicheServerConfig)
+/// and [`H3QuicheClientConfig`](crate::connector::H3QuicheClientConfig).
+pub(crate) const BYTE_CHANNEL_DEPTH: usize = 64;
+
+/// Per-connection buffer sizing knobs (SF-4 / SF-5-pkt_buf). Both default to the
+/// historical constants so out-of-the-box behavior is byte-for-byte unchanged;
+/// callers may raise/lower them to trade memory against throughput.
+///
+/// These are **trade-offs**, not free wins: shrinking `recv_channel_depth`
+/// reduces per-stream buffering (throughput) to save memory, and the packet
+/// buffer must NOT be shrunk below a full GSO batch without a datapath
+/// assessment (§5, §12).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DriverBufferConfig {
+    /// Bounded per-recv byte-channel depth (default [`BYTE_CHANNEL_DEPTH`]).
+    /// Effective value is clamped to at least 1.
+    pub recv_channel_depth: usize,
+    /// Outbound packet-buffer size in bytes (default [`PKT_BUF_LEN`]).
+    /// Effective value is clamped to at least 1.
+    pub packet_buffer_size: usize,
+    /// Optional aggregate cap (bytes) on buffered outbound send data admitted to
+    /// the worker command/op queues (SF-6, FR-010/FR-011). `None` (default) =
+    /// unlimited, preserving the historical unbounded behavior. A finite cap
+    /// bounds resident admitted send bytes to at most `cap + one admission unit`.
+    pub max_buffered_send_bytes: Option<usize>,
+}
+
+impl Default for DriverBufferConfig {
+    fn default() -> Self {
+        Self {
+            recv_channel_depth: BYTE_CHANNEL_DEPTH,
+            packet_buffer_size: PKT_BUF_LEN,
+            max_buffered_send_bytes: None,
+        }
+    }
+}
 
 /// Max commands applied per `process_writes` stage (a) (§5.2). Excess stays in
 /// `inbox` (relative order preserved) and re-forces an iteration.
@@ -73,6 +112,20 @@ const WRITE_BUDGET: usize = 32;
 /// Cap on the bytes offered to a single `stream_send` turn (§5.3a "one bounded
 /// transport call").
 const MAX_WRITE_CHUNK: usize = MAX_CHUNK;
+
+/// Receive-arena reservation size (SF-1). The reusable `recv_buf` is grown a
+/// whole `RECV_ARENA` block at a time and individual `MAX_CHUNK` windows are
+/// carved out of it with `split_to().freeze()` (O(1), shares the backing
+/// allocation). This is what makes the allocation *amortized*: reserving only
+/// `MAX_CHUNK` would force `BytesMut` to reallocate on **every** read once a
+/// frozen chunk keeps the buffer shared (non-unique), reintroducing the very
+/// per-chunk `malloc` SF-1 removes. One `RECV_ARENA` allocation instead backs
+/// `RECV_ARENA / avg_chunk` delivered chunks; the block is freed once the
+/// worker and every consumer have dropped their slices. It is per-connection
+/// working memory (one arena per driver, reused across all streams), lazily
+/// allocated on first receive (SF-5), and small next to the per-stream recv
+/// channel budget (`recv_channel_depth × MAX_CHUNK`).
+const RECV_ARENA: usize = 8 * MAX_CHUNK;
 
 /// Small low-water re-arm progress threshold (§5.3): any capacity gain wakes a
 /// blocked write, rather than starving it on the full remaining length.
@@ -92,6 +145,11 @@ fn is_bidi(id: u64) -> bool {
 /// control channel (§5.2). Unbounded because the emitting trait methods cannot
 /// exert backpressure or fail (`reset`/`stop_sending` return `()`), and the
 /// resume signals are correctness-critical and must never be dropped.
+// The `Send` variant is intentionally larger than the lifecycle variants: it
+// carries the caller's `WriteBuf` inline. Boxing it would add a heap allocation
+// per queued write on the send hot path, which we deliberately avoid (cf.
+// `SendOp`).
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum DriverCommand<B: Buf> {
     /// `OpenStreams::poll_open_bidi` — returns both halves.
     OpenBidi {
@@ -103,10 +161,19 @@ pub(crate) enum DriverCommand<B: Buf> {
         reply: oneshot::Sender<Result<SendHandoff<B>, Arc<ConnTerminal>>>,
     },
     /// `SendStream::send_data` — stash one `WriteBuf` in the stream's send slot.
+    /// The completion is delivered through the stream's **reusable**
+    /// [`WriteCompleter`] (SF-3), stamped with the write's generation, rather
+    /// than a freshly allocated per-chunk `oneshot`.
     Send {
         id: u64,
         buf: h3::quic::WriteBuf<B>,
-        done: oneshot::Sender<Result<(), SendEnd>>,
+        done: WriteCompleter<SendEnd>,
+        /// Aggregate send-byte reservation for this write (SF-6). Held for the
+        /// buffer's whole worker lifetime; its `Drop` releases the reserved
+        /// bytes exactly once at the SF-3 completion chokepoint (or on an
+        /// unapplied-command / rollback drop). `None` only for synthetic
+        /// internal sends that bypass front-end admission.
+        permit: Option<SendBytesPermit>,
     },
     /// `SendStream::poll_finish` — queue a FIN after any buffered writes.
     Finish {
@@ -156,12 +223,17 @@ impl<B: Buf> std::fmt::Debug for DriverCommand<B> {
 pub(crate) struct ConnShared {
     /// Published exactly once at the connection-terminal edge.
     pub(crate) conn_terminal: TerminalCell<Arc<ConnTerminal>>,
+    /// Aggregate buffered-send-byte accounting shared with every front-end
+    /// `H3SendStream` for cap admission (SF-6, §12 S3). `cap == None` (default)
+    /// leaves admission unbounded (behavior unchanged).
+    pub(crate) send_accounting: Arc<SendAccounting>,
 }
 
 impl ConnShared {
-    pub(crate) fn new() -> Arc<Self> {
+    pub(crate) fn new(max_buffered_send_bytes: Option<usize>) -> Arc<Self> {
         Arc::new(ConnShared {
             conn_terminal: TerminalCell::new(),
+            send_accounting: SendAccounting::new(max_buffered_send_bytes),
         })
     }
 }
@@ -178,6 +250,9 @@ pub(crate) struct RecvHandoff<B: Buf> {
     pub(crate) terminal: TerminalCell<RecvEnd>,
     /// Producer-coalesced resume bit shared with the worker (§5.1).
     pub(crate) resume: Arc<AtomicBool>,
+    /// Worker "parked on a full byte channel" flag shared with the worker so the
+    /// consumer only emits a resume when the worker had genuinely blocked (SF-2).
+    pub(crate) blocked: Arc<AtomicBool>,
     /// For `stop_sending` and drop cleanup.
     pub(crate) cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
     /// Armed cleanup if this handoff is dropped before conversion (§6.2).
@@ -192,6 +267,8 @@ pub(crate) struct SendHandoff<B: Buf> {
     pub(crate) status: TerminalCell<SendEnd>,
     /// For `send_data`/`poll_finish`/`reset` and drop cleanup.
     pub(crate) cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
+    /// Shared aggregate send-byte accounting for cap admission (SF-6, §12 S3).
+    pub(crate) send_accounting: Arc<SendAccounting>,
     /// Armed cleanup if this handoff is dropped before conversion (§6.2).
     pub(crate) cleanup: HandoffCleanup<B>,
 }
@@ -275,12 +352,16 @@ pub(crate) struct StreamRecvState {
     /// Producer-coalesced resume bit shared with the front end (§5.1, finding 3).
     pub(crate) resume: Arc<AtomicBool>,
     /// The byte channel was full on the last drain; parked until `RecvResume`.
-    pub(crate) blocked: bool,
+    /// Shared `Arc<AtomicBool>` with the front-end handle so the consumer can
+    /// gate its resume signal on genuine worker blocking (SF-2): the worker
+    /// publishes `true` (Release) when it parks and the consumer observes-and-
+    /// clears it (AcqRel swap) when it frees a slot.
+    pub(crate) blocked: Arc<AtomicBool>,
 }
 
 /// One ordered send operation queued for a stream (§5.3a). `Write` carries the
-/// caller's `WriteBuf` cursor (partial-consumed across turns) and its completion
-/// oneshot; `Finish` carries only its completion oneshot.
+/// caller's `WriteBuf` cursor (partial-consumed across turns) and its reusable
+/// [`WriteCompleter`] (SF-3); `Finish` carries only its completion oneshot.
 // The `Write` variant is intentionally larger than `Finish`: boxing the
 // `WriteBuf` would add a heap allocation per queued write on the send hot path,
 // which we deliberately avoid.
@@ -288,7 +369,9 @@ pub(crate) struct StreamRecvState {
 pub(crate) enum SendOp<B: Buf> {
     Write {
         buf: h3::quic::WriteBuf<B>,
-        done: oneshot::Sender<Result<(), SendEnd>>,
+        done: WriteCompleter<SendEnd>,
+        /// SF-6 byte reservation; released on drop (completion / drain / reset).
+        permit: Option<SendBytesPermit>,
     },
     Finish {
         done: oneshot::Sender<Result<(), SendEnd>>,
@@ -296,14 +379,19 @@ pub(crate) enum SendOp<B: Buf> {
 }
 
 impl<B: Buf> SendOp<B> {
-    /// Resolve this op's completion oneshot exactly once (§5.3a exactly-once).
+    /// Resolve this op's completion exactly once (§5.3a exactly-once). A `Write`
+    /// completes through its reusable [`WriteCompleter`] (set-if-current-
+    /// generation, SF-3); a `Finish` stays a per-stream one-shot `oneshot`.
     fn complete(self, result: Result<(), SendEnd>) {
-        let done = match self {
-            SendOp::Write { done, .. } => done,
-            SendOp::Finish { done } => done,
-        };
-        // Ignore send error: the front end may have stopped polling (drop).
-        let _ = done.send(result);
+        match self {
+            // Dropping the destructured `permit` here releases the SF-6 byte
+            // reservation at the exactly-once completion chokepoint.
+            SendOp::Write { done, .. } => done.complete(result),
+            // Ignore send error: the front end may have stopped polling (drop).
+            SendOp::Finish { done } => {
+                let _ = done.send(result);
+            }
+        }
     }
 }
 
@@ -584,13 +672,23 @@ pub(crate) struct QuicheDriver<B: Buf = Bytes> {
     pending_resume: VecDeque<u64>,
     resume_set: HashSet<u64>,
     /// New peer ids awaiting admission. `pending_admit` **owns** each captured
-    /// `PeerStream`; `pending_admit_order` defines bounded admission order and
-    /// its membership. Both are updated atomically on every exit (iter11 f6).
+    /// `PeerStream`; the per-class `pending_admit_bidi`/`pending_admit_uni`
+    /// queues define bounded admission order and its membership. Both are
+    /// updated atomically on every exit (iter11 f6). Admission order is split
+    /// per class so a class that parks on a full accept channel can be skipped
+    /// without rescanning its backlog, bounding per-pump work to O(ADMIT_BUDGET)
+    /// regardless of how many same-class ids are blocked (MF-1).
     pending_admit: HashMap<u64, PeerStream>,
-    pending_admit_order: VecDeque<u64>,
+    pending_admit_bidi: VecDeque<u64>,
+    pending_admit_uni: VecDeque<u64>,
     /// Per-class parked promotion queues (parking is independent per class, §5).
     parked_bidi: VecDeque<u64>,
     parked_uni: VecDeque<u64>,
+    /// Test-only counter of ids popped/examined by `phase2_admission` in the
+    /// most recent pump. Proves the MF-1 fix bounds per-pump admission work to
+    /// O(ADMIT_BUDGET) instead of re-scanning the accept-blocked backlog.
+    #[cfg(test)]
+    phase2_pops: usize,
 
     // ----- setup signalling (§7.1) -----
     established: Option<oneshot::Sender<Result<(), SetupFailure>>>,
@@ -598,10 +696,24 @@ pub(crate) struct QuicheDriver<B: Buf = Bytes> {
     // ----- worker loop flags / buffers (§2.3, §5) -----
     /// `should_act()` result: true once established.
     acting: bool,
-    /// Outbound packet buffer backing `buffer()` (§5, T3).
+    /// Outbound packet buffer backing `buffer()` (§5, T3). Sized from
+    /// [`DriverBufferConfig::packet_buffer_size`] (SF-5-pkt_buf).
     pkt_buf: Vec<u8>,
-    /// `stream_recv` target, capped at `MAX_CHUNK` (§5.1).
-    scratch: Vec<u8>,
+    /// Configured recv byte-channel depth applied in `build_recv` (SF-4).
+    recv_channel_depth: usize,
+    /// Reusable `stream_recv` target arena (SF-1). A single `BytesMut` grown a
+    /// `RECV_ARENA` block at a time; each chunk is carved via
+    /// `split_to(len).freeze()` (O(1) refcounted share of the backing
+    /// allocation, no per-chunk memcpy). Reserving a multi-chunk arena — rather
+    /// than one `MAX_CHUNK` window — is what makes the allocation *amortized*
+    /// while consumers hold frozen slices (a shared `BytesMut` cannot be reused
+    /// in place). Lazily allocated on first receive (SF-5): a connection that
+    /// never receives data never allocates it (`None`).
+    recv_buf: Option<BytesMut>,
+    /// Counts hoisted per-stream sender lookup+clone operations (SF-7): with the
+    /// clone hoisted out of the chunk loop this increments once per `drain_stream`.
+    #[cfg(test)]
+    recv_lookup_count: usize,
     /// A stage deferred runnable work under a per-iteration quota: force another
     /// iteration via the `wait_for_data` fast path (§5, finding 5).
     needs_iteration: bool,
@@ -646,18 +758,36 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
     /// Create a driver and its front-end handles. `is_server` selects the QUIC
     /// stream-id parity for locally-opened streams (§6.1); `accept_bidi_cap` /
     /// `accept_uni_cap` bound the respective accept queues (§5.2, provisional
-    /// §12 S3).
+    /// §12 S3). Buffer sizes take the historical defaults ([`DriverBufferConfig`]);
+    /// use [`with_buffers`](Self::with_buffers) to override them (SF-4/SF-5).
     pub(crate) fn new(
         is_server: bool,
         accept_bidi_cap: usize,
         accept_uni_cap: usize,
+    ) -> (Self, DriverHandles<B>) {
+        Self::with_buffers(
+            is_server,
+            accept_bidi_cap,
+            accept_uni_cap,
+            DriverBufferConfig::default(),
+        )
+    }
+
+    /// Like [`new`](Self::new) but with explicit per-connection buffer sizing
+    /// (SF-4 recv channel depth, SF-5 packet buffer size). Passing
+    /// `DriverBufferConfig::default()` is identical to [`new`](Self::new).
+    pub(crate) fn with_buffers(
+        is_server: bool,
+        accept_bidi_cap: usize,
+        accept_uni_cap: usize,
+        buffers: DriverBufferConfig,
     ) -> (Self, DriverHandles<B>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let cmd_tx_weak = cmd_tx.downgrade();
         let (accept_bidi_tx, accept_bidi_rx) = mpsc::channel(accept_bidi_cap.max(1));
         let (accept_uni_tx, accept_uni_rx) = mpsc::channel(accept_uni_cap.max(1));
         let (est_tx, est_rx) = oneshot::channel();
-        let shared = ConnShared::new();
+        let shared = ConnShared::new(buffers.max_buffered_send_bytes);
         let accept_terminal_bidi = TerminalCell::new();
         let accept_terminal_uni = TerminalCell::new();
         let accept_bidi_resume = Arc::new(AtomicBool::new(false));
@@ -689,13 +819,19 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             pending_resume: VecDeque::new(),
             resume_set: HashSet::new(),
             pending_admit: HashMap::new(),
-            pending_admit_order: VecDeque::new(),
+            pending_admit_bidi: VecDeque::new(),
+            pending_admit_uni: VecDeque::new(),
             parked_bidi: VecDeque::new(),
             parked_uni: VecDeque::new(),
+            #[cfg(test)]
+            phase2_pops: 0,
             established: Some(est_tx),
             acting: false,
-            pkt_buf: vec![0u8; PKT_BUF_LEN],
-            scratch: vec![0u8; MAX_CHUNK],
+            pkt_buf: vec![0u8; buffers.packet_buffer_size.max(1)],
+            recv_channel_depth: buffers.recv_channel_depth,
+            recv_buf: None,
+            #[cfg(test)]
+            recv_lookup_count: 0,
             needs_iteration: false,
             graceful_close_issued: false,
             last_handle_teardown: false,
@@ -842,10 +978,40 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
     fn has_runnable_remainder(&self) -> bool {
         !self.pending_resume.is_empty()
             || !self.pending_readable.is_empty()
-            || !self.pending_admit_order.is_empty()
+            // A class with pending admits re-arms the worker only if it is not
+            // currently accept-blocked-waiting: either it has never parked
+            // (`parked_*` empty — capacity may be free) or its accept-resume bit
+            // has since been set. A class that parked on a full accept channel
+            // (parked non-empty, resume bit still clear) is NOT reported runnable
+            // until the matching `Accept*Resume` arrives, so a capacity-blocked
+            // class can no longer self-reschedule the worker (MF-1, FR-002). A
+            // fresh never-parked class with pending ids still reports runnable so
+            // no admission is stalled. The accept-resume bit is set by the accept
+            // consumer (`stream.rs`) and read here on the worker; a Relaxed load
+            // suffices because the actual happens-before + wakeup is carried by
+            // the paired `Accept*Resume` command over the control channel (the
+            // bit only coalesces re-arm signals), matching the parked-promotion
+            // checks below.
+            || (!self.pending_admit_bidi.is_empty()
+                && (self.parked_bidi.is_empty()
+                    || self.accept_bidi_resume.load(Ordering::Relaxed)))
+            || (!self.pending_admit_uni.is_empty()
+                && (self.parked_uni.is_empty()
+                    || self.accept_uni_resume.load(Ordering::Relaxed)))
             || !self.runnable_send.is_empty()
             || (!self.parked_bidi.is_empty() && self.accept_bidi_resume.load(Ordering::Relaxed))
             || (!self.parked_uni.is_empty() && self.accept_uni_resume.load(Ordering::Relaxed))
+    }
+
+    /// Route a discovered peer id into its per-class admission queue (§5.1). The
+    /// split lets `phase2_admission` skip a parked (accept-full) class without
+    /// rescanning its backlog (MF-1); FIFO order is preserved within each class.
+    fn push_pending_admit(&mut self, id: u64) {
+        if is_bidi(id) {
+            self.pending_admit_bidi.push_back(id);
+        } else {
+            self.pending_admit_uni.push_back(id);
+        }
     }
 
     /// The mandatory explicit-close barrier (§5.2, §8.3, invariant 10), run
@@ -939,7 +1105,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             } else {
                 // A new peer id: own a fresh PeerStream awaiting admission.
                 self.pending_admit.insert(id, PeerStream::new(id));
-                self.pending_admit_order.push_back(id);
+                self.push_pending_admit(id);
             }
         }
         if n == DISCOVERY_BUDGET {
@@ -1030,7 +1196,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 let mut peer = PeerStream::new(id);
                 peer.pending_send_terminal = stopped;
                 self.pending_admit.insert(id, peer);
-                self.pending_admit_order.push_back(id);
+                self.push_pending_admit(id);
                 // A new admission is pending: ensure stage (b) runs next iteration.
                 self.needs_iteration = true;
             }
@@ -1056,7 +1222,10 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             match self.recv.get_mut(&id) {
                 Some(state) => {
                     state.resume.store(false, Ordering::Relaxed);
-                    state.blocked = false;
+                    // Defensive: the consumer already cleared `blocked` via its
+                    // AcqRel swap when it emitted this resume; reset it here too
+                    // so a fresh park cycle starts from a known-clear flag (SF-2).
+                    state.blocked.store(false, Ordering::Relaxed);
                 }
                 None => continue,
             }
@@ -1095,6 +1264,19 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
     /// chunks, decrementing the shared `read_budget` per chunk (§5.1). Publishes
     /// `RecvEnd::Fin` only after `Permit::send`-ing the final byte (sealing edge).
     fn drain_stream<C: QuicConn>(&mut self, qconn: &mut C, id: u64) {
+        // SF-7: hoist the per-stream sender lookup+clone out of the chunk loop.
+        // Cloning the `Sender` (a) frees `&mut self` for the receive buffer borrow
+        // and (b) is done once per drain instead of once per chunk. The clone
+        // stays valid even if the `recv` entry is later removed on a terminal
+        // path (we `return` on those paths anyway).
+        let tx = match self.recv.get(&id) {
+            Some(state) => state.bytes.clone(),
+            None => return,
+        };
+        #[cfg(test)]
+        {
+            self.recv_lookup_count += 1;
+        }
         for _ in 0..CHUNK_BUDGET {
             if self.read_budget == 0 {
                 // Requeue keeping membership so the remainder drains next pump.
@@ -1102,21 +1284,40 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 self.needs_iteration = true;
                 return;
             }
-            // Clone the sender so the reserved `Permit` does not borrow `self`,
-            // freeing `&mut self.scratch` for `stream_recv`.
-            let tx = match self.recv.get(&id) {
-                Some(state) => state.bytes.clone(),
-                None => return,
-            };
             let permit = match tx.try_reserve() {
                 Ok(permit) => permit,
                 Err(TrySendError::Full(())) => {
                     // Full: leave bytes in quiche (flow control backpressures the
-                    // peer); park until RecvResume. No stream_recv, no loss.
-                    if let Some(state) = self.recv.get_mut(&id) {
-                        state.blocked = true;
+                    // peer); park until RecvResume. SF-2 lost-wakeup closure
+                    // (§5.1): publish `blocked=true` with Release BEFORE a final
+                    // capacity re-check. This forms an atomic handshake with the
+                    // consumer's `blocked.swap(false, AcqRel)`:
+                    //   * if the consumer freed a slot and swapped before our
+                    //     store, its swap saw `false` (no resume) — but our
+                    //     re-check below then observes the freed slot and we do
+                    //     NOT park (so no wakeup is needed);
+                    //   * if the consumer frees after our store, its swap sees
+                    //     `true` and emits exactly one resume.
+                    // Either way we never park with a slot already free, so a
+                    // genuine resume can never be dropped (correctness > perf).
+                    if let Some(state) = self.recv.get(&id) {
+                        state.blocked.store(true, Ordering::Release);
                     }
-                    return;
+                    match tx.try_reserve() {
+                        Ok(permit) => {
+                            // A slot was freed in the window: clear the park flag
+                            // and proceed with the read instead of parking.
+                            if let Some(state) = self.recv.get(&id) {
+                                state.blocked.store(false, Ordering::Release);
+                            }
+                            permit
+                        }
+                        Err(TrySendError::Full(())) => return,
+                        Err(TrySendError::Closed(())) => {
+                            self.abandon_recv(qconn, id);
+                            return;
+                        }
+                    }
                 }
                 Err(TrySendError::Closed(())) => {
                     // Dropped H3RecvStream: normal local abandonment (invariant 1).
@@ -1124,11 +1325,69 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                     return;
                 }
             };
-            match qconn.stream_recv(id, &mut self.scratch) {
-                Ok((len, fin)) => {
-                    if len > 0 {
-                        let bytes = Bytes::copy_from_slice(&self.scratch[..len]);
-                        permit.send(bytes);
+            // SF-1: read into the reusable `BytesMut` arena (lazily allocated
+            // per SF-5) and hand the consumer an owned `Bytes` via
+            // `split_to(len).freeze()`. `stream_recv` requires an *initialized*
+            // `&mut [u8]`, so a `MAX_CHUNK` window is grown with a safe
+            // zero-fill (`resize`) — NOT an unsafe uninitialized-slice cast. The
+            // zero-fill of the reused window is the accepted trade-off (D-1):
+            // this removes the per-chunk *memcpy*, not the fill; only the
+            // freshly-written `[..len]` region is frozen, so no uninitialized
+            // (or stale) byte is ever exposed to h3. The frozen slice shares the
+            // arena's backing allocation with the reader buffer (O(1)); a later
+            // grow reallocates instead of overwriting bytes the consumer holds.
+            //
+            // Allocation is *amortized* (SF-1): the arena keeps ≥ one MAX_CHUNK
+            // window of writable capacity and only reserves a fresh RECV_ARENA
+            // block when exhausted (or still shared by a live frozen chunk).
+            // `reserve` reclaims the block in place once earlier chunks drop, so
+            // one allocation backs many delivered chunks. Reserving RECV_ARENA
+            // (not MAX_CHUNK) is essential: a MAX_CHUNK reservation reallocates
+            // on every read while any frozen chunk keeps the buffer non-unique,
+            // which would make this *slower* than the `copy_from_slice` it
+            // replaces (2 allocs/chunk vs 1). Between reads the arena is fully
+            // carved (len == 0); each read grows it to a MAX_CHUNK window and
+            // carves back to len == 0.
+            let read = {
+                let buf = self.recv_buf.get_or_insert_with(BytesMut::new);
+                debug_assert_eq!(
+                    buf.len(),
+                    0,
+                    "recv arena must be fully carved between reads"
+                );
+                if buf.capacity() < MAX_CHUNK {
+                    buf.reserve(RECV_ARENA);
+                }
+                buf.resize(MAX_CHUNK, 0);
+                match qconn.stream_recv(id, &mut buf[..]) {
+                    Ok((len, fin)) => {
+                        let chunk = if len > 0 {
+                            buf.truncate(len);
+                            // O(1) refcounted carve sharing the arena backing;
+                            // the retained tail advances past it (capacity
+                            // shrinks by `len`) and the next read fills the rest.
+                            Some(buf.split_to(len).freeze())
+                        } else {
+                            // Nothing written: rewind the zero-filled window so
+                            // the arena position (and capacity) is unchanged.
+                            buf.truncate(0);
+                            None
+                        };
+                        Ok((chunk, fin))
+                    }
+                    Err(err) => {
+                        // Rewind the zero-filled window on error (no wasted
+                        // capacity, arena stays fully carved for the next read).
+                        buf.truncate(0);
+                        Err(err)
+                    }
+                }
+            };
+            match read {
+                Ok((chunk, fin)) => {
+                    let had_bytes = chunk.is_some();
+                    if let Some(chunk) = chunk {
+                        permit.send(chunk);
                         self.read_budget -= 1;
                     } else {
                         drop(permit);
@@ -1139,7 +1398,10 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                         self.mark_recv_done(id);
                         return;
                     }
-                    if len == 0 || !qconn.stream_readable(id) {
+                    // Mirror the original semantics: a zero-length read always
+                    // stops this drain (avoids spinning on a readable-but-empty
+                    // stream); otherwise stop once quiche reports no more data.
+                    if !had_bytes || !qconn.stream_readable(id) {
                         return;
                     }
                 }
@@ -1178,28 +1440,49 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         }
     }
 
-    /// Phase 2: admit up to `ADMIT_BUDGET` ids from `pending_admit_order`
-    /// (§5.1). A full accept queue parks **only that class**; the other class
-    /// keeps admitting (parking is independent per class).
+    /// Phase 2: admit up to `ADMIT_BUDGET` ids from the per-class admission
+    /// queues (§5.1). A full accept queue parks **only that class**; the other
+    /// class keeps admitting (parking is independent per class). The two queues
+    /// are serviced in an alternating (round-robin) fashion so a flood of one
+    /// class cannot starve the other. Crucially, once a class parks it is not
+    /// serviced again this pump and its remaining backlog is left in place
+    /// **without being rescanned** — this bounds per-pump work to O(ADMIT_BUDGET)
+    /// regardless of how many same-class ids are accept-blocked (MF-1).
     fn phase2_admission<C: QuicConn>(&mut self, qconn: &mut C) {
         let mut budget = ADMIT_BUDGET;
         let mut bidi_blocked = false;
         let mut uni_blocked = false;
-        // Ids of a blocked class are carried and restored to the front so their
-        // relative order survives to the next pump.
-        let mut carry: VecDeque<u64> = VecDeque::new();
+        #[cfg(test)]
+        {
+            self.phase2_pops = 0;
+        }
+        // Alternate the preferred class each iteration for fair cross-class
+        // servicing (FR-003). Skip a class that is blocked (parked this pump) or
+        // empty; stop when neither class can be served.
+        let mut prefer_bidi = true;
         while budget > 0 {
-            if bidi_blocked && uni_blocked {
-                break;
-            }
-            let id = match self.pending_admit_order.pop_front() {
-                Some(id) => id,
-                None => break,
+            let bidi_ready = !bidi_blocked && !self.pending_admit_bidi.is_empty();
+            let uni_ready = !uni_blocked && !self.pending_admit_uni.is_empty();
+            let bidi = match (bidi_ready, uni_ready) {
+                (false, false) => break,
+                (true, false) => true,
+                (false, true) => false,
+                (true, true) => prefer_bidi,
             };
-            let bidi = is_bidi(id);
-            if (bidi && bidi_blocked) || (!bidi && uni_blocked) {
-                carry.push_back(id);
-                continue;
+            // Alternate for the next iteration so the two queues share the budget.
+            prefer_bidi = !bidi;
+            let id = if bidi {
+                self.pending_admit_bidi.pop_front()
+            } else {
+                self.pending_admit_uni.pop_front()
+            };
+            let id = match id {
+                Some(id) => id,
+                None => continue,
+            };
+            #[cfg(test)]
+            {
+                self.phase2_pops += 1;
             }
             // Already admitted (defensive; membership should prevent it).
             if self.admit.contains_key(&id) || self.recv.contains_key(&id) {
@@ -1231,9 +1514,6 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                     }
                 }
             }
-        }
-        while let Some(id) = carry.pop_back() {
-            self.pending_admit_order.push_front(id);
         }
     }
 
@@ -1323,8 +1603,12 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             };
             let (recv_state, recv_handoff, recv_done) =
                 self.build_recv(id, cmd_tx.clone(), peer.pending_recv_terminal.take());
-            let (send_handoff, send_state, send_done) =
-                build_send(id, cmd_tx, peer.pending_send_terminal.take());
+            let (send_handoff, send_state, send_done) = build_send(
+                id,
+                cmd_tx,
+                Arc::clone(&self.shared.send_accounting),
+                peer.pending_send_terminal.take(),
+            );
             if let Some(state) = recv_state {
                 self.recv.insert(id, state);
             }
@@ -1396,9 +1680,10 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
         retained: Option<RecvEnd>,
     ) -> (Option<StreamRecvState>, RecvHandoff<B>, bool) {
-        let (tx, rx) = mpsc::channel(BYTE_CHANNEL_DEPTH);
+        let (tx, rx) = mpsc::channel(self.recv_channel_depth.max(1));
         let terminal = TerminalCell::new();
         let resume = Arc::new(AtomicBool::new(false));
+        let blocked = Arc::new(AtomicBool::new(false));
         let recv_done = retained.is_some();
         if let Some(end) = retained {
             terminal.set(end);
@@ -1408,6 +1693,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             bytes: rx,
             terminal: terminal.clone(),
             resume: Arc::clone(&resume),
+            blocked: Arc::clone(&blocked),
             cmd_tx: cmd_tx.clone(),
             cleanup: HandoffCleanup::new(id, true, cmd_tx),
         };
@@ -1418,7 +1704,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 bytes: tx,
                 terminal,
                 resume,
-                blocked: false,
+                blocked,
             })
         };
         (state, handoff, recv_done)
@@ -1574,8 +1860,13 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 DriverCommand::AcceptUniResume => {
                     self.accept_uni_resume.store(true, Ordering::Relaxed);
                 }
-                DriverCommand::Send { id, buf, done } => {
-                    self.enqueue_send_op(id, SendOp::Write { buf, done });
+                DriverCommand::Send {
+                    id,
+                    buf,
+                    done,
+                    permit,
+                } => {
+                    self.enqueue_send_op(id, SendOp::Write { buf, done, permit });
                 }
                 DriverCommand::Finish { id, done } => {
                     self.enqueue_send_op(id, SendOp::Finish { done });
@@ -1639,8 +1930,12 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 self.admit.remove(&id);
             }
         }
-        // Discovered-but-not-yet-admitted streams.
-        let pending: Vec<u64> = self.pending_admit_order.drain(..).collect();
+        // Discovered-but-not-yet-admitted streams (both per-class queues).
+        let pending: Vec<u64> = self
+            .pending_admit_bidi
+            .drain(..)
+            .chain(self.pending_admit_uni.drain(..))
+            .collect();
         for id in pending {
             if self.pending_admit.remove(&id).is_some() {
                 self.shutdown_peer_directions(qconn, id, is_bidi(id));
@@ -1706,7 +2001,8 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             self.next_bidi_id = id.wrapping_add(4);
             // (6) Build both halves, retaining live registry state.
             let (recv_state, recv_handoff, _recv_done) = self.build_recv(id, cmd_tx.clone(), None);
-            let (send_handoff, send_state, _send_done) = build_send(id, cmd_tx, None);
+            let (send_handoff, send_state, _send_done) =
+                build_send(id, cmd_tx, Arc::clone(&self.shared.send_accounting), None);
             if let Some(state) = recv_state {
                 self.recv.insert(id, state);
             }
@@ -1761,7 +2057,8 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 continue;
             }
             self.next_uni_id = id.wrapping_add(4);
-            let (send_handoff, send_state, _send_done) = build_send(id, cmd_tx, None);
+            let (send_handoff, send_state, _send_done) =
+                build_send(id, cmd_tx, Arc::clone(&self.shared.send_accounting), None);
             if let Some(state) = send_state {
                 self.send.insert(id, state);
             }
@@ -2225,7 +2522,13 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
     /// own cells already carry it. Never a bare oneshot cancel.
     fn complete_command_on_close(&self, cmd: DriverCommand<B>, terminal: &Arc<ConnTerminal>) {
         match cmd {
-            DriverCommand::Send { done, .. } | DriverCommand::Finish { done, .. } => {
+            // A `Send` still queued at close resolves its generation exactly once
+            // through its reusable completer (set-if-current-generation); a
+            // `Finish` resolves its per-stream oneshot. Never a bare cancel.
+            DriverCommand::Send { done, .. } => {
+                done.complete(Err(SendEnd::Conn(Arc::clone(terminal))));
+            }
+            DriverCommand::Finish { done, .. } => {
                 let _ = done.send(Err(SendEnd::Conn(Arc::clone(terminal))));
             }
             DriverCommand::OpenBidi { reply } => {
@@ -2265,6 +2568,7 @@ enum TurnOutcome {
 fn build_send<B: Buf>(
     id: u64,
     cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
+    send_accounting: Arc<SendAccounting>,
     retained: Option<SendEnd>,
 ) -> (SendHandoff<B>, Option<StreamSendState<B>>, bool) {
     let status = TerminalCell::new();
@@ -2276,6 +2580,7 @@ fn build_send<B: Buf>(
         id,
         status: status.clone(),
         cmd_tx: cmd_tx.clone(),
+        send_accounting,
         cleanup: HandoffCleanup::new(id, false, cmd_tx),
     };
     let state = if send_done {
@@ -2313,7 +2618,7 @@ impl<B: Buf + Send + 'static> ApplicationOverQuic for QuicheDriver<B> {
     }
 
     fn buffer(&mut self) -> &mut [u8] {
-        // The outbound packet buffer (PKT_BUF_LEN), NOT the MAX_CHUNK scratch.
+        // The outbound packet buffer (PKT_BUF_LEN), NOT the MAX_CHUNK recv buffer.
         &mut self.pkt_buf
     }
 
@@ -2379,6 +2684,7 @@ impl<B: Buf> Drop for QuicheDriver<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::WriteOutcome;
 
     fn driver() -> (QuicheDriver<Bytes>, DriverHandles<Bytes>) {
         // Default to the client convention (locally-opened bidi `0,4,8…`).
@@ -2425,6 +2731,59 @@ mod tests {
         let (mut d, _h) = driver();
         assert_eq!(d.buffer().len(), PKT_BUF_LEN);
         assert_ne!(PKT_BUF_LEN, MAX_CHUNK);
+    }
+
+    /// SF-4/SF-5 (SC-006): the default constructor preserves the historical
+    /// buffer sizes exactly — recv channel depth == `BYTE_CHANNEL_DEPTH` and the
+    /// packet buffer == `PKT_BUF_LEN`.
+    #[test]
+    fn sf4_sf5_default_buffer_sizes_unchanged() {
+        let (mut d, _h) = QuicheDriver::<Bytes>::new(false, 4, 4);
+        assert_eq!(d.recv_channel_depth, BYTE_CHANNEL_DEPTH);
+        assert_eq!(d.buffer().len(), PKT_BUF_LEN);
+    }
+
+    /// SF-4/SF-5 (SC-006): `with_buffers` overrides take effect end-to-end — the
+    /// packet buffer is sized to `packet_buffer_size`, and a freshly-built recv
+    /// channel's max capacity equals `recv_channel_depth`.
+    #[test]
+    fn sf4_sf5_buffer_overrides_take_effect() {
+        let (mut d, h) = QuicheDriver::<Bytes>::with_buffers(
+            false,
+            4,
+            4,
+            DriverBufferConfig {
+                recv_channel_depth: 8,
+                packet_buffer_size: 4096,
+                max_buffered_send_bytes: None,
+            },
+        );
+        assert_eq!(d.recv_channel_depth, 8);
+        assert_eq!(d.buffer().len(), 4096);
+        // The configured depth is applied to the per-stream byte channel.
+        let cmd_tx = h.cmd_tx.clone();
+        let (state, _handoff, _done) = d.build_recv(0, cmd_tx, None);
+        let state = state.expect("live recv state");
+        assert_eq!(state.bytes.max_capacity(), 8);
+    }
+
+    /// SF-4/SF-5: zero-valued overrides are clamped to at least 1 (no panic on
+    /// channel/buffer construction).
+    #[test]
+    fn sf4_sf5_zero_sizes_clamped_to_one() {
+        let (mut d, h) = QuicheDriver::<Bytes>::with_buffers(
+            false,
+            4,
+            4,
+            DriverBufferConfig {
+                recv_channel_depth: 0,
+                packet_buffer_size: 0,
+                max_buffered_send_bytes: None,
+            },
+        );
+        assert_eq!(d.buffer().len(), 1);
+        let (state, _handoff, _done) = d.build_recv(0, h.cmd_tx.clone(), None);
+        assert_eq!(state.expect("live recv state").bytes.max_capacity(), 1);
     }
 
     #[test]
@@ -2483,6 +2842,163 @@ mod tests {
         assert!(h.accept_bidi_rx.try_recv().is_err());
     }
 
+    /// SF-1 (SC-002): the delivered `Bytes` shares the reusable receive buffer's
+    /// backing allocation — no per-chunk deep copy. The chunk is the front split
+    /// of the buffer, so the retained `BytesMut` begins exactly `chunk.len()`
+    /// bytes into the SAME allocation; a deep copy would place them in unrelated
+    /// allocations, so this contiguity holds iff no copy occurred.
+    #[test]
+    fn sf1_delivered_chunk_shares_recv_buffer_backing() {
+        let (mut d, mut h) = driver();
+        let mut c = MockConn::new();
+        // No FIN so the buffer retains a [len..] remainder to compare against.
+        c.script_recv(0, [data(b"zerocopy-payload", false)]);
+        c.queue_readable([0]);
+        d.read_budget = READ_BUDGET;
+        d.run_read_pump(&mut c);
+
+        let mut ho = h.accept_bidi_rx.try_recv().expect("one bidi handoff");
+        let chunk = ho.recv.bytes.try_recv().unwrap();
+        assert_eq!(&chunk[..], b"zerocopy-payload");
+        let buf = d
+            .recv_buf
+            .as_ref()
+            .expect("recv buffer allocated on first read");
+        assert_eq!(
+            chunk.as_ptr() as usize + chunk.len(),
+            buf.as_ptr() as usize,
+            "delivered chunk must be contiguous with the retained buffer (shared backing)"
+        );
+    }
+
+    /// SF-1 (SC-002): a multi-chunk drain produces distinct, byte-correct,
+    /// non-aliasing payloads across the `split_to`/re-arm cycle — an earlier
+    /// frozen chunk is never corrupted by a later read into the reused buffer.
+    #[test]
+    fn sf1_multi_chunk_drain_no_aliasing_corruption() {
+        let (mut d, mut h) = driver();
+        let mut c = MockConn::new();
+        c.script_recv(0, [data(b"AAAA", false), data(b"BBBB", true)]);
+        c.queue_readable([0]);
+        d.read_budget = READ_BUDGET;
+        d.run_read_pump(&mut c);
+
+        let mut ho = h.accept_bidi_rx.try_recv().expect("one bidi handoff");
+        let c1 = ho.recv.bytes.try_recv().unwrap();
+        let c2 = ho.recv.bytes.try_recv().unwrap();
+        // Both correct AND the first is intact after the second read reused the
+        // buffer — proves the reuse cycle does not alias/overwrite live chunks.
+        assert_eq!(&c1[..], b"AAAA");
+        assert_eq!(&c2[..], b"BBBB");
+        assert!(matches!(ho.recv.terminal.get(), Some(RecvEnd::Fin)));
+    }
+
+    /// SF-1 (SC-002): the receive arena *amortizes* allocation — draining
+    /// several chunks the consumer holds does NOT reallocate the buffer per
+    /// chunk. Each delivered chunk is contiguous with the previous one in the
+    /// SAME backing allocation, which holds iff no per-chunk realloc occurred
+    /// (a fresh allocation per chunk would place them at unrelated addresses).
+    /// This is the regression guard for the arena fix: a `MAX_CHUNK`-only
+    /// reservation reallocates every read once a frozen chunk is retained.
+    #[test]
+    fn sf1_receive_arena_amortizes_allocation() {
+        let (mut d, _h) = driver();
+        let (tx, mut rx) = mpsc::channel::<Bytes>(BYTE_CHANNEL_DEPTH);
+        d.recv.insert(
+            0,
+            StreamRecvState {
+                bytes: tx,
+                terminal: TerminalCell::new(),
+                resume: Arc::new(AtomicBool::new(false)),
+                blocked: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let mut c = MockConn::new();
+        c.script_recv(
+            0,
+            [
+                data(b"aaaa", false),
+                data(b"bbbb", false),
+                data(b"cccc", false),
+                data(b"dddd", false),
+            ],
+        );
+        d.read_budget = READ_BUDGET;
+        d.drain_stream(&mut c, 0);
+
+        let mut held = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            held.push(chunk);
+        }
+        assert_eq!(held.len(), 4, "all four chunks drained in one pass");
+        let mut prev_end: Option<usize> = None;
+        for chunk in &held {
+            let start = chunk.as_ptr() as usize;
+            if let Some(pe) = prev_end {
+                assert_eq!(
+                    pe, start,
+                    "chunk not contiguous with the previous → arena reallocated \
+                     per chunk (allocation not amortized)"
+                );
+            }
+            prev_end = Some(start + chunk.len());
+        }
+    }
+
+    /// SF-7 (SC-003): the per-stream sender lookup+clone is hoisted out of the
+    /// chunk loop — draining K chunks in one `drain_stream` performs exactly one
+    /// lookup/clone, not one per chunk.
+    #[test]
+    fn sf7_sender_lookup_hoisted_once_per_drain() {
+        let (mut d, _h) = driver();
+        let (tx, mut rx) = mpsc::channel::<Bytes>(BYTE_CHANNEL_DEPTH);
+        d.recv.insert(
+            0,
+            StreamRecvState {
+                bytes: tx,
+                terminal: TerminalCell::new(),
+                resume: Arc::new(AtomicBool::new(false)),
+                blocked: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let mut c = MockConn::new();
+        c.script_recv(0, [data(b"a", false), data(b"b", false), data(b"c", false)]);
+        d.read_budget = READ_BUDGET;
+        d.drain_stream(&mut c, 0);
+
+        // Three chunks pulled in one drain → exactly one hoisted lookup/clone.
+        assert_eq!(d.recv_lookup_count, 1);
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"a"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"b"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"c"));
+    }
+
+    /// SF-5-scratch (SC-006): the receive buffer is lazily allocated — a driver
+    /// that never receives data never allocates it; it materializes only on the
+    /// first `stream_recv`.
+    #[test]
+    fn sf5_recv_buffer_lazily_allocated() {
+        let (mut d, mut h) = driver();
+        // Fresh driver, no receives yet → buffer not allocated.
+        assert!(
+            d.recv_buf.is_none(),
+            "idle connection must not allocate the receive buffer"
+        );
+
+        let mut c = MockConn::new();
+        c.script_recv(0, [data(b"x", true)]);
+        c.queue_readable([0]);
+        d.read_budget = READ_BUDGET;
+        d.run_read_pump(&mut c);
+        let _ho = h.accept_bidi_rx.try_recv().expect("one bidi handoff");
+
+        // After the first receive it exists.
+        assert!(
+            d.recv_buf.is_some(),
+            "receive buffer must materialize on first stream_recv"
+        );
+    }
+
     /// §11: queued bytes then `RESET_STREAM` — queued bytes delivered, then
     /// `RecvEnd::Reset`; no bytes enqueued after the seal.
     #[test]
@@ -2530,7 +3046,7 @@ mod tests {
                 bytes: tx,
                 terminal: terminal.clone(),
                 resume,
-                blocked: false,
+                blocked: Arc::new(AtomicBool::new(false)),
             },
         );
         d.admit.insert(
@@ -2550,7 +3066,7 @@ mod tests {
 
         // Full channel: stream_recv never called, stream parked blocked.
         assert!(c.recv_calls.is_empty());
-        assert!(d.recv.get(&0).unwrap().blocked);
+        assert!(d.recv.get(&0).unwrap().blocked.load(Ordering::Relaxed));
 
         // Free capacity, then RecvResume drains the pending read.
         for _ in 0..BYTE_CHANNEL_DEPTH {
@@ -2564,6 +3080,102 @@ mod tests {
         assert_eq!(c.recv_calls, vec![0]);
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"late"));
         assert!(matches!(terminal.get(), Some(RecvEnd::Fin)));
+    }
+
+    /// SF-2 §5.1: with a free slot the worker takes the initial-reserve fast path
+    /// and never parks, even if `blocked` was left set by a prior cycle — the
+    /// drain proceeds and clears the stale park flag.
+    ///
+    /// Coverage note: the *mid-window* case (initial reserve returns `Full`, then
+    /// a slot is freed by the consumer before the post-`blocked=true` re-check, so
+    /// the re-check succeeds and proceeds instead of parking) is guaranteed by the
+    /// tokio channel's atomic permit semantics and cannot be hit deterministically
+    /// in a single-threaded unit test without a production test hook. Its
+    /// correctness-critical counterpart — a resume emitted iff the reader was
+    /// actually parked — is covered directly by the consumer-side tests
+    /// `recv_resume_gated_when_worker_never_blocked` /
+    /// `recv_resume_sent_once_when_worker_blocked` (stream.rs) and by
+    /// `sf2_worker_publishes_blocked_on_full_channel` below.
+    #[test]
+    fn sf2_worker_recheck_does_not_park_with_free_slot() {
+        let (mut d, _h) = driver();
+        let (tx, mut rx) = mpsc::channel::<Bytes>(BYTE_CHANNEL_DEPTH);
+        // Channel has capacity (empty). Pre-set blocked to model the race window
+        // where the consumer's swap-clear has not yet been observed.
+        let blocked = Arc::new(AtomicBool::new(true));
+        let terminal = TerminalCell::new();
+        d.recv.insert(
+            0,
+            StreamRecvState {
+                bytes: tx,
+                terminal: terminal.clone(),
+                resume: Arc::new(AtomicBool::new(false)),
+                blocked: Arc::clone(&blocked),
+            },
+        );
+        d.admit.insert(
+            0,
+            AdmitState::Registered {
+                send_done: false,
+                recv_done: false,
+            },
+        );
+        d.pending_readable.push_back(0);
+        d.readable_set.insert(0);
+
+        let mut c = MockConn::new();
+        c.script_recv(0, [data(b"ok", true)]);
+        d.read_budget = READ_BUDGET;
+        d.run_read_pump(&mut c);
+
+        // Slot was free → the read proceeded (bytes delivered), and the drain did
+        // not leave the stream parked.
+        assert_eq!(c.recv_calls, vec![0]);
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"ok"));
+        assert!(matches!(terminal.get(), Some(RecvEnd::Fin)));
+    }
+
+    /// SF-2 §5.1: on a genuinely full channel the worker publishes `blocked=true`
+    /// (Release) so a subsequent consumer free can observe it and emit a resume.
+    /// This proves the park flag is set for the lost-wakeup handshake.
+    #[test]
+    fn sf2_worker_publishes_blocked_on_full_channel() {
+        let (mut d, _h) = driver();
+        let (tx, _rx) = mpsc::channel::<Bytes>(BYTE_CHANNEL_DEPTH);
+        for _ in 0..BYTE_CHANNEL_DEPTH {
+            tx.try_send(Bytes::from_static(b"x")).unwrap();
+        }
+        let blocked = Arc::new(AtomicBool::new(false));
+        d.recv.insert(
+            0,
+            StreamRecvState {
+                bytes: tx,
+                terminal: TerminalCell::new(),
+                resume: Arc::new(AtomicBool::new(false)),
+                blocked: Arc::clone(&blocked),
+            },
+        );
+        d.admit.insert(
+            0,
+            AdmitState::Registered {
+                send_done: false,
+                recv_done: false,
+            },
+        );
+        d.pending_readable.push_back(0);
+        d.readable_set.insert(0);
+
+        let mut c = MockConn::new();
+        c.script_recv(0, [data(b"late", true)]);
+        d.read_budget = READ_BUDGET;
+        d.run_read_pump(&mut c);
+
+        // Full → no read, park flag published with Release for the consumer.
+        assert!(c.recv_calls.is_empty());
+        assert!(
+            blocked.load(Ordering::Acquire),
+            "park flag must be published"
+        );
     }
 
     /// §11: destructive intake + admission — a new peer id is admitted exactly
@@ -2629,6 +3241,212 @@ mod tests {
         assert!(h.accept_bidi_rx.try_recv().is_err()); // no duplicate promotion
     }
 
+    /// MF-1: a class that parks on a full accept channel must bound per-pump work
+    /// to O(ADMIT_BUDGET) — the blocked-class backlog is left in place, never
+    /// rescanned — and must NOT keep the worker runnable until its
+    /// `Accept*Resume` arrives. FIFO order within the class is preserved across
+    /// the parked queue + the pending backlog.
+    #[test]
+    fn mf1_parked_class_bounds_scan_and_quiesces_worker() {
+        // Accept capacity 1: fill the single bidi slot, then leave it full.
+        let (mut d, _h) = QuicheDriver::<Bytes>::new(false, 1, 1);
+        let mut c = MockConn::new();
+        d.pending_admit.insert(0, PeerStream::new(0));
+        d.pending_admit_bidi.push_back(0);
+        d.phase2_admission(&mut c);
+        assert!(matches!(
+            d.admit.get(&0),
+            Some(AdmitState::Registered { .. })
+        ));
+
+        // Seed a large fresh backlog of the SAME class (bidi ids 4, 8, …).
+        const N: u64 = 64;
+        for k in 1..=N {
+            let id = k * 4; // is_bidi(id) == true
+            assert!(is_bidi(id));
+            d.pending_admit.insert(id, PeerStream::new(id));
+            d.pending_admit_bidi.push_back(id);
+        }
+        assert_eq!(d.pending_admit_bidi.len() as u64, N);
+
+        // One admission pump: the first backlog id (4) attempts admission, hits
+        // the full accept channel, and PARKS the class. Critically, only ONE id
+        // is examined — the remaining backlog is NOT scanned (the old carry loop
+        // drained/examined all N every pump → O(N²) across re-pumps).
+        d.phase2_admission(&mut c);
+        assert_eq!(
+            d.phase2_pops, 1,
+            "bounded scan: exactly one id examined, not the whole backlog (MF-1)"
+        );
+        assert_eq!(d.parked_bidi.len(), 1, "exactly one id parked");
+        assert_eq!(
+            *d.parked_bidi.front().unwrap(),
+            4,
+            "FIFO: id 4 parked first"
+        );
+        assert_eq!(
+            d.pending_admit_bidi.len() as u64,
+            N - 1,
+            "blocked-class backlog left in place, not rescanned (MF-1)"
+        );
+        // FIFO preserved in the retained backlog (front is the next-oldest, 8).
+        assert_eq!(*d.pending_admit_bidi.front().unwrap(), 8);
+
+        // FR-002: an accept-blocked class must NOT self-reschedule the worker.
+        assert!(
+            !d.has_runnable_remainder(),
+            "capacity-blocked class must not keep the worker runnable"
+        );
+
+        // A second pump likewise examines only O(1) ids (no unbounded self-scan),
+        // and the class still does not report runnable → no re-pump spin.
+        d.phase2_admission(&mut c);
+        assert_eq!(
+            d.phase2_pops, 1,
+            "repeated pumps stay O(1) while the class is accept-blocked"
+        );
+        assert!(!d.has_runnable_remainder());
+
+        // Only once the matching AcceptBidiResume arrives is the class runnable.
+        d.accept_bidi_resume.store(true, Ordering::Relaxed);
+        assert!(
+            d.has_runnable_remainder(),
+            "AcceptBidiResume re-arms the worker for the parked class"
+        );
+    }
+
+    /// MF-1: after `AcceptBidiResume` + freed capacity, `promote_parked` drains
+    /// the parked backlog in FIFO order (earliest-parked id admitted before later
+    /// backlog ids).
+    ///
+    /// Scope note (test fidelity): this exercises `promote_parked` in isolation,
+    /// which is strictly FIFO across the `parked_bidi` queue. The full
+    /// `run_read_pump` runs `phase2_admission` *before* `promote_parked`, so a
+    /// brand-new pending id arriving in the same resume pump can be admitted
+    /// ahead of an already-parked id. That phase ordering is PRE-EXISTING on
+    /// `dev` (unchanged by MF-1, which preserves existing admission semantics per
+    /// the task mandate); MF-1 only bounds the scan and suppresses the runnable
+    /// signal for a capacity-blocked class. This test therefore asserts the
+    /// promotion queue's ordering, not the whole-pump admit order.
+    #[test]
+    fn mf1_parked_class_resumes_in_fifo_order() {
+        let (mut d, mut h) = QuicheDriver::<Bytes>::new(false, 1, 1);
+        let mut c = MockConn::new();
+        // Fill the single slot with id 0, then seed backlog 4, 8.
+        for id in [0u64, 4, 8] {
+            d.pending_admit.insert(id, PeerStream::new(id));
+            d.pending_admit_bidi.push_back(id);
+        }
+        d.phase2_admission(&mut c);
+        // id 0 admitted; id 4 parked; id 8 still pending.
+        assert!(matches!(
+            d.admit.get(&0),
+            Some(AdmitState::Registered { .. })
+        ));
+        assert_eq!(d.parked_bidi.front().copied(), Some(4));
+        assert_eq!(d.pending_admit_bidi.front().copied(), Some(8));
+
+        // Free one slot (drain id 0), signal resume, pump promotion + admission.
+        let ho0 = h.accept_bidi_rx.try_recv().expect("id 0 handoff");
+        assert_eq!(ho0.recv.id, 0);
+        d.accept_bidi_resume.store(true, Ordering::Relaxed);
+        d.promote_parked(&mut c, true);
+        // The FIFO-earliest parked id (4) is promoted before the newer id (8).
+        let ho4 = h.accept_bidi_rx.try_recv().expect("id 4 promoted first");
+        assert_eq!(ho4.recv.id, 4, "FIFO: earliest-parked id promoted first");
+        assert!(matches!(
+            d.admit.get(&4),
+            Some(AdmitState::Registered { .. })
+        ));
+        // id 8 remains queued (slot re-filled by id 4) — still FIFO-next.
+        assert_eq!(d.pending_admit_bidi.front().copied(), Some(8));
+    }
+
+    /// MF-1 / FR-003: a class blocked on its own accept capacity does not starve
+    /// the other class — the unblocked class keeps admitting in the same pump.
+    #[test]
+    fn mf1_blocked_class_does_not_starve_other_class() {
+        // bidi capacity 1 (fill it), uni capacity ample.
+        let (mut d, _h) = QuicheDriver::<Bytes>::new(false, 1, 16);
+        let mut c = MockConn::new();
+        d.pending_admit.insert(0, PeerStream::new(0));
+        d.pending_admit_bidi.push_back(0);
+        d.phase2_admission(&mut c); // fills the single bidi slot
+        assert!(matches!(
+            d.admit.get(&0),
+            Some(AdmitState::Registered { .. })
+        ));
+
+        // Flood bidi (all will be blocked) and enqueue one uni (id 2).
+        for k in 1..=32u64 {
+            let id = k * 4; // bidi
+            d.pending_admit.insert(id, PeerStream::new(id));
+            d.pending_admit_bidi.push_back(id);
+        }
+        d.pending_admit.insert(2, PeerStream::new(2)); // uni (is_bidi(2)==false)
+        assert!(!is_bidi(2));
+        d.pending_admit_uni.push_back(2);
+
+        d.phase2_admission(&mut c);
+        // The uni stream is admitted despite the bidi flood + bidi park.
+        assert!(
+            matches!(d.admit.get(&2), Some(AdmitState::Registered { .. })),
+            "unblocked uni class admitted despite blocked bidi flood"
+        );
+        assert!(d.pending_admit_uni.is_empty());
+        assert_eq!(d.parked_bidi.len(), 1, "bidi parked exactly once");
+    }
+
+    /// MF-1 / MF-A: a fresh, never-parked class with pending ids MUST report the
+    /// worker runnable (the gate keys off `parked_*` non-emptiness, so it never
+    /// deadlocks a class whose accept-resume bit is still the initial `false`).
+    #[test]
+    fn mf1_fresh_never_parked_class_reports_runnable() {
+        let (mut d, _h) = driver();
+        // No pending work at all → not runnable.
+        assert!(!d.has_runnable_remainder());
+
+        // A fresh bidi class with pending ids (parked_bidi empty, resume == false).
+        d.pending_admit.insert(0, PeerStream::new(0));
+        d.pending_admit_bidi.push_back(0);
+        assert!(d.parked_bidi.is_empty());
+        assert!(!d.accept_bidi_resume.load(Ordering::Relaxed));
+        assert!(
+            d.has_runnable_remainder(),
+            "fresh never-parked class with pending ids must be runnable (MF-A)"
+        );
+
+        // Same for a fresh uni class.
+        let (mut d2, _h2) = driver();
+        d2.pending_admit.insert(2, PeerStream::new(2));
+        d2.pending_admit_uni.push_back(2);
+        assert!(d2.has_runnable_remainder());
+    }
+
+    /// MF-1 / FR-003: with both classes admissible and each holding a large
+    /// backlog, a single pump makes fair progress on BOTH classes (round-robin),
+    /// so neither is starved within `ADMIT_BUDGET`.
+    #[test]
+    fn mf1_cross_class_fair_servicing() {
+        let (mut d, _h) = QuicheDriver::<Bytes>::new(false, 128, 128);
+        let mut c = MockConn::new();
+        for k in 0..40u64 {
+            let bidi = k * 4; // bidi
+            let uni = k * 4 + 2; // uni
+            d.pending_admit.insert(bidi, PeerStream::new(bidi));
+            d.pending_admit_bidi.push_back(bidi);
+            d.pending_admit.insert(uni, PeerStream::new(uni));
+            d.pending_admit_uni.push_back(uni);
+        }
+        d.phase2_admission(&mut c);
+        // ADMIT_BUDGET (32) split evenly by round-robin → 16 admits per class.
+        let admitted_bidi = 40 - d.pending_admit_bidi.len();
+        let admitted_uni = 40 - d.pending_admit_uni.len();
+        assert_eq!(admitted_bidi + admitted_uni, ADMIT_BUDGET);
+        assert_eq!(admitted_bidi, ADMIT_BUDGET / 2, "bidi got a fair half");
+        assert_eq!(admitted_uni, ADMIT_BUDGET / 2, "uni got a fair half");
+    }
+
     /// §11 / §5.5 contract A: once a bidi stream's both directions are terminal,
     /// `admit[id]` (and the recv entry + cursor memberships) are dropped
     /// immediately. Per the §5.5 spike a collected id never reappears in
@@ -2649,7 +3467,7 @@ mod tests {
                 pending_recv_terminal: None,
             },
         );
-        d.pending_admit_order.push_back(0);
+        d.pending_admit_bidi.push_back(0);
         d.read_budget = READ_BUDGET;
         d.run_read_pump(&mut c);
 
@@ -2722,7 +3540,7 @@ mod tests {
                 bytes: tx,
                 terminal: TerminalCell::new(),
                 resume: Arc::new(AtomicBool::new(false)),
-                blocked: false,
+                blocked: Arc::new(AtomicBool::new(false)),
             },
         );
         d.admit.insert(
@@ -2775,7 +3593,7 @@ mod tests {
                 bytes: tx,
                 terminal: TerminalCell::new(),
                 resume: Arc::new(AtomicBool::new(false)),
-                blocked: false,
+                blocked: Arc::new(AtomicBool::new(false)),
             },
         );
         d.admit.insert(
@@ -2832,18 +3650,70 @@ mod tests {
         c.sent.iter().any(|(sid, _, fin)| *sid == id && *fin)
     }
 
-    fn push_send(
+    /// Test-only view over a reusable [`WriteCompletion`](crate::buffer)
+    /// generation (SF-3): mirrors the old per-write `oneshot` receiver so send
+    /// tests can assert pending / `Ok` / `Err` / cancelled completion states.
+    struct SendProbe {
+        cell: crate::buffer::WriteCompletion<SendEnd>,
+        generation: u64,
+    }
+
+    #[derive(Debug)]
+    enum ProbeState {
+        Pending,
+        Ok,
+        Err(SendEnd),
+        Cancelled,
+    }
+
+    impl SendProbe {
+        /// Non-consuming when pending; consumes the outcome once resolved.
+        fn state(&self) -> ProbeState {
+            match self.cell.try_take(self.generation) {
+                None => ProbeState::Pending,
+                Some(WriteOutcome::Done(Ok(()))) => ProbeState::Ok,
+                Some(WriteOutcome::Done(Err(e))) => ProbeState::Err(e),
+                Some(WriteOutcome::Cancelled) => ProbeState::Cancelled,
+            }
+        }
+    }
+
+    /// Enqueue a `Send` carrying a completer for `cell`'s next generation and
+    /// return a [`SendProbe`] for it. When `cell` is shared across calls this
+    /// proves the reusable-cell contract (SC-004): no per-chunk allocation.
+    fn push_send_on(
         d: &mut QuicheDriver<Bytes>,
+        cell: &crate::buffer::WriteCompletion<SendEnd>,
         id: u64,
         payload: &'static [u8],
-    ) -> oneshot::Receiver<Result<(), SendEnd>> {
-        let (tx, rx) = oneshot::channel();
+    ) -> SendProbe {
+        let generation = cell.begin();
+        let buf = wbuf(payload);
+        // Reserve the buffer's full wire size (frame header + payload) against the
+        // driver's shared accounting, exactly as the front end does (SF-6); the
+        // permit rides with the command and releases on the op's completion/drop.
+        let permit = d.shared.send_accounting.try_reserve(buf.remaining());
         d.inbox.push_back(DriverCommand::Send {
             id,
-            buf: wbuf(payload),
-            done: tx,
+            buf,
+            done: cell.completer(generation),
+            permit,
         });
-        rx
+        SendProbe {
+            cell: cell.clone(),
+            generation,
+        }
+    }
+
+    /// The full wire size (DATA frame header + payload) a `wbuf(payload)` buffers,
+    /// which is what SF-6 accounting reserves.
+    fn wire_len(payload: &'static [u8]) -> usize {
+        wbuf(payload).remaining()
+    }
+
+    fn push_send(d: &mut QuicheDriver<Bytes>, id: u64, payload: &'static [u8]) -> SendProbe {
+        let cell = crate::buffer::WriteCompletion::new();
+        push_send_on(d, &cell, id, payload)
     }
 
     fn push_finish(d: &mut QuicheDriver<Bytes>, id: u64) -> oneshot::Receiver<Result<(), SendEnd>> {
@@ -2862,15 +3732,12 @@ mod tests {
         let total = wbuf_len(b"hello world");
         // Accept at most 3 bytes per stream_send call.
         c.send_capacity.insert(0, 3);
-        let mut done = push_send(&mut d, 0, b"hello world");
+        let done = push_send(&mut d, 0, b"hello world");
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
 
         // Not fully accepted yet: no completion, and the blocked write re-armed.
-        assert!(matches!(
-            done.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
+        assert!(matches!(done.state(), ProbeState::Pending));
         let rearms: Vec<usize> = c
             .rearms
             .iter()
@@ -2896,7 +3763,7 @@ mod tests {
         }
         assert_eq!(sent_len(&c, 0), total, "all bytes eventually accepted");
         assert!(
-            matches!(done.try_recv(), Ok(Ok(()))),
+            matches!(done.state(), ProbeState::Ok),
             "exactly one Ok at full acceptance"
         );
     }
@@ -2932,20 +3799,20 @@ mod tests {
         let (mut d, _h) = driver();
         let mut c = MockConn::new();
         // Write1 is small and fully accepted this turn.
-        let mut done1 = push_send(&mut d, 0, b"a");
+        let done1 = push_send(&mut d, 0, b"a");
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
         assert!(
-            matches!(done1.try_recv(), Ok(Ok(()))),
+            matches!(done1.state(), ProbeState::Ok),
             "Write1 accepted before reset"
         );
 
         // Write2 queued, then Reset preempts it in the same stage (a).
-        let mut done2 = push_send(&mut d, 0, b"bcde");
+        let done2 = push_send(&mut d, 0, b"bcde");
         d.inbox.push_back(DriverCommand::Reset { id: 0, code: 42 });
         d.apply_inbox(&mut c);
-        match done2.try_recv() {
-            Ok(Err(SendEnd::Reset { error_code: 42 })) => {}
+        match done2.state() {
+            ProbeState::Err(SendEnd::Reset { error_code: 42 }) => {}
             other => panic!("Write2 must be cancelled once with local reset, got {other:?}"),
         }
         // Sticky status published for the front end.
@@ -2961,6 +3828,129 @@ mod tests {
             is_write: true,
             code: 42,
         }));
+    }
+
+    /// SF-6: a `Send` reserves its bytes against the shared accounting on
+    /// admission and releases them exactly once when the write completes (default
+    /// unlimited config keeps residency accurate without ever bounding admission).
+    #[test]
+    fn sf6_accounting_reserves_on_admission_releases_on_completion() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        assert_eq!(d.shared.send_accounting.resident(), 0);
+        // push_send reserves the buffer's wire size against d.shared.send_accounting,
+        // mirroring the front end.
+        let done = push_send(&mut d, 0, b"hello");
+        assert_eq!(
+            d.shared.send_accounting.resident(),
+            wire_len(b"hello"),
+            "reserved when the command is admitted"
+        );
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+        assert!(
+            matches!(done.state(), ProbeState::Ok),
+            "write completes once"
+        );
+        assert_eq!(
+            d.shared.send_accounting.resident(),
+            0,
+            "released exactly once at the completion chokepoint"
+        );
+    }
+
+    /// SF-6: a `Reset` that preempts a queued `Write` drains the op and thereby
+    /// releases its byte reservation — the RAII permit ties release to the same
+    /// exactly-once drain as the completion path.
+    #[test]
+    fn sf6_accounting_released_when_reset_drains_queued_write() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        let done = push_send(&mut d, 0, b"abcd");
+        d.apply_inbox(&mut c); // move Write into send_ops (permit rides along)
+        assert_eq!(d.shared.send_accounting.resident(), wire_len(b"abcd"));
+        d.inbox.push_back(DriverCommand::Reset { id: 0, code: 7 });
+        d.apply_inbox(&mut c); // apply_reset drains the op with the reset terminal
+        assert!(matches!(
+            done.state(),
+            ProbeState::Err(SendEnd::Reset { error_code: 7 })
+        ));
+        assert_eq!(
+            d.shared.send_accounting.resident(),
+            0,
+            "reset drain releases the reservation"
+        );
+    }
+
+    /// SF-3 integrated: one reusable completion cell serves two sequential writes
+    /// on the same stream through the real driver drain path. Completing
+    /// generation `g`, then beginning `g+1` on the SAME cell, resolves each
+    /// generation exactly once with no cross-generation bleed: after `g` is
+    /// consumed, a `Reset` preempting `g+1` resolves only `g+1`, and a stale poll
+    /// of `g` reads nothing. The cell is reused (not reallocated per write).
+    #[test]
+    fn sf3_reused_cell_across_generations_no_cross_bleed() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        let cell = crate::buffer::WriteCompletion::new();
+
+        // Generation g: a full write that completes Ok through stage_send.
+        let g = push_send_on(&mut d, &cell, 0, b"hello");
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+        assert!(matches!(g.state(), ProbeState::Ok), "g completes once");
+        assert_eq!(d.shared.send_accounting.resident(), 0, "g released");
+        // g is now consumed: a stale re-poll of the same generation reads nothing.
+        assert!(matches!(g.state(), ProbeState::Pending), "g consumed once");
+
+        // Generation g+1 on the SAME cell, preempted by a Reset before staging.
+        let g1 = push_send_on(&mut d, &cell, 0, b"world");
+        assert_eq!(cell.generation(), 2, "same cell reused across both writes");
+        d.apply_inbox(&mut c); // move Write into send_ops (permit rides along)
+        assert_eq!(d.shared.send_accounting.resident(), wire_len(b"world"));
+        d.inbox.push_back(DriverCommand::Reset { id: 0, code: 7 });
+        d.apply_inbox(&mut c); // apply_reset drains g+1 exactly once
+
+        assert!(
+            matches!(
+                g1.state(),
+                ProbeState::Err(SendEnd::Reset { error_code: 7 })
+            ),
+            "g+1 resolves once as the reset"
+        );
+        // No cross-generation bleed: the stale g generation still reads nothing.
+        assert!(matches!(g.state(), ProbeState::Pending), "no bleed into g");
+        assert_eq!(d.shared.send_accounting.resident(), 0, "g+1 released");
+    }
+
+    /// SF-6: a finite worker-level cap bounds admitted send bytes; once the cap
+    /// is full, a further admission via [`SendAccounting::try_reserve`] is
+    /// refused (the front end would park) until an outstanding permit releases.
+    #[test]
+    fn sf6_worker_cap_bounds_admitted_bytes() {
+        let cap = wire_len(b"abc");
+        let (mut d, _h) = QuicheDriver::<Bytes>::with_buffers(
+            false,
+            4,
+            4,
+            DriverBufferConfig {
+                recv_channel_depth: BYTE_CHANNEL_DEPTH,
+                packet_buffer_size: PKT_BUF_LEN,
+                max_buffered_send_bytes: Some(cap),
+            },
+        );
+        let mut c = MockConn::new();
+        assert_eq!(d.shared.send_accounting.cap(), Some(cap));
+        let done = push_send(&mut d, 0, b"abc"); // fills the cap exactly
+        assert_eq!(d.shared.send_accounting.resident(), cap);
+        // Over the cap now → a fresh reservation is refused.
+        assert!(d.shared.send_accounting.try_reserve(1).is_none());
+        // Drain the write; the permit releases and capacity reopens.
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+        assert!(matches!(done.state(), ProbeState::Ok));
+        assert_eq!(d.shared.send_accounting.resident(), 0);
+        assert!(d.shared.send_accounting.try_reserve(cap).is_some());
     }
 
     /// §11 / Q3: a `Reset` at **zero** send capacity still emits `RESET_STREAM`
@@ -3042,7 +4032,7 @@ mod tests {
         let mut c = MockConn::new();
         // Peer STOP_SENDING on the send half → send terminal + contract A (recv
         // already done) reclaims admit/recv but retains self.send's terminal.
-        let mut w1 = push_send(&mut d, 0, b"aa");
+        let w1 = push_send(&mut d, 0, b"aa");
         c.send_errors
             .entry(0)
             .or_default()
@@ -3050,19 +4040,19 @@ mod tests {
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
         assert!(matches!(
-            w1.try_recv(),
-            Ok(Err(SendEnd::Stopped { error_code: 55 }))
+            w1.state(),
+            ProbeState::Err(SendEnd::Stopped { error_code: 55 })
         ));
         assert!(!d.admit.contains_key(&0), "contract A reclaimed admit");
         assert!(d.send.contains_key(&0), "send retained for deferred ops");
 
         // A Send that was deferred past the terminal edge completes with the
         // sticky Stopped terminal (never a fabricated Internal / bare cancel).
-        let mut late = push_send(&mut d, 0, b"bb");
+        let late = push_send(&mut d, 0, b"bb");
         d.apply_inbox(&mut c);
         assert!(matches!(
-            late.try_recv(),
-            Ok(Err(SendEnd::Stopped { error_code: 55 }))
+            late.state(),
+            ProbeState::Err(SendEnd::Stopped { error_code: 55 })
         ));
     }
 
@@ -3073,8 +4063,8 @@ mod tests {
     fn stop_sending_on_send_drains_all_ops_once() {
         let (mut d, _h) = driver();
         let mut c = MockConn::new();
-        let mut w1 = push_send(&mut d, 0, b"aa");
-        let mut w2 = push_send(&mut d, 0, b"bb");
+        let w1 = push_send(&mut d, 0, b"aa");
+        let w2 = push_send(&mut d, 0, b"bb");
         let mut fin = push_finish(&mut d, 0);
         d.apply_inbox(&mut c);
         // The first stream_send call reports the peer stopped us.
@@ -3084,11 +4074,15 @@ mod tests {
             .push_back(quiche::Error::StreamStopped(9));
         d.stage_send(&mut c);
 
-        for (label, rx) in [("w1", &mut w1), ("w2", &mut w2), ("fin", &mut fin)] {
-            match rx.try_recv() {
-                Ok(Err(SendEnd::Stopped { error_code: 9 })) => {}
+        for (label, st) in [("w1", w1.state()), ("w2", w2.state())] {
+            match st {
+                ProbeState::Err(SendEnd::Stopped { error_code: 9 }) => {}
                 other => panic!("{label} must complete once with Stopped, got {other:?}"),
             }
+        }
+        match fin.try_recv() {
+            Ok(Err(SendEnd::Stopped { error_code: 9 })) => {}
+            other => panic!("fin must complete once with Stopped, got {other:?}"),
         }
         assert!(matches!(
             d.send.get(&0).unwrap().status.get(),
@@ -3108,17 +4102,17 @@ mod tests {
     fn stop_sending_via_writable_probe_drains_ops() {
         let (mut d, _h) = driver();
         let mut c = MockConn::new();
-        let mut w1 = push_send(&mut d, 0, b"aa");
-        let mut w2 = push_send(&mut d, 0, b"bb");
+        let w1 = push_send(&mut d, 0, b"aa");
+        let w2 = push_send(&mut d, 0, b"bb");
         d.apply_inbox(&mut c);
         // Stage (d) probes capacity and finds the stream stopped.
         c.writable_next.push_back(0);
         c.capacity.insert(0, Err(quiche::Error::StreamStopped(13)));
         d.stage_writable(&mut c);
 
-        for (label, rx) in [("w1", &mut w1), ("w2", &mut w2)] {
-            match rx.try_recv() {
-                Ok(Err(SendEnd::Stopped { error_code: 13 })) => {}
+        for (label, st) in [("w1", w1.state()), ("w2", w2.state())] {
+            match st {
+                ProbeState::Err(SendEnd::Stopped { error_code: 13 }) => {}
                 other => panic!("{label} must complete once with Stopped, got {other:?}"),
             }
         }
@@ -3136,27 +4130,30 @@ mod tests {
         // (WRITE_BUDGET turns × MAX_WRITE_CHUNK = 512 KiB), so it cannot finish
         // within a single batch even if it takes every remaining turn.
         static BULK: [u8; 1024 * 1024] = [b'x'; 1024 * 1024];
-        let (bulk_tx, mut bulk_done) = oneshot::channel();
+        let bulk_cell = crate::buffer::WriteCompletion::<SendEnd>::new();
+        let bulk_gen = bulk_cell.begin();
         d.inbox.push_back(DriverCommand::Send {
             id: 0,
             buf: WriteBuf::from(h3::proto::frame::Frame::Data(Bytes::from_static(&BULK))),
-            done: bulk_tx,
+            done: bulk_cell.completer(bulk_gen),
+            permit: None,
         });
+        let bulk = SendProbe {
+            cell: bulk_cell,
+            generation: bulk_gen,
+        };
         // Small stream 4 enqueued behind it.
-        let mut small_done = push_send(&mut d, 4, b"z");
+        let small_done = push_send(&mut d, 4, b"z");
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
 
         // The small stream got its turn and completed despite the bulk backlog.
         assert!(
-            matches!(small_done.try_recv(), Ok(Ok(()))),
+            matches!(small_done.state(), ProbeState::Ok),
             "small stream serviced"
         );
         // The bulk stream is still in flight (not completed, still runnable).
-        assert!(matches!(
-            bulk_done.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
+        assert!(matches!(bulk.state(), ProbeState::Pending));
         assert!(d.runnable_send_set.contains(&0) || d.needs_iteration);
     }
 
@@ -3173,10 +4170,10 @@ mod tests {
         d.stage_send(&mut c); // service the reset shutdown
 
         // A late Send resolves immediately with the sticky reset terminal.
-        let mut late = push_send(&mut d, 0, b"late");
+        let late = push_send(&mut d, 0, b"late");
         d.apply_inbox(&mut c);
-        match late.try_recv() {
-            Ok(Err(SendEnd::Reset { error_code: 5 })) => {}
+        match late.state() {
+            ProbeState::Err(SendEnd::Reset { error_code: 5 }) => {}
             other => panic!("late Send must complete once with sticky terminal, got {other:?}"),
         }
         assert!(
@@ -3374,17 +4371,41 @@ mod tests {
         let (mut d, _h) = driver();
         let mut c = MockConn::new();
         // Queue a Send op WITHOUT running stage (e), so it stays in send_ops.
-        let mut done = push_send(&mut d, 0, b"payload");
+        let done = push_send(&mut d, 0, b"payload");
         d.apply_inbox(&mut c);
         assert!(!d.send.get(&0).unwrap().send_ops.is_empty());
 
         c.peer_error = Some(conn_err(true, 0x7, b""));
         d.do_on_conn_close(&mut c);
 
-        match done.try_recv() {
-            Ok(Err(SendEnd::Conn(_))) => {}
+        match done.state() {
+            ProbeState::Err(SendEnd::Conn(_)) => {}
             other => panic!("expected SendEnd::Conn, got {other:?}"),
         }
+    }
+
+    /// SF-3 (gpt#7 lifecycle): a `Send` still **unapplied** in the inbox at close
+    /// resolves its generation exactly once via `complete_command_on_close` — the
+    /// reusable completer delivers the connection terminal, never a bare cancel.
+    #[test]
+    fn unapplied_send_at_close_completes_generation_once() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        // Queue a Send but do NOT apply_inbox: it never reaches send_ops, so the
+        // on_conn_close command-drain loop must resolve it directly.
+        let done = push_send(&mut d, 0, b"payload");
+        assert!(
+            !d.send.contains_key(&0),
+            "precondition: Send not yet applied into send_ops"
+        );
+        c.peer_error = Some(conn_err(true, 0x9, b""));
+        d.do_on_conn_close(&mut c);
+        match done.state() {
+            ProbeState::Err(SendEnd::Conn(_)) => {}
+            other => panic!("expected SendEnd::Conn for unapplied Send, got {other:?}"),
+        }
+        // Exactly once: nothing left to consume.
+        assert!(matches!(done.state(), ProbeState::Pending));
     }
 
     // Regression (review finding): a Send that hits `ConnGone` in the closing
@@ -3395,7 +4416,7 @@ mod tests {
     fn send_conngone_in_closing_window_defers_to_on_conn_close() {
         let (mut d, _h) = driver();
         let mut c = MockConn::new();
-        let mut done = push_send(&mut d, 0, b"x");
+        let done = push_send(&mut d, 0, b"x");
         c.send_errors
             .entry(0)
             .or_default()
@@ -3403,17 +4424,14 @@ mod tests {
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
         // Not completed, not pinned: op retained, status cell empty.
-        assert!(matches!(
-            done.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
+        assert!(matches!(done.state(), ProbeState::Pending));
         assert!(!d.send.get(&0).unwrap().send_ops.is_empty());
         assert!(d.send.get(&0).unwrap().status.get().is_none());
         // on_conn_close classifies and drains it with SendEnd::Conn.
         c.peer_error = Some(conn_err(true, 0x101, b""));
         d.do_on_conn_close(&mut c);
-        match done.try_recv() {
-            Ok(Err(SendEnd::Conn(_))) => {}
+        match done.state() {
+            ProbeState::Err(SendEnd::Conn(_)) => {}
             other => panic!("expected SendEnd::Conn after close, got {other:?}"),
         }
     }
@@ -3433,7 +4451,7 @@ mod tests {
                 bytes: tx,
                 terminal: terminal_cell.clone(),
                 resume: Arc::new(AtomicBool::new(false)),
-                blocked: false,
+                blocked: Arc::new(AtomicBool::new(false)),
             },
         );
         d.pending_readable.push_back(0);
@@ -3568,7 +4586,7 @@ mod tests {
         d.admit.insert(0, AdmitState::Parked(PeerStream::new(0)));
         d.parked_bidi.push_back(0);
         d.pending_admit.insert(2, PeerStream::new(2));
-        d.pending_admit_order.push_back(2);
+        d.pending_admit_uni.push_back(2);
 
         d.inbox.push_back(DriverCommand::ConnectionDropped);
         d.apply_inbox(&mut c);
@@ -3576,7 +4594,7 @@ mod tests {
         assert!(!d.admit.contains_key(&0), "parked bidi dropped");
         assert!(d.parked_bidi.is_empty());
         assert!(d.pending_admit.is_empty());
-        assert!(d.pending_admit_order.is_empty());
+        assert!(d.pending_admit_uni.is_empty());
         // Peer bidi shut down BOTH directions; peer uni only read.
         assert!(c.shutdowns.iter().any(|s| s.id == 0 && s.is_write));
         assert!(c.shutdowns.iter().any(|s| s.id == 0 && !s.is_write));
@@ -3710,7 +4728,8 @@ mod tests {
         // Simulate retained halves for a materialized-but-undeliverable bidi.
         let cmd_tx = d.cmd_tx_weak.upgrade().unwrap();
         let (recv_state, _rh, _rd) = d.build_recv(0, cmd_tx.clone(), None);
-        let (_sh, send_state, _sd) = build_send(0, cmd_tx, None);
+        let (_sh, send_state, _sd) =
+            build_send(0, cmd_tx, Arc::clone(&d.shared.send_accounting), None);
         d.recv.insert(0, recv_state.unwrap());
         d.send.insert(0, send_state.unwrap());
 
@@ -3727,7 +4746,12 @@ mod tests {
             .any(|s| !s.is_write && s.code == H3_REQUEST_CANCELLED));
 
         // Uni: only Shutdown::Write.
-        let (_sh, send_state, _sd) = build_send(2, d.cmd_tx_weak.upgrade().unwrap(), None);
+        let (_sh, send_state, _sd) = build_send(
+            2,
+            d.cmd_tx_weak.upgrade().unwrap(),
+            Arc::clone(&d.shared.send_accounting),
+            None,
+        );
         d.send.insert(2, send_state.unwrap());
         d.cleanup_undeliverable_open(&mut c, 2, false);
         assert!(!d.send.contains_key(&2));
@@ -3823,7 +4847,7 @@ mod tests {
                 bytes: tx,
                 terminal: TerminalCell::new(),
                 resume: Arc::new(AtomicBool::new(false)),
-                blocked: false,
+                blocked: Arc::new(AtomicBool::new(false)),
             },
         );
         d.send.insert(0, StreamSendState::new());

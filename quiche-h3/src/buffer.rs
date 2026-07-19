@@ -6,8 +6,10 @@
 //! to publish terminal reasons to synchronous `h3::quic` `poll_*` methods.
 #![allow(dead_code)] // wired up incrementally across Phases 2–8
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use bytes::Buf;
 use futures::task::AtomicWaker;
@@ -143,6 +145,372 @@ impl<T: Clone> TerminalCell<T> {
     }
 }
 
+/// The outcome of a single outstanding write, as observed by the front-end
+/// [`H3SendStream`](crate::stream::H3SendStream) (SF-3). Mirrors the two ways a
+/// per-write `oneshot` used to resolve: a delivered `Result` (worker completed
+/// the op) or `Cancelled` (the carrier dropped without completing — e.g. an
+/// unapplied `Send` at connection close, matching `oneshot::Sender`'s drop).
+#[cfg_attr(test, derive(Debug))]
+pub(crate) enum WriteOutcome<E> {
+    /// The worker resolved the write with a concrete result.
+    Done(Result<(), E>),
+    /// The completion carrier was dropped without completing; the front end
+    /// resolves through its sticky terminal instead (never a bare cancel).
+    Cancelled,
+}
+
+/// A per-stream, **reusable** write-completion cell (SF-3). Replaces the
+/// per-write `oneshot` so K sequential writes on one stream reuse a single
+/// `Arc`-shared cell (a refcount bump per write) instead of heap-allocating a
+/// channel per chunk.
+///
+/// Reuse across writes is made safe by a **generation counter** with
+/// **set-if-current-generation** completion (synthesis MF-B). [`TerminalCell`]'s
+/// exactly-once safety derives precisely from *never resetting*, so it is the
+/// wrong template for a cell that must be reused; a reused cell reintroduces a
+/// worker-set ↔ front-end-reset race unless synchronized. Here:
+///
+/// - Each new write [`begin`](WriteCompletion::begin)s a fresh generation and
+///   clears any stale slot; the generation is stamped into the enqueued op.
+/// - The worker completes through a [`WriteCompleter`] whose
+///   [`set_if_current`](WriteCompletion::set_if_current) only stores when the
+///   op's stamped generation still matches the cell's current generation, so a
+///   stale/superseded completion is a no-op rather than clobbering the next
+///   write's slot.
+/// - The front end consumes the completion for its generation exactly once via
+///   [`poll`](WriteCompletion::poll) (which empties the slot), then `begin`s the
+///   next generation.
+///
+/// The single-outstanding-write-per-stream contract (h3's `send_data`↔
+/// `poll_ready` handshake) guarantees at most one in-flight generation, so reset
+/// and worker-set never target the same generation concurrently, and exactly-once
+/// holds *per generation*.
+pub(crate) struct WriteCompletion<E> {
+    inner: Arc<WriteCompletionInner<E>>,
+}
+
+struct WriteCompletionInner<E> {
+    /// The cell's current generation. Bumped by the front end before each write.
+    generation: AtomicU64,
+    /// `(generation, outcome)` for the completion, if one has been stored. The
+    /// paired generation lets the front end reject a stale slot defensively.
+    slot: Mutex<Option<(u64, WriteOutcome<E>)>>,
+    waker: AtomicWaker,
+}
+
+impl<E> Clone for WriteCompletion<E> {
+    fn clone(&self) -> Self {
+        WriteCompletion {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<E> Default for WriteCompletion<E> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<E> WriteCompletion<E> {
+    pub(crate) fn new() -> Self {
+        WriteCompletion {
+            inner: Arc::new(WriteCompletionInner {
+                generation: AtomicU64::new(0),
+                slot: Mutex::new(None),
+                waker: AtomicWaker::new(),
+            }),
+        }
+    }
+
+    /// Front end: begin a new write. Advances to a fresh generation, clears any
+    /// stale slot, and returns the new generation to stamp into the enqueued op.
+    /// Safe to clear here because the single-outstanding-write contract
+    /// guarantees the prior generation's completion was already consumed by
+    /// [`poll`](WriteCompletion::poll).
+    pub(crate) fn begin(&self) -> u64 {
+        let generation = self.inner.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        *self.inner.slot.lock().expect("WriteCompletion poisoned") = None;
+        generation
+    }
+
+    /// Build a one-shot [`WriteCompleter`] for `generation`, to hand to the
+    /// worker in the enqueued op. Dropping it without completing signals
+    /// [`WriteOutcome::Cancelled`] (mirroring `oneshot::Sender`'s drop).
+    pub(crate) fn completer(&self, generation: u64) -> WriteCompleter<E> {
+        WriteCompleter {
+            cell: self.clone(),
+            generation,
+            completed: false,
+        }
+    }
+
+    /// Worker: store `outcome` for `generation`, but only if it is still the
+    /// current generation and the slot is empty (set-if-current-generation). A
+    /// stale/superseded or duplicate completion is dropped. Wakes the front end
+    /// when a value is installed.
+    fn set_if_current(&self, generation: u64, outcome: WriteOutcome<E>) {
+        {
+            let mut slot = self.inner.slot.lock().expect("WriteCompletion poisoned");
+            if self.inner.generation.load(Ordering::Acquire) != generation || slot.is_some() {
+                return; // stale generation or already completed: no-op, no wake
+            }
+            *slot = Some((generation, outcome));
+        }
+        self.inner.waker.wake();
+    }
+
+    /// Front end: race-free poll for `generation`'s completion. Registers the
+    /// waker, then reads the slot; a value for a matching generation is taken
+    /// (consumed) exactly once. A slot bearing a different generation is ignored
+    /// (defensive — the single-outstanding contract makes this unreachable).
+    pub(crate) fn poll(&self, generation: u64, cx: &mut Context<'_>) -> Poll<WriteOutcome<E>> {
+        self.inner.waker.register(cx.waker());
+        let mut slot = self.inner.slot.lock().expect("WriteCompletion poisoned");
+        if matches!(slot.as_ref(), Some((g, _)) if *g == generation) {
+            let (_, outcome) = slot.take().expect("slot just matched");
+            return Poll::Ready(outcome);
+        }
+        Poll::Pending
+    }
+
+    /// Test-only: non-registering take of a completed outcome for `generation`.
+    #[cfg(test)]
+    pub(crate) fn try_take(&self, generation: u64) -> Option<WriteOutcome<E>> {
+        let mut slot = self.inner.slot.lock().expect("WriteCompletion poisoned");
+        if matches!(slot.as_ref(), Some((g, _)) if *g == generation) {
+            return Some(slot.take().expect("slot just matched").1);
+        }
+        None
+    }
+
+    /// Test-only: the cell's current generation (advances once per `begin`).
+    /// A single cell reused for K writes ends at generation K (SF-3 / SC-004).
+    #[cfg(test)]
+    pub(crate) fn generation(&self) -> u64 {
+        self.inner.generation.load(Ordering::Acquire)
+    }
+
+    /// Test-only: identity check proving two handles share the *same* underlying
+    /// cell (no per-write allocation) rather than merely being equal.
+    #[cfg(test)]
+    pub(crate) fn same_cell(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+/// Worker-side one-shot completion carrier for one generation of a
+/// [`WriteCompletion`] (SF-3). Carries an `Arc` clone of the cell plus the
+/// stamped generation. [`complete`](WriteCompleter::complete) resolves the write;
+/// dropping it without completing signals [`WriteOutcome::Cancelled`] so an
+/// unapplied/dropped `Send` never hangs the front end (matching the old
+/// `oneshot::Sender` drop semantics). Both paths honor set-if-current-generation,
+/// so a stale carrier for a superseded generation is a no-op.
+pub(crate) struct WriteCompleter<E> {
+    cell: WriteCompletion<E>,
+    generation: u64,
+    completed: bool,
+}
+
+impl<E> WriteCompleter<E> {
+    /// Resolve the write with `result`, exactly once for this generation.
+    pub(crate) fn complete(mut self, result: Result<(), E>) {
+        self.cell
+            .set_if_current(self.generation, WriteOutcome::Done(result));
+        self.completed = true;
+    }
+}
+
+impl<E> Drop for WriteCompleter<E> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.cell
+                .set_if_current(self.generation, WriteOutcome::Cancelled);
+        }
+    }
+}
+
+/// Aggregate buffered-send-byte accounting with an optional finite cap (SF-6,
+/// FR-010/FR-011, §12 S3). Bounds the total bytes resident in the unbounded
+/// command channel / per-stream `SendOp` queues so a slow/stalled peer cannot
+/// drive send-side memory without limit.
+///
+/// The accounting domain is **admitted** bytes only — a byte enters residency
+/// when the front end reserves it just before enqueuing a `Send` command, and
+/// leaves when the carrying [`SendBytesPermit`] drops (the SF-3 completion
+/// chokepoint: write completion, terminal drain, unapplied-close, or enqueue
+/// rollback). The front-end per-stream `stash` is **excluded** — it is a single
+/// not-yet-admitted `WriteBuf` bounded by the h3 single-outstanding-write
+/// contract, not aggregate buffering.
+///
+/// `cap == None` (the default) means unlimited: `try_reserve` always succeeds
+/// and no admission ever parks, so behavior is byte-for-byte unchanged from
+/// before SF-6 apart from one atomic reserve/release pair per write (plus one
+/// uncontended waiter-lock acquisition per release that drains an always-empty
+/// waiter list — no task ever parks). A finite cap bounds
+/// residency to at most `cap + one admission unit` (the oversize/`cap == 0`
+/// exception below guarantees forward progress).
+pub(crate) struct SendAccounting {
+    /// Resident admitted buffered send bytes.
+    resident: AtomicUsize,
+    /// Optional finite cap. `None` = unlimited (default; behavior unchanged).
+    cap: Option<usize>,
+    /// Parked admissions waiting for residency to drop under the cap, keyed by
+    /// stream id so each parked sender has at most one entry and a re-poll
+    /// **replaces** its (possibly stale) waker rather than appending. A dropped
+    /// or admitted sender unregisters its entry, so the cap guard cannot itself
+    /// accumulate unbounded waker memory under a stalled peer + stream churn
+    /// (SH-E). A single [`AtomicWaker`] would instead drop other stalled
+    /// streams' wakers, so a keyed multi-waiter map is required.
+    ///
+    /// `tokio::sync::Notify` is deliberately **not** used here: its `Notified`
+    /// future borrows the `Notify` and must be held across polls to stay
+    /// registered, which is infeasible inside the synchronous `poll_ready`
+    /// (§12 S3 trade-off note). The map is touched **only** when a finite cap is
+    /// configured; the default (`cap == None`) path never locks it.
+    waiters: Mutex<HashMap<u64, Waker>>,
+}
+
+impl SendAccounting {
+    /// Create shared accounting with an optional finite `cap`.
+    pub(crate) fn new(cap: Option<usize>) -> Arc<Self> {
+        Arc::new(SendAccounting {
+            resident: AtomicUsize::new(0),
+            cap,
+            waiters: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Currently resident admitted send bytes (inspection / tests).
+    pub(crate) fn resident(&self) -> usize {
+        self.resident.load(Ordering::Acquire)
+    }
+
+    /// The configured cap, if finite.
+    pub(crate) fn cap(&self) -> Option<usize> {
+        self.cap
+    }
+
+    /// Try to admit `bytes`. Reserves atomically iff the new residency fits
+    /// under the cap, **or** if nothing is currently resident — the
+    /// one-in-flight-unit exception that lets an oversize buffer (or a `cap == 0`
+    /// configuration) still make progress, preserving liveness. Returns a
+    /// [`SendBytesPermit`] whose `Drop` releases the reservation exactly once.
+    ///
+    /// Unlimited (`cap == None`) always succeeds. `bytes == 0` always succeeds
+    /// with a zero-cost permit.
+    pub(crate) fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<SendBytesPermit> {
+        let outcome = self
+            .resident
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                let next = cur.checked_add(bytes)?;
+                match self.cap {
+                    // Over cap, and something is already resident: reject and let
+                    // the caller park until a permit drops. A zero-byte
+                    // reservation (`bytes == 0`) adds nothing and MUST always
+                    // succeed per the contract above — never park a 0-byte write
+                    // behind the cap (it can't reduce residency and would stall
+                    // needlessly while residency sits above the cap under the
+                    // one-in-flight-unit exception).
+                    Some(cap) if bytes > 0 && next > cap && cur != 0 => None,
+                    _ => Some(next),
+                }
+            });
+        match outcome {
+            Ok(_) => Some(SendBytesPermit {
+                accounting: Arc::clone(self),
+                bytes,
+            }),
+            Err(_) => None,
+        }
+    }
+
+    /// Register `waker` for parked stream `id` to be woken when residency next
+    /// drops (keyed multi-waiter). Callers MUST register *before* the final
+    /// over-cap re-check so a release racing between check and park cannot be
+    /// missed (SF-2 discipline, N-1). A re-poll replaces the prior waker for the
+    /// same `id`; `will_wake` skips a redundant clone. No-op under `cap == None`
+    /// (admission never parks, so nothing ever registers).
+    pub(crate) fn register_waiter(&self, id: u64, waker: &Waker) {
+        if self.cap.is_none() {
+            return;
+        }
+        let mut waiters = self.waiters.lock().expect("send-accounting waiters lock");
+        match waiters.get(&id) {
+            Some(existing) if existing.will_wake(waker) => {}
+            _ => {
+                waiters.insert(id, waker.clone());
+            }
+        }
+    }
+
+    /// Remove stream `id`'s parked-admission waker (on successful admission or on
+    /// `H3SendStream` drop) so a cancelled/admitted sender does not retain a
+    /// waker until the next release. Idempotent; no-op under `cap == None`.
+    pub(crate) fn unregister_waiter(&self, id: u64) {
+        if self.cap.is_none() {
+            return;
+        }
+        let mut waiters = self.waiters.lock().expect("send-accounting waiters lock");
+        waiters.remove(&id);
+    }
+
+    /// Release `bytes` back to the pool and wake every parked admission (they
+    /// re-check under the atomic). Invoked only by [`SendBytesPermit::drop`].
+    fn release(&self, bytes: usize) {
+        if bytes != 0 {
+            // Saturating guard: each permit releases exactly once, so this never
+            // underflows in practice, but guard defensively rather than wrap.
+            let _ = self
+                .resident
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                    Some(cur.saturating_sub(bytes))
+                });
+        }
+        // The default (unlimited) path never parks, so the waiter map is
+        // provably empty — skip the lock entirely to keep it byte-for-byte as
+        // cheap as before SF-6 (opus#2). Only a finite cap can have waiters.
+        if self.cap.is_none() {
+            return;
+        }
+        // Wake all waiters even for a zero-byte release: a zero-byte permit still
+        // signals an admission slot may have opened elsewhere. Drain-and-wake so
+        // a re-parking admission re-registers freshly.
+        let wakers: Vec<Waker> = {
+            let mut waiters = self.waiters.lock().expect("send-accounting waiters lock");
+            waiters.drain().map(|(_id, w)| w).collect()
+        };
+        for w in wakers {
+            w.wake();
+        }
+    }
+}
+
+/// RAII reservation of `bytes` against a [`SendAccounting`] pool. Created by
+/// [`SendAccounting::try_reserve`] at admission and carried with the outbound
+/// `Send` command / `SendOp::Write`; its `Drop` decrements residency exactly
+/// once and wakes parked admissions. Moving the permit (through the command
+/// channel into the worker's op queue) never releases — only the final drop at
+/// the SF-3 completion chokepoint (or an unapplied-command / rollback drop)
+/// does.
+pub(crate) struct SendBytesPermit {
+    accounting: Arc<SendAccounting>,
+    bytes: usize,
+}
+
+impl SendBytesPermit {
+    /// The number of bytes this permit holds resident (inspection / tests).
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for SendBytesPermit {
+    fn drop(&mut self) {
+        self.accounting.release(self.bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +626,353 @@ mod tests {
         assert_eq!(cell.poll(&mut cx), Poll::Ready(55));
         drop(waker);
         unsafe { drop(Box::from_raw(hook_ptr)) };
+    }
+
+    /// SF-3 / SC-004: a single reusable cell services K sequential writes with
+    /// no per-write allocation — the same underlying cell instance is reused
+    /// across generations (identity-checked), advancing one generation per write.
+    #[test]
+    fn write_completion_reuses_one_cell_across_generations() {
+        let cell = WriteCompletion::<i32>::new();
+        assert_eq!(cell.generation(), 0);
+        for expected_gen in 1..=8u64 {
+            let generation = cell.begin();
+            assert_eq!(generation, expected_gen);
+            let completer = cell.completer(generation);
+            // The worker's completer shares the *same* cell (a refcount bump).
+            assert!(completer.cell.same_cell(&cell), "completer reuses the cell");
+            completer.complete(Ok(()));
+            // Front end consumes the completion for this generation exactly once.
+            assert!(matches!(
+                cell.try_take(generation),
+                Some(WriteOutcome::Done(Ok(())))
+            ));
+            assert!(cell.try_take(generation).is_none(), "consumed exactly once");
+        }
+        assert_eq!(cell.generation(), 8, "one generation per write, one cell");
+    }
+
+    /// SF-3: set-if-current-generation drops a stale completion for a superseded
+    /// generation (synthesis MF-B). Worker sets `Ok` for generation g; the front
+    /// end consumes it, begins g+1, and enqueues the next write; a lingering
+    /// completer for g must NOT clobber the g+1 slot, and g+1 completes exactly
+    /// once with its own (reset) terminal.
+    #[test]
+    fn write_completion_set_if_current_drops_stale_generation() {
+        let cell = WriteCompletion::<i32>::new();
+        let g1 = cell.begin();
+        // Fabricate a lingering carrier for g1 that has NOT completed yet.
+        let stale = cell.completer(g1);
+        // Front end already consumed g1 and advanced to g2 (begin clears the slot).
+        let g2 = cell.begin();
+        assert_eq!(g2, g1 + 1);
+        let current = cell.completer(g2);
+        // The stale g1 completion arrives late: set-if-current-generation drops it.
+        stale.complete(Ok(()));
+        assert!(cell.try_take(g1).is_none(), "stale g1 store dropped");
+        assert!(cell.try_take(g2).is_none(), "stale store must not fill g2");
+        // The real g2 completion (a reset terminal) resolves exactly once.
+        current.complete(Err(-7));
+        assert!(matches!(
+            cell.try_take(g2),
+            Some(WriteOutcome::Done(Err(-7)))
+        ));
+        assert!(cell.try_take(g2).is_none(), "g2 consumed exactly once");
+    }
+
+    /// SF-3: a completer dropped without completing signals `Cancelled` (matching
+    /// the old `oneshot::Sender` drop), so an unapplied/dropped `Send` never hangs
+    /// the front end.
+    #[test]
+    fn write_completion_drop_signals_cancelled() {
+        let cell = WriteCompletion::<i32>::new();
+        let generation = cell.begin();
+        let completer = cell.completer(generation);
+        drop(completer);
+        assert!(matches!(
+            cell.try_take(generation),
+            Some(WriteOutcome::Cancelled)
+        ));
+    }
+
+    /// SF-3: a stale carrier dropped after the cell advanced does NOT inject a
+    /// `Cancelled` into the newer generation's slot (set-if-current on drop too).
+    #[test]
+    fn write_completion_stale_drop_does_not_cancel_new_generation() {
+        let cell = WriteCompletion::<i32>::new();
+        let g1 = cell.begin();
+        let stale = cell.completer(g1);
+        let g2 = cell.begin();
+        let current = cell.completer(g2);
+        drop(stale); // stale Cancelled for g1 is dropped (generation mismatch)
+        assert!(cell.try_take(g2).is_none(), "stale drop must not fill g2");
+        current.complete(Ok(()));
+        assert!(matches!(
+            cell.try_take(g2),
+            Some(WriteOutcome::Done(Ok(())))
+        ));
+    }
+
+    /// SF-3: `poll` registers the waker and the worker's completion wakes it
+    /// exactly once, race-free (register-then-recheck like [`TerminalCell`]).
+    #[test]
+    fn write_completion_poll_registers_and_wakes() {
+        let cell = WriteCompletion::<i32>::new();
+        let generation = cell.begin();
+        let flag = Arc::new(AtomicBool::new(false));
+        let waker = flag_waker(flag.clone());
+        let mut cx = Context::from_waker(&waker);
+        // Nothing completed yet: Pending, waker registered, not yet woken.
+        assert!(matches!(cell.poll(generation, &mut cx), Poll::Pending));
+        assert!(!flag.load(Ordering::SeqCst));
+        // Worker completes → the registered waker fires.
+        cell.completer(generation).complete(Ok(()));
+        assert!(flag.load(Ordering::SeqCst), "completion woke the poller");
+        match cell.poll(generation, &mut cx) {
+            Poll::Ready(WriteOutcome::Done(Ok(()))) => {}
+            other => panic!("expected Ready(Done(Ok)), got {other:?}"),
+        }
+    }
+
+    // ---- SF-6 send-byte accounting ----
+
+    #[test]
+    fn send_accounting_unlimited_increments_and_releases_once() {
+        // Default (cap == None): every reserve succeeds and residency tracks the
+        // outstanding bytes, returning to zero after the permits drop.
+        let acct = SendAccounting::new(None);
+        assert_eq!(acct.resident(), 0);
+        assert_eq!(acct.cap(), None);
+
+        let p1 = acct.try_reserve(1000).expect("unlimited reserve");
+        let p2 = acct.try_reserve(2500).expect("unlimited reserve");
+        assert_eq!(acct.resident(), 3500);
+        assert_eq!(p1.bytes(), 1000);
+
+        drop(p1);
+        assert_eq!(acct.resident(), 2500);
+        drop(p2);
+        assert_eq!(acct.resident(), 0);
+    }
+
+    #[test]
+    fn send_accounting_capped_rejects_over_cap_then_admits_after_release() {
+        // A finite cap parks admissions that would exceed it, and re-admits once
+        // an outstanding permit drops (the front end retries after a wake).
+        let acct = SendAccounting::new(Some(100));
+        let p1 = acct.try_reserve(60).expect("fits under cap");
+        assert_eq!(acct.resident(), 60);
+
+        // 60 + 60 = 120 > 100 and residency is non-zero → rejected (park).
+        assert!(acct.try_reserve(60).is_none());
+        assert_eq!(
+            acct.resident(),
+            60,
+            "rejected reserve must not mutate residency"
+        );
+
+        // A smaller reserve that still fits is admitted.
+        let p2 = acct.try_reserve(40).expect("40 fits (100 total == cap)");
+        assert_eq!(acct.resident(), 100);
+        assert!(acct.try_reserve(1).is_none(), "at cap, nothing more admits");
+
+        drop(p1);
+        // 40 resident now; the 60 retry fits.
+        let _p3 = acct.try_reserve(60).expect("fits after release");
+        assert_eq!(acct.resident(), 100);
+        drop(p2);
+    }
+
+    #[test]
+    fn send_accounting_oversize_admits_one_unit_and_bounds_at_cap_plus_unit() {
+        // The `current == 0` exception lets a single oversize buffer through so
+        // an item larger than the cap can still make progress, but only one such
+        // unit is ever admitted: residency is bounded by cap + one unit.
+        let acct = SendAccounting::new(Some(100));
+        let big = acct
+            .try_reserve(250)
+            .expect("oversize admits when nothing resident");
+        assert_eq!(acct.resident(), 250);
+
+        // With the oversize unit resident, nothing else admits until it drops.
+        assert!(acct.try_reserve(1).is_none());
+        assert!(acct.try_reserve(250).is_none());
+        assert_eq!(acct.resident(), 250);
+
+        drop(big);
+        assert_eq!(acct.resident(), 0);
+        // cap == 0 is the degenerate oversize case: only the single-unit
+        // exception ever admits.
+        let acct0 = SendAccounting::new(Some(0));
+        let unit = acct0
+            .try_reserve(10)
+            .expect("cap==0 admits one in-flight unit");
+        assert!(acct0.try_reserve(1).is_none());
+        drop(unit);
+        assert!(acct0.try_reserve(10).is_some());
+    }
+
+    #[test]
+    fn send_accounting_release_wakes_parked_waiter() {
+        // A parked admission registers a waker; dropping a permit wakes it so it
+        // can retry. Register-before-recheck (SF-2) means a release racing the
+        // park is never missed.
+        let acct = SendAccounting::new(Some(100));
+        let p = acct.try_reserve(100).expect("fills cap");
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let waker = flag_waker(flag.clone());
+        // Over-cap attempt fails; the front end registers then re-checks.
+        assert!(acct.try_reserve(50).is_none());
+        acct.register_waiter(7, &waker);
+        assert!(acct.try_reserve(50).is_none());
+        assert!(!flag.load(Ordering::SeqCst));
+
+        drop(p);
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "release must wake the parked admission"
+        );
+        // After the wake the retry now fits.
+        assert!(acct.try_reserve(50).is_some());
+    }
+
+    #[test]
+    fn send_accounting_register_waiter_dedups_equal_waker() {
+        // Repeated registration of the same stream's waker (a stream polled
+        // repeatedly) must not grow the waiter map: it is keyed by stream id.
+        let acct = SendAccounting::new(Some(10));
+        let _p = acct.try_reserve(10).expect("fills cap");
+        let flag = Arc::new(AtomicBool::new(false));
+        let waker = flag_waker(flag.clone());
+        acct.register_waiter(3, &waker);
+        acct.register_waiter(3, &waker);
+        acct.register_waiter(3, &waker);
+        assert_eq!(acct.waiters.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn send_accounting_unregister_drops_parked_waiter() {
+        // A cancelled/admitted stream unregisters its waker so the cap guard's
+        // waiter map cannot accumulate stale entries under a stalled peer + churn
+        // (SH-E). Two distinct streams park; unregistering one leaves exactly the
+        // other, and a subsequent release wakes only the still-parked stream.
+        let acct = SendAccounting::new(Some(100));
+        let _p = acct.try_reserve(100).expect("fills cap");
+        let flag_a = Arc::new(AtomicBool::new(false));
+        let flag_b = Arc::new(AtomicBool::new(false));
+        acct.register_waiter(1, &flag_waker(flag_a.clone()));
+        acct.register_waiter(2, &flag_waker(flag_b.clone()));
+        assert_eq!(acct.waiters.lock().unwrap().len(), 2);
+
+        // Stream 1 is dropped/admitted → unregister removes exactly its entry.
+        acct.unregister_waiter(1);
+        assert_eq!(acct.waiters.lock().unwrap().len(), 1);
+        // Idempotent: unregistering an absent id is a no-op.
+        acct.unregister_waiter(1);
+        assert_eq!(acct.waiters.lock().unwrap().len(), 1);
+
+        // A release wakes only the still-parked stream 2, never the gone one.
+        drop(_p);
+        assert!(
+            !flag_a.load(Ordering::SeqCst),
+            "unregistered stream not woken"
+        );
+        assert!(flag_b.load(Ordering::SeqCst), "still-parked stream woken");
+    }
+
+    #[test]
+    fn send_accounting_unlimited_never_registers_waiters() {
+        // Under the default (unlimited) config the waiter map is never touched:
+        // register/unregister are no-ops and the map stays empty (lock-free
+        // default path — opus#2).
+        let acct = SendAccounting::new(None);
+        let flag = Arc::new(AtomicBool::new(false));
+        acct.register_waiter(1, &flag_waker(flag));
+        assert!(acct.waiters.lock().unwrap().is_empty());
+        acct.unregister_waiter(1);
+        assert!(acct.waiters.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn send_accounting_zero_byte_reserve_is_free() {
+        // A zero-byte write still yields a permit (uniform enqueue path) without
+        // perturbing residency.
+        let acct = SendAccounting::new(Some(100));
+        let p = acct
+            .try_reserve(0)
+            .expect("zero-byte reserve always admits");
+        assert_eq!(acct.resident(), 0);
+        assert_eq!(p.bytes(), 0);
+        drop(p);
+        assert_eq!(acct.resident(), 0);
+    }
+
+    #[test]
+    fn send_accounting_zero_byte_reserve_admits_even_when_over_cap() {
+        // The one-in-flight-unit exception can leave residency ABOVE the cap
+        // (an oversize buffer, or `cap == 0`). A zero-byte reserve adds nothing
+        // and MUST still admit in that state — it can never reduce residency, so
+        // parking it would stall a 0-wire-byte write needlessly (gemini). A
+        // non-zero reserve in the same state correctly parks.
+        let acct = SendAccounting::new(Some(100));
+        // Oversize admission via the `cur == 0` exception pushes resident > cap.
+        let big = acct
+            .try_reserve(250)
+            .expect("oversize admits as the one unit");
+        assert!(acct.resident() > acct.cap().unwrap());
+        // A non-zero reserve now parks (over cap, something resident).
+        assert!(acct.try_reserve(1).is_none());
+        // A zero-byte reserve still admits despite being over cap.
+        let z = acct
+            .try_reserve(0)
+            .expect("zero-byte reserve admits over cap");
+        assert_eq!(z.bytes(), 0);
+        drop(z);
+        drop(big);
+        assert_eq!(acct.resident(), 0);
+    }
+
+    #[test]
+    fn send_accounting_concurrent_admissions_never_exceed_cap() {
+        // SF-6 (e): the aggregate bound is enforced atomically. With many threads
+        // racing `try_reserve` against a shared cap, peak residency never exceeds
+        // the cap — the `fetch_update` reservation has no check-then-add window
+        // that could let two admissions oversubscribe. (Each unit is < cap, so
+        // the single-in-flight oversize exception never applies here.)
+        use std::thread;
+        const UNIT: usize = 10;
+        const CAP: usize = 100;
+        let acct = Arc::new(SendAccounting::new(Some(CAP)));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let acct = Arc::clone(&acct);
+            let peak = Arc::clone(&peak);
+            handles.push(thread::spawn(move || {
+                let mut held: Vec<SendBytesPermit> = Vec::new();
+                for _ in 0..256 {
+                    if let Some(p) = acct.try_reserve(UNIT) {
+                        // Record residency observed while holding this permit.
+                        peak.fetch_max(acct.resident(), Ordering::SeqCst);
+                        held.push(p);
+                        if held.len() > 3 {
+                            held.remove(0); // churn: release the oldest
+                        }
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(
+            peak.load(Ordering::SeqCst) <= CAP,
+            "peak residency {} oversubscribed cap {CAP}",
+            peak.load(Ordering::SeqCst),
+        );
+        // All permits dropped → residency drains fully.
+        assert_eq!(acct.resident(), 0, "all reservations released");
     }
 
     // ---- test waker plumbing ----

@@ -22,7 +22,8 @@ use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificatePaths};
 use tokio_quiche::{ConnectionParams, QuicConnectionStream};
 
-use crate::driver::QuicheDriver;
+use crate::buffer::PKT_BUF_LEN;
+use crate::driver::{DriverBufferConfig, QuicheDriver, BYTE_CHANNEL_DEPTH};
 use crate::endpoint::{EndpointShared, H3QuicheEndpoint};
 use crate::stream::Connection;
 use crate::Error;
@@ -40,6 +41,16 @@ const DEFAULT_ACCEPT_UNI_CAP: usize = 128;
 /// borrows (TLS cert/key **paths**, `QuicSettings`, `Hooks`) so the acceptor is
 /// self-contained, plus the accept-queue depths and per-listener handshake cap
 /// (§7.1).
+///
+/// **Construction (CO-C):** construct via [`Default`] + functional-update syntax
+/// (e.g. `H3QuicheServerConfig { cert_path, ..Default::default() }`). New fields
+/// (like the SF-4/SF-5 buffer knobs below) are added additively with defaults, so
+/// **`..Default::default()` / `Default::default()` construction keeps compiling**
+/// across additions (a caller that instead uses an *exhaustive* field literal must
+/// name any new field). We deliberately do **not** mark this `#[non_exhaustive]`:
+/// that would forbid struct-literal/FRU construction downstream entirely (forcing
+/// a mutate-after-default/builder style), a heavier break than additive fields —
+/// see Docs.md/§12.
 #[derive(Clone)]
 pub struct H3QuicheServerConfig {
     /// Path to the PEM X.509 certificate chain.
@@ -56,6 +67,24 @@ pub struct H3QuicheServerConfig {
     pub accept_uni_cap: usize,
     /// Cap on concurrently-progressing handshakes per listener (§7.1).
     pub max_in_flight_handshakes: NonZeroUsize,
+    /// Per-recv byte-channel depth per accepted connection (SF-4). Defaults to
+    /// `BYTE_CHANNEL_DEPTH` (64); the per-stream in-flight memory bound is
+    /// `recv_channel_depth × MAX_CHUNK`. **Trade-off**: lowering it saves memory
+    /// at the cost of per-stream throughput/buffering.
+    pub recv_channel_depth: usize,
+    /// Outbound packet-buffer size in bytes per accepted connection (SF-5).
+    /// Defaults to `PKT_BUF_LEN` (64 KiB). **Do NOT shrink below a full GSO
+    /// batch without a datapath assessment** (§5, §12): it can regress egress
+    /// batching/throughput.
+    pub packet_buffer_size: usize,
+    /// Optional aggregate cap (bytes) on buffered outbound send data admitted to
+    /// each accepted connection's worker (SF-6). `None` (default) leaves the send
+    /// path unbounded, preserving historical behavior. A finite cap bounds
+    /// resident admitted send bytes to at most `cap + one admission unit`, so a
+    /// slow/stalled peer cannot grow send-side memory without limit. Front-end
+    /// writes past the cap park (async backpressure) rather than being dropped or
+    /// reordered (§12 S3).
+    pub max_buffered_send_bytes: Option<usize>,
 }
 
 impl Default for H3QuicheServerConfig {
@@ -69,6 +98,9 @@ impl Default for H3QuicheServerConfig {
             accept_uni_cap: DEFAULT_ACCEPT_UNI_CAP,
             max_in_flight_handshakes: NonZeroUsize::new(DEFAULT_MAX_IN_FLIGHT_HANDSHAKES)
                 .expect("DEFAULT_MAX_IN_FLIGHT_HANDSHAKES is non-zero"),
+            recv_channel_depth: BYTE_CHANNEL_DEPTH,
+            packet_buffer_size: PKT_BUF_LEN,
+            max_buffered_send_bytes: None,
         }
     }
 }
@@ -85,6 +117,9 @@ pub struct H3QuicheAcceptor {
     max_in_flight_handshakes: NonZeroUsize,
     accept_bidi_cap: usize,
     accept_uni_cap: usize,
+    /// Per-connection buffer sizing (SF-4/SF-5) applied to every accepted
+    /// connection's driver; sourced from [`H3QuicheServerConfig`].
+    buffers: DriverBufferConfig,
     incoming_done: bool,
     /// Endpoint registry shared by every acceptor from the same `bind()` call
     /// and by the [`H3QuicheEndpoint`] handles it hands out (§5.1). Registration
@@ -146,6 +181,11 @@ impl H3QuicheAcceptor {
                 max_in_flight_handshakes: config.max_in_flight_handshakes,
                 accept_bidi_cap: config.accept_bidi_cap,
                 accept_uni_cap: config.accept_uni_cap,
+                buffers: DriverBufferConfig {
+                    recv_channel_depth: config.recv_channel_depth,
+                    packet_buffer_size: config.packet_buffer_size,
+                    max_buffered_send_bytes: config.max_buffered_send_bytes,
+                },
                 incoming_done: false,
                 shared: Arc::clone(&shared),
             })
@@ -296,10 +336,11 @@ impl H3QuicheAcceptor {
                     };
                     match item {
                         Ok(iqc) => {
-                            let (mut driver, handles) = QuicheDriver::<Bytes>::new(
+                            let (mut driver, handles) = QuicheDriver::<Bytes>::with_buffers(
                                 true,
                                 self.accept_bidi_cap,
                                 self.accept_uni_cap,
+                                self.buffers,
                             );
                             // Admission fence (§5.1): register under the endpoint
                             // lock at the true linearization point. If `close()`
@@ -387,5 +428,36 @@ mod tests {
                 .get(),
             256
         );
+    }
+
+    /// SF-4/SF-5 (SC-006): the server config defaults to the historical buffer
+    /// sizes so out-of-the-box behavior is unchanged; overrides are honored.
+    #[test]
+    fn server_config_buffer_defaults_and_overrides() {
+        let def = H3QuicheServerConfig::default();
+        assert_eq!(def.recv_channel_depth, BYTE_CHANNEL_DEPTH);
+        assert_eq!(def.packet_buffer_size, PKT_BUF_LEN);
+
+        let custom = H3QuicheServerConfig {
+            recv_channel_depth: 16,
+            packet_buffer_size: 8192,
+            ..H3QuicheServerConfig::default()
+        };
+        assert_eq!(custom.recv_channel_depth, 16);
+        assert_eq!(custom.packet_buffer_size, 8192);
+    }
+
+    /// SF-6 (SC-007): the aggregate send-byte cap defaults to `None` (unbounded,
+    /// behavior unchanged) and a configured cap is preserved on the config.
+    #[test]
+    fn server_config_send_cap_defaults_none_and_overrides() {
+        let def = H3QuicheServerConfig::default();
+        assert_eq!(def.max_buffered_send_bytes, None);
+
+        let custom = H3QuicheServerConfig {
+            max_buffered_send_bytes: Some(1 << 20),
+            ..H3QuicheServerConfig::default()
+        };
+        assert_eq!(custom.max_buffered_send_bytes, Some(1 << 20));
     }
 }
