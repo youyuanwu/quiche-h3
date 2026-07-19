@@ -22,7 +22,8 @@ use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificat
 use tokio_quiche::socket::Socket;
 use tokio_quiche::ConnectionParams;
 
-use crate::driver::QuicheDriver;
+use crate::buffer::PKT_BUF_LEN;
+use crate::driver::{DriverBufferConfig, QuicheDriver, BYTE_CHANNEL_DEPTH};
 use crate::stream::Connection;
 use crate::Error;
 
@@ -35,6 +36,12 @@ const DEFAULT_ACCEPT_UNI_CAP: usize = 128;
 /// toggle applied per-`connect`, and an optional advisory SNI. A borrowing
 /// `ConnectionParams<'_>` is rebuilt from these owned fields inside each
 /// `connect` (§7.2).
+///
+/// **Construction (CO-C):** construct via [`Default`] + functional-update syntax.
+/// New fields (like the SF-4/SF-5 buffer knobs below) are added additively with
+/// defaults, so FRU-style construction keeps compiling. We deliberately do
+/// **not** mark this `#[non_exhaustive]`: that would forbid struct-literal/FRU
+/// construction downstream entirely — see Docs.md/§12.
 #[derive(Clone)]
 pub struct H3QuicheClientConfig {
     /// QUIC transport settings (ALPN defaults to `[b"h3"]`).
@@ -51,6 +58,15 @@ pub struct H3QuicheClientConfig {
     /// Advisory default SNI / verification name. The explicit `server_name`
     /// passed to [`H3QuicheConnector::new`] takes precedence.
     pub server_name: Option<String>,
+    /// Per-recv byte-channel depth for the connection (SF-4). Defaults to
+    /// [`BYTE_CHANNEL_DEPTH`]; the per-stream in-flight memory bound is
+    /// `recv_channel_depth × MAX_CHUNK`. **Trade-off**: lowering it saves memory
+    /// at the cost of per-stream throughput/buffering.
+    pub recv_channel_depth: usize,
+    /// Outbound packet-buffer size in bytes for the connection (SF-5). Defaults
+    /// to [`PKT_BUF_LEN`] (64 KiB). **Do NOT shrink below a full GSO batch
+    /// without a datapath assessment** (§5, §12).
+    pub packet_buffer_size: usize,
 }
 
 impl Default for H3QuicheClientConfig {
@@ -62,6 +78,8 @@ impl Default for H3QuicheClientConfig {
             key_path: None,
             verify_peer: true,
             server_name: None,
+            recv_channel_depth: BYTE_CHANNEL_DEPTH,
+            packet_buffer_size: PKT_BUF_LEN,
         }
     }
 }
@@ -156,8 +174,15 @@ impl H3QuicheConnector {
         };
         let params = ConnectionParams::new_client(settings, tls, inner.config.hooks.clone());
 
-        let (driver, handles) =
-            QuicheDriver::<Bytes>::new(false, DEFAULT_ACCEPT_BIDI_CAP, DEFAULT_ACCEPT_UNI_CAP);
+        let (driver, handles) = QuicheDriver::<Bytes>::with_buffers(
+            false,
+            DEFAULT_ACCEPT_BIDI_CAP,
+            DEFAULT_ACCEPT_UNI_CAP,
+            DriverBufferConfig {
+                recv_channel_depth: inner.config.recv_channel_depth,
+                packet_buffer_size: inner.config.packet_buffer_size,
+            },
+        );
 
         match connect_with_config(socket, Some(&inner.server_name), &params, driver).await {
             Ok(_qconn) => {
@@ -209,6 +234,23 @@ mod tests {
             .expect("no-mTLS config is valid");
         // `Clone` is part of the public contract (H3Connector: Clone + 'static).
         let _cloned = connector.clone();
+    }
+
+    /// SF-4/SF-5 (SC-006): the client config defaults to the historical buffer
+    /// sizes so out-of-the-box behavior is unchanged; overrides are honored.
+    #[test]
+    fn client_config_buffer_defaults_and_overrides() {
+        let def = H3QuicheClientConfig::default();
+        assert_eq!(def.recv_channel_depth, BYTE_CHANNEL_DEPTH);
+        assert_eq!(def.packet_buffer_size, PKT_BUF_LEN);
+
+        let custom = H3QuicheClientConfig {
+            recv_channel_depth: 32,
+            packet_buffer_size: 16384,
+            ..H3QuicheClientConfig::default()
+        };
+        assert_eq!(custom.recv_channel_depth, 32);
+        assert_eq!(custom.packet_buffer_size, 16384);
     }
 
     // Regression (review finding): a lone cert or key silently disables mTLS.

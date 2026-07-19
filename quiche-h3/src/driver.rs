@@ -57,8 +57,38 @@ const PROMOTE_BUDGET: usize = 32;
 const CHUNK_BUDGET: usize = 16;
 
 /// Bounded per-recv byte-channel depth; the per-stream in-flight memory bound is
-/// `BYTE_CHANNEL_DEPTH × MAX_CHUNK` (§5.1, provisional §12 S3).
-const BYTE_CHANNEL_DEPTH: usize = 64;
+/// `BYTE_CHANNEL_DEPTH × MAX_CHUNK` (§5.1, provisional §12 S3). This is the
+/// **default** depth; it is configurable per connection via [`DriverBufferConfig`]
+/// (SF-4) — see [`H3QuicheServerConfig`](crate::listener::H3QuicheServerConfig)
+/// and [`H3QuicheClientConfig`](crate::connector::H3QuicheClientConfig).
+pub(crate) const BYTE_CHANNEL_DEPTH: usize = 64;
+
+/// Per-connection buffer sizing knobs (SF-4 / SF-5-pkt_buf). Both default to the
+/// historical constants so out-of-the-box behavior is byte-for-byte unchanged;
+/// callers may raise/lower them to trade memory against throughput.
+///
+/// These are **trade-offs**, not free wins: shrinking `recv_channel_depth`
+/// reduces per-stream buffering (throughput) to save memory, and the packet
+/// buffer must NOT be shrunk below a full GSO batch without a datapath
+/// assessment (§5, §12).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DriverBufferConfig {
+    /// Bounded per-recv byte-channel depth (default [`BYTE_CHANNEL_DEPTH`]).
+    /// Effective value is clamped to at least 1.
+    pub recv_channel_depth: usize,
+    /// Outbound packet-buffer size in bytes (default [`PKT_BUF_LEN`]).
+    /// Effective value is clamped to at least 1.
+    pub packet_buffer_size: usize,
+}
+
+impl Default for DriverBufferConfig {
+    fn default() -> Self {
+        Self {
+            recv_channel_depth: BYTE_CHANNEL_DEPTH,
+            packet_buffer_size: PKT_BUF_LEN,
+        }
+    }
+}
 
 /// Max commands applied per `process_writes` stage (a) (§5.2). Excess stays in
 /// `inbox` (relative order preserved) and re-forces an iteration.
@@ -615,8 +645,11 @@ pub(crate) struct QuicheDriver<B: Buf = Bytes> {
     // ----- worker loop flags / buffers (§2.3, §5) -----
     /// `should_act()` result: true once established.
     acting: bool,
-    /// Outbound packet buffer backing `buffer()` (§5, T3).
+    /// Outbound packet buffer backing `buffer()` (§5, T3). Sized from
+    /// [`DriverBufferConfig::packet_buffer_size`] (SF-5-pkt_buf).
     pkt_buf: Vec<u8>,
+    /// Configured recv byte-channel depth applied in `build_recv` (SF-4).
+    recv_channel_depth: usize,
     /// Reusable `stream_recv` target (SF-1). A single `BytesMut` grown to
     /// `MAX_CHUNK` per read; each chunk is handed out via `split_to(len).freeze()`
     /// (O(1) refcounted share of the backing allocation, no per-chunk memcpy).
@@ -671,11 +704,29 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
     /// Create a driver and its front-end handles. `is_server` selects the QUIC
     /// stream-id parity for locally-opened streams (§6.1); `accept_bidi_cap` /
     /// `accept_uni_cap` bound the respective accept queues (§5.2, provisional
-    /// §12 S3).
+    /// §12 S3). Buffer sizes take the historical defaults ([`DriverBufferConfig`]);
+    /// use [`with_buffers`](Self::with_buffers) to override them (SF-4/SF-5).
     pub(crate) fn new(
         is_server: bool,
         accept_bidi_cap: usize,
         accept_uni_cap: usize,
+    ) -> (Self, DriverHandles<B>) {
+        Self::with_buffers(
+            is_server,
+            accept_bidi_cap,
+            accept_uni_cap,
+            DriverBufferConfig::default(),
+        )
+    }
+
+    /// Like [`new`](Self::new) but with explicit per-connection buffer sizing
+    /// (SF-4 recv channel depth, SF-5 packet buffer size). Passing
+    /// `DriverBufferConfig::default()` is identical to [`new`](Self::new).
+    pub(crate) fn with_buffers(
+        is_server: bool,
+        accept_bidi_cap: usize,
+        accept_uni_cap: usize,
+        buffers: DriverBufferConfig,
     ) -> (Self, DriverHandles<B>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let cmd_tx_weak = cmd_tx.downgrade();
@@ -722,7 +773,8 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             phase2_pops: 0,
             established: Some(est_tx),
             acting: false,
-            pkt_buf: vec![0u8; PKT_BUF_LEN],
+            pkt_buf: vec![0u8; buffers.packet_buffer_size.max(1)],
+            recv_channel_depth: buffers.recv_channel_depth,
             recv_buf: None,
             #[cfg(test)]
             recv_lookup_count: 0,
@@ -1537,7 +1589,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
         retained: Option<RecvEnd>,
     ) -> (Option<StreamRecvState>, RecvHandoff<B>, bool) {
-        let (tx, rx) = mpsc::channel(BYTE_CHANNEL_DEPTH);
+        let (tx, rx) = mpsc::channel(self.recv_channel_depth.max(1));
         let terminal = TerminalCell::new();
         let resume = Arc::new(AtomicBool::new(false));
         let blocked = Arc::new(AtomicBool::new(false));
@@ -2572,6 +2624,57 @@ mod tests {
         let (mut d, _h) = driver();
         assert_eq!(d.buffer().len(), PKT_BUF_LEN);
         assert_ne!(PKT_BUF_LEN, MAX_CHUNK);
+    }
+
+    /// SF-4/SF-5 (SC-006): the default constructor preserves the historical
+    /// buffer sizes exactly — recv channel depth == `BYTE_CHANNEL_DEPTH` and the
+    /// packet buffer == `PKT_BUF_LEN`.
+    #[test]
+    fn sf4_sf5_default_buffer_sizes_unchanged() {
+        let (mut d, _h) = QuicheDriver::<Bytes>::new(false, 4, 4);
+        assert_eq!(d.recv_channel_depth, BYTE_CHANNEL_DEPTH);
+        assert_eq!(d.buffer().len(), PKT_BUF_LEN);
+    }
+
+    /// SF-4/SF-5 (SC-006): `with_buffers` overrides take effect end-to-end — the
+    /// packet buffer is sized to `packet_buffer_size`, and a freshly-built recv
+    /// channel's max capacity equals `recv_channel_depth`.
+    #[test]
+    fn sf4_sf5_buffer_overrides_take_effect() {
+        let (mut d, h) = QuicheDriver::<Bytes>::with_buffers(
+            false,
+            4,
+            4,
+            DriverBufferConfig {
+                recv_channel_depth: 8,
+                packet_buffer_size: 4096,
+            },
+        );
+        assert_eq!(d.recv_channel_depth, 8);
+        assert_eq!(d.buffer().len(), 4096);
+        // The configured depth is applied to the per-stream byte channel.
+        let cmd_tx = h.cmd_tx.clone();
+        let (state, _handoff, _done) = d.build_recv(0, cmd_tx, None);
+        let state = state.expect("live recv state");
+        assert_eq!(state.bytes.max_capacity(), 8);
+    }
+
+    /// SF-4/SF-5: zero-valued overrides are clamped to at least 1 (no panic on
+    /// channel/buffer construction).
+    #[test]
+    fn sf4_sf5_zero_sizes_clamped_to_one() {
+        let (mut d, h) = QuicheDriver::<Bytes>::with_buffers(
+            false,
+            4,
+            4,
+            DriverBufferConfig {
+                recv_channel_depth: 0,
+                packet_buffer_size: 0,
+            },
+        );
+        assert_eq!(d.buffer().len(), 1);
+        let (state, _handoff, _done) = d.build_recv(0, h.cmd_tx.clone(), None);
+        assert_eq!(state.expect("live recv state").bytes.max_capacity(), 1);
     }
 
     #[test]
