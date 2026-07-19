@@ -331,7 +331,7 @@ impl<B: Buf> quic::SendStream<B> for H3SendStream<B> {
                 // permit released between check and park is never missed (SF-2
                 // lost-wake discipline). Re-stash the buffer so a later poll
                 // retries this exact write in order (no data loss/reorder).
-                self.send_accounting.register_waiter(cx.waker());
+                self.send_accounting.register_waiter(self.id, cx.waker());
                 match self.send_accounting.try_reserve(bytes) {
                     Some(permit) => permit,
                     None => {
@@ -341,6 +341,10 @@ impl<B: Buf> quic::SendStream<B> for H3SendStream<B> {
                 }
             }
         };
+        // Admitted: we are no longer parked, so drop any waker we registered on a
+        // prior over-cap poll (keeps the cap's waiter map bounded to genuinely
+        // parked senders; no-op / lock-free under the default unlimited config).
+        self.send_accounting.unregister_waiter(self.id);
         // Admitted: reuse the per-stream cell — begin a fresh generation (clears
         // any consumed prior slot — safe under the single-outstanding-write
         // contract) and hand the worker a completer stamped with it, instead of
@@ -490,6 +494,11 @@ impl<B: Buf> quic::SendStream<B> for H3SendStream<B> {
 
 impl<B: Buf> Drop for H3SendStream<B> {
     fn drop(&mut self) {
+        // A dropped send half is no longer a parked admission: unregister its
+        // cap waiter so a cancelled stream cannot retain a waker until the next
+        // release (bounds the cap guard's waiter memory; no-op under the default
+        // unlimited config).
+        self.send_accounting.unregister_waiter(self.id);
         // Graceful finish-on-drop for an unfinished send half (§6.2). A dropped
         // completion receiver is harmless: the worker's `reply.send` just fails.
         if self.finalized || self.terminal_now_noctx().is_some() {
@@ -998,6 +1007,34 @@ mod tests {
     /// which is what SF-6 accounting reserves.
     fn wire_len(payload: &'static [u8]) -> usize {
         wbuf(payload).remaining()
+    }
+
+    /// SF-6 (f): if the worker command channel is already closed when a reserved
+    /// write is flushed, the dropped `Send` command carries the byte permit, so
+    /// residency rolls back to its pre-attempt value. A failed enqueue must never
+    /// leak reserved capacity against the aggregate cap (which would otherwise
+    /// permanently shrink the usable send budget).
+    #[test]
+    fn sf6_enqueue_failure_rolls_back_reserved_bytes() {
+        let acct = SendAccounting::new(Some(1024));
+        let (status, mut send, crx) = send_half_with(0, Arc::clone(&acct));
+        // Close the worker command channel so the next enqueue fails.
+        drop(crx);
+        // A terminal must be published for the front end to resolve the failure.
+        status.set(SendEnd::Reset { error_code: 9 });
+
+        let mut cx = noop_cx();
+        send.send_data(wbuf(b"hello")).unwrap();
+        assert_eq!(acct.resident(), 0, "nothing reserved until the flush");
+        match send.poll_ready(&mut cx) {
+            Poll::Ready(Err(_)) => {}
+            other => panic!("expected terminal error on closed channel, got {other:?}"),
+        }
+        assert_eq!(
+            acct.resident(),
+            0,
+            "a failed enqueue must not leak the reserved bytes"
+        );
     }
 
     // ---- H3RecvStream ----

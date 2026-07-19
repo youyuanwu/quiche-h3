@@ -45,10 +45,12 @@ const DEFAULT_ACCEPT_UNI_CAP: usize = 128;
 /// **Construction (CO-C):** construct via [`Default`] + functional-update syntax
 /// (e.g. `H3QuicheServerConfig { cert_path, ..Default::default() }`). New fields
 /// (like the SF-4/SF-5 buffer knobs below) are added additively with defaults, so
-/// FRU-style construction keeps compiling across additions. We deliberately do
-/// **not** mark this `#[non_exhaustive]`: that would forbid struct-literal/FRU
-/// construction downstream entirely (forcing a mutate-after-default/builder
-/// style), a heavier break than additive fields — see Docs.md/§12.
+/// **`..Default::default()` / `Default::default()` construction keeps compiling**
+/// across additions (a caller that instead uses an *exhaustive* field literal must
+/// name any new field). We deliberately do **not** mark this `#[non_exhaustive]`:
+/// that would forbid struct-literal/FRU construction downstream entirely (forcing
+/// a mutate-after-default/builder style), a heavier break than additive fields —
+/// see Docs.md/§12.
 #[derive(Clone)]
 pub struct H3QuicheServerConfig {
     /// Path to the PEM X.509 certificate chain.

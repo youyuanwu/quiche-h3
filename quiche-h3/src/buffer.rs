@@ -6,6 +6,7 @@
 //! to publish terminal reasons to synchronous `h3::quic` `poll_*` methods.
 #![allow(dead_code)] // wired up incrementally across Phases 2–8
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -354,15 +355,20 @@ pub(crate) struct SendAccounting {
     resident: AtomicUsize,
     /// Optional finite cap. `None` = unlimited (default; behavior unchanged).
     cap: Option<usize>,
-    /// Parked admissions waiting for residency to drop under the cap. A
-    /// hand-rolled multi-waiter (NOT a single [`AtomicWaker`], which would drop
-    /// other streams' wakers when several stalled streams contend — SH-E).
+    /// Parked admissions waiting for residency to drop under the cap, keyed by
+    /// stream id so each parked sender has at most one entry and a re-poll
+    /// **replaces** its (possibly stale) waker rather than appending. A dropped
+    /// or admitted sender unregisters its entry, so the cap guard cannot itself
+    /// accumulate unbounded waker memory under a stalled peer + stream churn
+    /// (SH-E). A single [`AtomicWaker`] would instead drop other stalled
+    /// streams' wakers, so a keyed multi-waiter map is required.
     ///
     /// `tokio::sync::Notify` is deliberately **not** used here: its `Notified`
     /// future borrows the `Notify` and must be held across polls to stay
     /// registered, which is infeasible inside the synchronous `poll_ready`
-    /// (§12 S3 trade-off note).
-    waiters: Mutex<Vec<Waker>>,
+    /// (§12 S3 trade-off note). The map is touched **only** when a finite cap is
+    /// configured; the default (`cap == None`) path never locks it.
+    waiters: Mutex<HashMap<u64, Waker>>,
 }
 
 impl SendAccounting {
@@ -371,7 +377,7 @@ impl SendAccounting {
         Arc::new(SendAccounting {
             resident: AtomicUsize::new(0),
             cap,
-            waiters: Mutex::new(Vec::new()),
+            waiters: Mutex::new(HashMap::new()),
         })
     }
 
@@ -400,8 +406,13 @@ impl SendAccounting {
                 let next = cur.checked_add(bytes)?;
                 match self.cap {
                     // Over cap, and something is already resident: reject and let
-                    // the caller park until a permit drops.
-                    Some(cap) if next > cap && cur != 0 => None,
+                    // the caller park until a permit drops. A zero-byte
+                    // reservation (`bytes == 0`) adds nothing and MUST always
+                    // succeed per the contract above — never park a 0-byte write
+                    // behind the cap (it can't reduce residency and would stall
+                    // needlessly while residency sits above the cap under the
+                    // one-in-flight-unit exception).
+                    Some(cap) if bytes > 0 && next > cap && cur != 0 => None,
                     _ => Some(next),
                 }
             });
@@ -414,14 +425,34 @@ impl SendAccounting {
         }
     }
 
-    /// Register `waker` to be woken when residency next drops (multi-waiter).
-    /// Callers MUST register *before* the final over-cap re-check so a release
-    /// racing between check and park cannot be missed (SF-2 discipline, N-1).
-    pub(crate) fn register_waiter(&self, waker: &Waker) {
-        let mut waiters = self.waiters.lock().expect("send-accounting waiters lock");
-        if !waiters.iter().any(|w| w.will_wake(waker)) {
-            waiters.push(waker.clone());
+    /// Register `waker` for parked stream `id` to be woken when residency next
+    /// drops (keyed multi-waiter). Callers MUST register *before* the final
+    /// over-cap re-check so a release racing between check and park cannot be
+    /// missed (SF-2 discipline, N-1). A re-poll replaces the prior waker for the
+    /// same `id`; `will_wake` skips a redundant clone. No-op under `cap == None`
+    /// (admission never parks, so nothing ever registers).
+    pub(crate) fn register_waiter(&self, id: u64, waker: &Waker) {
+        if self.cap.is_none() {
+            return;
         }
+        let mut waiters = self.waiters.lock().expect("send-accounting waiters lock");
+        match waiters.get(&id) {
+            Some(existing) if existing.will_wake(waker) => {}
+            _ => {
+                waiters.insert(id, waker.clone());
+            }
+        }
+    }
+
+    /// Remove stream `id`'s parked-admission waker (on successful admission or on
+    /// `H3SendStream` drop) so a cancelled/admitted sender does not retain a
+    /// waker until the next release. Idempotent; no-op under `cap == None`.
+    pub(crate) fn unregister_waiter(&self, id: u64) {
+        if self.cap.is_none() {
+            return;
+        }
+        let mut waiters = self.waiters.lock().expect("send-accounting waiters lock");
+        waiters.remove(&id);
     }
 
     /// Release `bytes` back to the pool and wake every parked admission (they
@@ -436,12 +467,18 @@ impl SendAccounting {
                     Some(cur.saturating_sub(bytes))
                 });
         }
+        // The default (unlimited) path never parks, so the waiter map is
+        // provably empty — skip the lock entirely to keep it byte-for-byte as
+        // cheap as before SF-6 (opus#2). Only a finite cap can have waiters.
+        if self.cap.is_none() {
+            return;
+        }
         // Wake all waiters even for a zero-byte release: a zero-byte permit still
         // signals an admission slot may have opened elsewhere. Drain-and-wake so
         // a re-parking admission re-registers freshly.
         let wakers: Vec<Waker> = {
             let mut waiters = self.waiters.lock().expect("send-accounting waiters lock");
-            std::mem::take(&mut *waiters)
+            waiters.drain().map(|(_id, w)| w).collect()
         };
         for w in wakers {
             w.wake();
@@ -787,7 +824,7 @@ mod tests {
         let waker = flag_waker(flag.clone());
         // Over-cap attempt fails; the front end registers then re-checks.
         assert!(acct.try_reserve(50).is_none());
-        acct.register_waiter(&waker);
+        acct.register_waiter(7, &waker);
         assert!(acct.try_reserve(50).is_none());
         assert!(!flag.load(Ordering::SeqCst));
 
@@ -802,16 +839,59 @@ mod tests {
 
     #[test]
     fn send_accounting_register_waiter_dedups_equal_waker() {
-        // Repeated registration of the same waker (a stream polled repeatedly)
-        // must not grow the waiter list without bound.
+        // Repeated registration of the same stream's waker (a stream polled
+        // repeatedly) must not grow the waiter map: it is keyed by stream id.
         let acct = SendAccounting::new(Some(10));
         let _p = acct.try_reserve(10).expect("fills cap");
         let flag = Arc::new(AtomicBool::new(false));
         let waker = flag_waker(flag.clone());
-        acct.register_waiter(&waker);
-        acct.register_waiter(&waker);
-        acct.register_waiter(&waker);
+        acct.register_waiter(3, &waker);
+        acct.register_waiter(3, &waker);
+        acct.register_waiter(3, &waker);
         assert_eq!(acct.waiters.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn send_accounting_unregister_drops_parked_waiter() {
+        // A cancelled/admitted stream unregisters its waker so the cap guard's
+        // waiter map cannot accumulate stale entries under a stalled peer + churn
+        // (SH-E). Two distinct streams park; unregistering one leaves exactly the
+        // other, and a subsequent release wakes only the still-parked stream.
+        let acct = SendAccounting::new(Some(100));
+        let _p = acct.try_reserve(100).expect("fills cap");
+        let flag_a = Arc::new(AtomicBool::new(false));
+        let flag_b = Arc::new(AtomicBool::new(false));
+        acct.register_waiter(1, &flag_waker(flag_a.clone()));
+        acct.register_waiter(2, &flag_waker(flag_b.clone()));
+        assert_eq!(acct.waiters.lock().unwrap().len(), 2);
+
+        // Stream 1 is dropped/admitted → unregister removes exactly its entry.
+        acct.unregister_waiter(1);
+        assert_eq!(acct.waiters.lock().unwrap().len(), 1);
+        // Idempotent: unregistering an absent id is a no-op.
+        acct.unregister_waiter(1);
+        assert_eq!(acct.waiters.lock().unwrap().len(), 1);
+
+        // A release wakes only the still-parked stream 2, never the gone one.
+        drop(_p);
+        assert!(
+            !flag_a.load(Ordering::SeqCst),
+            "unregistered stream not woken"
+        );
+        assert!(flag_b.load(Ordering::SeqCst), "still-parked stream woken");
+    }
+
+    #[test]
+    fn send_accounting_unlimited_never_registers_waiters() {
+        // Under the default (unlimited) config the waiter map is never touched:
+        // register/unregister are no-ops and the map stays empty (lock-free
+        // default path — opus#2).
+        let acct = SendAccounting::new(None);
+        let flag = Arc::new(AtomicBool::new(false));
+        acct.register_waiter(1, &flag_waker(flag));
+        assert!(acct.waiters.lock().unwrap().is_empty());
+        acct.unregister_waiter(1);
+        assert!(acct.waiters.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -826,6 +906,73 @@ mod tests {
         assert_eq!(p.bytes(), 0);
         drop(p);
         assert_eq!(acct.resident(), 0);
+    }
+
+    #[test]
+    fn send_accounting_zero_byte_reserve_admits_even_when_over_cap() {
+        // The one-in-flight-unit exception can leave residency ABOVE the cap
+        // (an oversize buffer, or `cap == 0`). A zero-byte reserve adds nothing
+        // and MUST still admit in that state — it can never reduce residency, so
+        // parking it would stall a 0-wire-byte write needlessly (gemini). A
+        // non-zero reserve in the same state correctly parks.
+        let acct = SendAccounting::new(Some(100));
+        // Oversize admission via the `cur == 0` exception pushes resident > cap.
+        let big = acct
+            .try_reserve(250)
+            .expect("oversize admits as the one unit");
+        assert!(acct.resident() > acct.cap().unwrap());
+        // A non-zero reserve now parks (over cap, something resident).
+        assert!(acct.try_reserve(1).is_none());
+        // A zero-byte reserve still admits despite being over cap.
+        let z = acct
+            .try_reserve(0)
+            .expect("zero-byte reserve admits over cap");
+        assert_eq!(z.bytes(), 0);
+        drop(z);
+        drop(big);
+        assert_eq!(acct.resident(), 0);
+    }
+
+    #[test]
+    fn send_accounting_concurrent_admissions_never_exceed_cap() {
+        // SF-6 (e): the aggregate bound is enforced atomically. With many threads
+        // racing `try_reserve` against a shared cap, peak residency never exceeds
+        // the cap — the `fetch_update` reservation has no check-then-add window
+        // that could let two admissions oversubscribe. (Each unit is < cap, so
+        // the single-in-flight oversize exception never applies here.)
+        use std::thread;
+        const UNIT: usize = 10;
+        const CAP: usize = 100;
+        let acct = Arc::new(SendAccounting::new(Some(CAP)));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let acct = Arc::clone(&acct);
+            let peak = Arc::clone(&peak);
+            handles.push(thread::spawn(move || {
+                let mut held: Vec<SendBytesPermit> = Vec::new();
+                for _ in 0..256 {
+                    if let Some(p) = acct.try_reserve(UNIT) {
+                        // Record residency observed while holding this permit.
+                        peak.fetch_max(acct.resident(), Ordering::SeqCst);
+                        held.push(p);
+                        if held.len() > 3 {
+                            held.remove(0); // churn: release the oldest
+                        }
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(
+            peak.load(Ordering::SeqCst) <= CAP,
+            "peak residency {} oversubscribed cap {CAP}",
+            peak.load(Ordering::SeqCst),
+        );
+        // All permits dropped → residency drains fully.
+        assert_eq!(acct.resident(), 0, "all reservations released");
     }
 
     // ---- test waker plumbing ----

@@ -519,9 +519,16 @@ struct QuicheDriver<B: Buf = Bytes> {
     //    (`PKT_BUF_LEN`, e.g. 64 KiB — at least `max_send_udp_payload_size`, larger
     //    to amortize batched sends), NOT capped at MAX_CHUNK, so packet throughput
     //    is not throttled to the stream chunk size.
-    //  * `scratch` is the `stream_recv` target only, capped at MAX_CHUNK (§5.1).
+    //  * `recv_buf` is the `stream_recv` target. It is a lazily-allocated,
+    //    *reused* `BytesMut` arena (SF-5: nothing is allocated until the first
+    //    readable byte; SF-1: reused across chunks). Each read grows a MAX_CHUNK
+    //    window (§5.1) and carves the filled prefix out with `split_to(len)
+    //    .freeze()` — an O(1) refcounted slice sharing the arena's backing, so
+    //    h3 gets an owned `Bytes` with no per-chunk copy. A fresh RECV_ARENA
+    //    block (a small multiple of MAX_CHUNK) is reserved only when the arena is
+    //    exhausted or still shared by a live frozen chunk, amortizing allocation.
     pkt_buf: Vec<u8>,                    // buffer(): outbound packet buffer, len PKT_BUF_LEN
-    scratch: Vec<u8>,                    // stream_recv target, capped at MAX_CHUNK (§5.1)
+    recv_buf: Option<BytesMut>,          // reused stream_recv arena, lazily allocated (SF-1/SF-5)
     // Handshake-completion signal. on_conn_close is gated by should_act(), which is
     // false before establishment, so it CANNOT classify handshake failures. On
     // success on_conn_established sends Ok. If the app is dropped first, Drop sends
@@ -565,10 +572,14 @@ struct ConnShared {
 // `watch::Receiver::changed()` is an async future while the `h3::quic` methods
 // are synchronous `poll_*(cx)` fns.
 struct StreamRecvState {
-    bytes: mpsc::Sender<Bytes>,        // BOUNDED; worker reserves a permit before stream_recv
+    bytes: mpsc::Sender<Bytes>,        // BOUNDED (depth configurable, default BYTE_CHANNEL_DEPTH); worker reserves a permit before stream_recv
     terminal: TerminalCell<RecvEnd>,   // out-of-band sticky end reason
     resume: Arc<AtomicBool>,           // shared pending-resume bit; producer sets on false->true (finding 3)
-    blocked: bool,
+    // SF-2: shared park flag, published Release by the worker before its capacity
+    // re-check and swapped AcqRel-clear by the consumer, so a `RecvResume` is sent
+    // only when the reader had actually parked (no resume on every consumed chunk)
+    // while never dropping a genuine resume.
+    blocked: Arc<AtomicBool>,
 }
 struct StreamSendState {
     // Ordered per-stream Write/Finish queue (iter12 findings 3 & 4). A Reset is
@@ -578,7 +589,12 @@ struct StreamSendState {
     // already been removed and completed Ok, so reset cannot rewrite that result.
     // `on_conn_close` drains any surviving completion with `SendEnd::Conn`.
     //   enum SendOp {
-    //     Write  { buf: WriteBuf<B>, done: oneshot::Sender<Result<(), SendEnd>> },
+    //     // SF-3: completion rides a reusable per-stream `WriteCompleter` stamped
+    //     // with a generation instead of a freshly-allocated oneshot per chunk.
+    //     // SF-6: the RAII `SendBytesPermit` reserves the write's wire bytes
+    //     // against the aggregate send-byte cap and releases them on the op's
+    //     // exactly-once completion/drain (or drop).
+    //     Write  { buf: WriteBuf<B>, done: WriteCompleter<SendEnd>, permit: Option<SendBytesPermit> },
     //     Finish { done: oneshot::Sender<Result<(), SendEnd>> },
     //   }
     send_ops: VecDeque<SendOp>,
@@ -709,8 +725,11 @@ struct PeerStream {
   entry, and **never** publish `ConnTerminal::Internal`; the pending
   `StopSending` from the half's `Drop` is idempotent with this. Otherwise
   **reserve-then-read in a loop up to `CHUNK_BUDGET` chunks** (finding 5): with a
-  permit in hand call `stream_recv(id, &mut scratch)` (≤ `MAX_CHUNK`) and
-  `Permit::send` the `Bytes`, repeating while `qconn.stream_readable(id)` is still
+  permit in hand call `stream_recv(id, &mut window)` where `window` is a
+  `MAX_CHUNK`-sized region grown in the reused `recv_buf` arena (§5.1 / SF-1),
+  then carve the filled prefix out with `split_to(len).freeze()` and `Permit::send`
+  the resulting `Bytes` (an O(1) refcounted slice, no per-chunk copy), repeating
+  while `qconn.stream_readable(id)` is still
   true and a fresh permit reserves. If data still remains when `CHUNK_BUDGET` is
   hit, **requeue the id in `pending_readable` keeping its membership** so a body
   larger than `MAX_CHUNK` fully drains across bounded callbacks instead of
@@ -1052,11 +1071,14 @@ is the sender and runs inside the **synchronous** `process_reads`/`process_write
 callbacks (no `Context`, no `await`), so it moves bytes with `try_reserve` —
 **not** `PollSender`, whose `poll_reserve(cx)` needs a poll context these callbacks
 don't have (finding 2). Order matters (finding 3): **reserve a permit, then
-`stream_recv`** into a scratch buffer capped at `MAX_CHUNK` (e.g. 16 KiB), then
-`Permit::send`. Reserving first guarantees a full channel is detected *before*
-bytes are pulled out of quiche, so no data is ever dropped; the per-stream memory
-bound is therefore `channel_depth × MAX_CHUNK`. The front end is the receiver and
-polls `Receiver::poll_recv(cx)` directly.
+`stream_recv`** into a `MAX_CHUNK`-sized window (e.g. 16 KiB) grown in the reused
+`recv_buf` arena, then carve and `Permit::send` the filled prefix via
+`split_to(len).freeze()` (SF-1: O(1) refcounted, no per-chunk copy). Reserving
+first guarantees a full channel is detected *before* bytes are pulled out of
+quiche, so no data is ever dropped; the per-stream memory bound is therefore
+`channel_depth × MAX_CHUNK` (`channel_depth` configurable via
+`recv_channel_depth`, default `BYTE_CHANNEL_DEPTH`; §12 S3). The front end is the
+receiver and polls `Receiver::poll_recv(cx)` directly.
 
 The stream's **terminal** (`RecvEnd`) lives in a separate out-of-band
 `TerminalCell` (§5, findings 1 & 3): a full byte channel can therefore never
@@ -1157,13 +1179,19 @@ control bounds only the *peer's* influence, not the local application's**, and t
 per-iteration quotas below bound processing *work*, not queued bytes or command
 count. Operators bound it by limiting local stream/opener concurrency and the
 per-send buffer sizes chosen by the h3 layer; the depth/lag **metrics** (§12)
-observe this backlog but are **not** themselves a limit. If a future revision needs
-a hard global ceiling, the enforceable option is to keep bulk `WriteBuf`s in a
-bounded/coalesced per-stream slot and enqueue only a small `SendReady { id }`
-notification, plus aggregate pending-open/active-stream/queued-byte admission
-accounting — one possible design, not a mandated change. This mirrors
-tokio-quiche's own H3 driver split (unbounded control, bounded body/accept flow
-control), which shares the same caller-controlled control-plane property.
+observe this backlog but are **not** themselves a limit. **SF-6 (§12 S3)** now adds
+an *optional* aggregate send-byte cap: `SendAccounting` tracks admitted wire bytes
+and, when a finite cap is configured (`max_buffered_send_bytes`, default `None` =
+unbounded, preserving the behavior described here), the front end parks a write via
+async backpressure rather than admitting it — a hard aggregate ceiling on buffered
+send bytes without reordering or dropping. The remaining unbounded dimension is
+command *count* (opens/finishes/resets). If a future revision needs to bound that
+too, the enforceable option is to keep bulk `WriteBuf`s in a bounded/coalesced
+per-stream slot and enqueue only a small `SendReady { id }` notification, plus
+aggregate pending-open/active-stream admission accounting — one possible design,
+not a mandated change. This mirrors tokio-quiche's own H3 driver split (unbounded
+control, bounded body/accept flow control), which shares the same caller-controlled
+control-plane property.
 
 ```rust
 enum DriverCommand<B: Buf> {
@@ -1172,7 +1200,10 @@ enum DriverCommand<B: Buf> {
     // (Shutdown::Read is invalid for a locally-initiated uni stream, finding 4).
     OpenBidi { reply: oneshot::Sender<Result<StreamHalves, Arc<ConnTerminal>>> },
     OpenUni  { reply: oneshot::Sender<Result<H3SendStream, Arc<ConnTerminal>>> },
-    Send        { id: u64, buf: WriteBuf<B>, done: oneshot::Sender<Result<(), SendEnd>> },
+    // SF-3: `done` is a reusable per-stream `WriteCompleter` (generation-stamped),
+    // not a per-chunk oneshot. SF-6: `permit` carries the write's byte reservation
+    // (Some under a finite cap; None when unbounded), released on completion/drop.
+    Send        { id: u64, buf: WriteBuf<B>, done: WriteCompleter<SendEnd>, permit: Option<SendBytesPermit> },
     Finish      { id: u64, done: oneshot::Sender<Result<(), SendEnd>> },
     Reset       { id: u64, code: u64 },
     StopSending { id: u64, code: u64 },
@@ -1601,18 +1632,24 @@ Modeled on `msquic-h3`'s `H3Stream` / `H3SendStream` / `H3RecvStream`:
   `Option<WriteBuf<B>>` and returns an error if a buffer is already pending;
   its front-end fields include:
   ```rust
-  send_completion: Option<oneshot::Receiver<Result<(), SendEnd>>>,
+  stash: Option<WriteBuf<B>>,                 // the single stashed pending write
+  // SF-3: a reusable, generation-stamped completion cell instead of a per-write
+  // oneshot; `send_gen` is the in-flight write's generation (None when idle).
+  write_completion: WriteCompletion<SendEnd>,
+  send_gen: Option<u64>,
+  send_accounting: Arc<SendAccounting>,       // SF-6: aggregate send-byte cap (shared)
   finish_completion: Option<oneshot::Receiver<Result<(), SendEnd>>>,
   finish_result: Option<Result<(), SendEnd>>, // retained for repeated poll_finish
   finalized: bool,                            // FIN/reset/terminal chosen
   ```
   `poll_ready` uses this precedence:
-  1. If `send_completion` is `Some`, poll it **first**. On `Ready(result)`, clear
-     the slot and return that exact recorded result once, even if sticky `status`
-     was set after the worker sent the completion. On `Pending`, retain it and
-     return `Pending`. If the oneshot is cancelled, clear it and consult sticky
-     `status` with the race-free check/register/recheck order; return that terminal
-     if present, otherwise `InternalError`.
+  1. If `send_gen` is `Some`, poll `write_completion` for that generation
+     **first**. On `Ready(outcome)`, clear `send_gen` and return that exact
+     recorded result once, even if sticky `status` was set after the worker stored
+     the completion. On `Pending`, retain it and return `Pending`. A `Cancelled`
+     outcome (dropped completer) consults sticky `status` with the race-free
+     check/register/recheck order; return that terminal if present, otherwise
+     `InternalError`.
   2. With no in-flight operation, consult sticky `status`;
      `Stopped`/local-`Reset`/`Conn` rejects idle or new work. This includes a
      newly promoted parked peer bidi stream: promotion installs any retained
@@ -1621,9 +1658,13 @@ Modeled on `msquic-h3`'s `H3Stream` / `H3SendStream` / `H3RecvStream`:
   3. If no `WriteBuf` is stashed, return `Ready(Ok(()))` immediately (the idle /
      no-buffer readiness fast path, §2.1 — defensive, reference-backend-compatible;
      it does **not** presume `poll_ready` runs before `send_data`).
-  4. Otherwise move the stash into one `Send` command, store its completion
-     receiver, wake the worker, and poll that same receiver on this and later
-     calls. It is never enqueued twice.
+  4. Otherwise reserve the write's wire bytes against `send_accounting` (SF-6:
+     always succeeds when unbounded; under a finite cap, register the waker and
+     re-check, then re-stash and return `Pending` if still over the cap — async
+     backpressure, never dropped or reordered). On admission, `begin` a fresh
+     `write_completion` generation, move the stash into one `Send` carrying that
+     generation's completer and the byte permit, wake the worker, and poll that
+     generation on this and later calls. It is never enqueued twice.
 
   `poll_finish` has a separate idempotent state machine. If `finish_result` is
   present, return its retained result. If `finish_completion` is present, poll it

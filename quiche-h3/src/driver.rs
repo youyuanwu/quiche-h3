@@ -113,6 +113,20 @@ const WRITE_BUDGET: usize = 32;
 /// transport call").
 const MAX_WRITE_CHUNK: usize = MAX_CHUNK;
 
+/// Receive-arena reservation size (SF-1). The reusable `recv_buf` is grown a
+/// whole `RECV_ARENA` block at a time and individual `MAX_CHUNK` windows are
+/// carved out of it with `split_to().freeze()` (O(1), shares the backing
+/// allocation). This is what makes the allocation *amortized*: reserving only
+/// `MAX_CHUNK` would force `BytesMut` to reallocate on **every** read once a
+/// frozen chunk keeps the buffer shared (non-unique), reintroducing the very
+/// per-chunk `malloc` SF-1 removes. One `RECV_ARENA` allocation instead backs
+/// `RECV_ARENA / avg_chunk` delivered chunks; the block is freed once the
+/// worker and every consumer have dropped their slices. It is per-connection
+/// working memory (one arena per driver, reused across all streams), lazily
+/// allocated on first receive (SF-5), and small next to the per-stream recv
+/// channel budget (`recv_channel_depth × MAX_CHUNK`).
+const RECV_ARENA: usize = 8 * MAX_CHUNK;
+
 /// Small low-water re-arm progress threshold (§5.3): any capacity gain wakes a
 /// blocked write, rather than starving it on the full remaining length.
 const REARM_THRESHOLD: usize = 1;
@@ -687,11 +701,14 @@ pub(crate) struct QuicheDriver<B: Buf = Bytes> {
     pkt_buf: Vec<u8>,
     /// Configured recv byte-channel depth applied in `build_recv` (SF-4).
     recv_channel_depth: usize,
-    /// Reusable `stream_recv` target (SF-1). A single `BytesMut` grown to
-    /// `MAX_CHUNK` per read; each chunk is handed out via `split_to(len).freeze()`
-    /// (O(1) refcounted share of the backing allocation, no per-chunk memcpy).
-    /// Lazily allocated on first receive (SF-5): a connection that never receives
-    /// data never allocates it (`None`).
+    /// Reusable `stream_recv` target arena (SF-1). A single `BytesMut` grown a
+    /// `RECV_ARENA` block at a time; each chunk is carved via
+    /// `split_to(len).freeze()` (O(1) refcounted share of the backing
+    /// allocation, no per-chunk memcpy). Reserving a multi-chunk arena — rather
+    /// than one `MAX_CHUNK` window — is what makes the allocation *amortized*
+    /// while consumers hold frozen slices (a shared `BytesMut` cannot be reused
+    /// in place). Lazily allocated on first receive (SF-5): a connection that
+    /// never receives data never allocates it (`None`).
     recv_buf: Option<BytesMut>,
     /// Counts hoisted per-stream sender lookup+clone operations (SF-7): with the
     /// clone hoisted out of the chunk loop this increments once per `drain_stream`.
@@ -1308,29 +1325,62 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                     return;
                 }
             };
-            // SF-1: read into the reusable `BytesMut` (lazily allocated per SF-5)
-            // and hand the consumer an owned `Bytes` via `split_to(len).freeze()`.
-            // `stream_recv` requires an *initialized* `&mut [u8]`, so the buffer is
-            // grown to `MAX_CHUNK` with a safe zero-fill (`resize`) — NOT an unsafe
-            // uninitialized-slice cast. The zero-fill of the reused window is the
-            // accepted trade-off (D-1): this removes the per-chunk *memcpy*, not the
-            // fill; only the freshly-written `[..len]` region is frozen, so no
-            // uninitialized (or stale) byte is ever exposed to h3. The frozen slice
-            // shares the backing allocation with the reader buffer (O(1)); a later
-            // grow reallocates instead of overwriting bytes the consumer still holds.
+            // SF-1: read into the reusable `BytesMut` arena (lazily allocated
+            // per SF-5) and hand the consumer an owned `Bytes` via
+            // `split_to(len).freeze()`. `stream_recv` requires an *initialized*
+            // `&mut [u8]`, so a `MAX_CHUNK` window is grown with a safe
+            // zero-fill (`resize`) — NOT an unsafe uninitialized-slice cast. The
+            // zero-fill of the reused window is the accepted trade-off (D-1):
+            // this removes the per-chunk *memcpy*, not the fill; only the
+            // freshly-written `[..len]` region is frozen, so no uninitialized
+            // (or stale) byte is ever exposed to h3. The frozen slice shares the
+            // arena's backing allocation with the reader buffer (O(1)); a later
+            // grow reallocates instead of overwriting bytes the consumer holds.
+            //
+            // Allocation is *amortized* (SF-1): the arena keeps ≥ one MAX_CHUNK
+            // window of writable capacity and only reserves a fresh RECV_ARENA
+            // block when exhausted (or still shared by a live frozen chunk).
+            // `reserve` reclaims the block in place once earlier chunks drop, so
+            // one allocation backs many delivered chunks. Reserving RECV_ARENA
+            // (not MAX_CHUNK) is essential: a MAX_CHUNK reservation reallocates
+            // on every read while any frozen chunk keeps the buffer non-unique,
+            // which would make this *slower* than the `copy_from_slice` it
+            // replaces (2 allocs/chunk vs 1). Between reads the arena is fully
+            // carved (len == 0); each read grows it to a MAX_CHUNK window and
+            // carves back to len == 0.
             let read = {
                 let buf = self.recv_buf.get_or_insert_with(BytesMut::new);
+                debug_assert_eq!(
+                    buf.len(),
+                    0,
+                    "recv arena must be fully carved between reads"
+                );
+                if buf.capacity() < MAX_CHUNK {
+                    buf.reserve(RECV_ARENA);
+                }
                 buf.resize(MAX_CHUNK, 0);
                 match qconn.stream_recv(id, &mut buf[..]) {
                     Ok((len, fin)) => {
                         let chunk = if len > 0 {
+                            buf.truncate(len);
+                            // O(1) refcounted carve sharing the arena backing;
+                            // the retained tail advances past it (capacity
+                            // shrinks by `len`) and the next read fills the rest.
                             Some(buf.split_to(len).freeze())
                         } else {
+                            // Nothing written: rewind the zero-filled window so
+                            // the arena position (and capacity) is unchanged.
+                            buf.truncate(0);
                             None
                         };
                         Ok((chunk, fin))
                     }
-                    Err(err) => Err(err),
+                    Err(err) => {
+                        // Rewind the zero-filled window on error (no wasted
+                        // capacity, arena stays fully carved for the next read).
+                        buf.truncate(0);
+                        Err(err)
+                    }
                 }
             };
             match read {
@@ -2843,6 +2893,58 @@ mod tests {
         assert!(matches!(ho.recv.terminal.get(), Some(RecvEnd::Fin)));
     }
 
+    /// SF-1 (SC-002): the receive arena *amortizes* allocation — draining
+    /// several chunks the consumer holds does NOT reallocate the buffer per
+    /// chunk. Each delivered chunk is contiguous with the previous one in the
+    /// SAME backing allocation, which holds iff no per-chunk realloc occurred
+    /// (a fresh allocation per chunk would place them at unrelated addresses).
+    /// This is the regression guard for the arena fix: a `MAX_CHUNK`-only
+    /// reservation reallocates every read once a frozen chunk is retained.
+    #[test]
+    fn sf1_receive_arena_amortizes_allocation() {
+        let (mut d, _h) = driver();
+        let (tx, mut rx) = mpsc::channel::<Bytes>(BYTE_CHANNEL_DEPTH);
+        d.recv.insert(
+            0,
+            StreamRecvState {
+                bytes: tx,
+                terminal: TerminalCell::new(),
+                resume: Arc::new(AtomicBool::new(false)),
+                blocked: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let mut c = MockConn::new();
+        c.script_recv(
+            0,
+            [
+                data(b"aaaa", false),
+                data(b"bbbb", false),
+                data(b"cccc", false),
+                data(b"dddd", false),
+            ],
+        );
+        d.read_budget = READ_BUDGET;
+        d.drain_stream(&mut c, 0);
+
+        let mut held = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            held.push(chunk);
+        }
+        assert_eq!(held.len(), 4, "all four chunks drained in one pass");
+        let mut prev_end: Option<usize> = None;
+        for chunk in &held {
+            let start = chunk.as_ptr() as usize;
+            if let Some(pe) = prev_end {
+                assert_eq!(
+                    pe, start,
+                    "chunk not contiguous with the previous → arena reallocated \
+                     per chunk (allocation not amortized)"
+                );
+            }
+            prev_end = Some(start + chunk.len());
+        }
+    }
+
     /// SF-7 (SC-003): the per-stream sender lookup+clone is hoisted out of the
     /// chunk loop — draining K chunks in one `drain_stream` performs exactly one
     /// lookup/clone, not one per chunk.
@@ -2980,10 +3082,20 @@ mod tests {
         assert!(matches!(terminal.get(), Some(RecvEnd::Fin)));
     }
 
-    /// SF-2 §5.1: the worker's capacity re-check under the lost-wakeup handshake
-    /// must NOT park when a slot is already free. Here `blocked` is pre-set (as if
-    /// a prior park), but the channel has room, so the drain proceeds and clears
-    /// the park flag — never leaving the stream parked with a free slot.
+    /// SF-2 §5.1: with a free slot the worker takes the initial-reserve fast path
+    /// and never parks, even if `blocked` was left set by a prior cycle — the
+    /// drain proceeds and clears the stale park flag.
+    ///
+    /// Coverage note: the *mid-window* case (initial reserve returns `Full`, then
+    /// a slot is freed by the consumer before the post-`blocked=true` re-check, so
+    /// the re-check succeeds and proceeds instead of parking) is guaranteed by the
+    /// tokio channel's atomic permit semantics and cannot be hit deterministically
+    /// in a single-threaded unit test without a production test hook. Its
+    /// correctness-critical counterpart — a resume emitted iff the reader was
+    /// actually parked — is covered directly by the consumer-side tests
+    /// `recv_resume_gated_when_worker_never_blocked` /
+    /// `recv_resume_sent_once_when_worker_blocked` (stream.rs) and by
+    /// `sf2_worker_publishes_blocked_on_full_channel` below.
     #[test]
     fn sf2_worker_recheck_does_not_park_with_free_slot() {
         let (mut d, _h) = driver();
@@ -3203,8 +3315,19 @@ mod tests {
         );
     }
 
-    /// MF-1: after `AcceptBidiResume` + freed capacity, a parked class resumes in
-    /// FIFO order (the earliest-parked id is admitted before later backlog ids).
+    /// MF-1: after `AcceptBidiResume` + freed capacity, `promote_parked` drains
+    /// the parked backlog in FIFO order (earliest-parked id admitted before later
+    /// backlog ids).
+    ///
+    /// Scope note (test fidelity): this exercises `promote_parked` in isolation,
+    /// which is strictly FIFO across the `parked_bidi` queue. The full
+    /// `run_read_pump` runs `phase2_admission` *before* `promote_parked`, so a
+    /// brand-new pending id arriving in the same resume pump can be admitted
+    /// ahead of an already-parked id. That phase ordering is PRE-EXISTING on
+    /// `dev` (unchanged by MF-1, which preserves existing admission semantics per
+    /// the task mandate); MF-1 only bounds the scan and suppresses the runnable
+    /// signal for a capacity-blocked class. This test therefore asserts the
+    /// promotion queue's ordering, not the whole-pump admit order.
     #[test]
     fn mf1_parked_class_resumes_in_fifo_order() {
         let (mut d, mut h) = QuicheDriver::<Bytes>::new(false, 1, 1);
@@ -3757,6 +3880,47 @@ mod tests {
             0,
             "reset drain releases the reservation"
         );
+    }
+
+    /// SF-3 integrated: one reusable completion cell serves two sequential writes
+    /// on the same stream through the real driver drain path. Completing
+    /// generation `g`, then beginning `g+1` on the SAME cell, resolves each
+    /// generation exactly once with no cross-generation bleed: after `g` is
+    /// consumed, a `Reset` preempting `g+1` resolves only `g+1`, and a stale poll
+    /// of `g` reads nothing. The cell is reused (not reallocated per write).
+    #[test]
+    fn sf3_reused_cell_across_generations_no_cross_bleed() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        let cell = crate::buffer::WriteCompletion::new();
+
+        // Generation g: a full write that completes Ok through stage_send.
+        let g = push_send_on(&mut d, &cell, 0, b"hello");
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+        assert!(matches!(g.state(), ProbeState::Ok), "g completes once");
+        assert_eq!(d.shared.send_accounting.resident(), 0, "g released");
+        // g is now consumed: a stale re-poll of the same generation reads nothing.
+        assert!(matches!(g.state(), ProbeState::Pending), "g consumed once");
+
+        // Generation g+1 on the SAME cell, preempted by a Reset before staging.
+        let g1 = push_send_on(&mut d, &cell, 0, b"world");
+        assert_eq!(cell.generation(), 2, "same cell reused across both writes");
+        d.apply_inbox(&mut c); // move Write into send_ops (permit rides along)
+        assert_eq!(d.shared.send_accounting.resident(), wire_len(b"world"));
+        d.inbox.push_back(DriverCommand::Reset { id: 0, code: 7 });
+        d.apply_inbox(&mut c); // apply_reset drains g+1 exactly once
+
+        assert!(
+            matches!(
+                g1.state(),
+                ProbeState::Err(SendEnd::Reset { error_code: 7 })
+            ),
+            "g+1 resolves once as the reset"
+        );
+        // No cross-generation bleed: the stale g generation still reads nothing.
+        assert!(matches!(g.state(), ProbeState::Pending), "no bleed into g");
+        assert_eq!(d.shared.send_accounting.resident(), 0, "g+1 released");
     }
 
     /// SF-6: a finite worker-level cap bounds admitted send bytes; once the cap
