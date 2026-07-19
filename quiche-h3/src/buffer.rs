@@ -6,9 +6,9 @@
 //! to publish terminal reasons to synchronous `h3::quic` `poll_*` methods.
 #![allow(dead_code)] // wired up incrementally across Phases 2–8
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use bytes::Buf;
 use futures::task::AtomicWaker;
@@ -329,6 +329,149 @@ impl<E> Drop for WriteCompleter<E> {
     }
 }
 
+/// Aggregate buffered-send-byte accounting with an optional finite cap (SF-6,
+/// FR-010/FR-011, §12 S3). Bounds the total bytes resident in the unbounded
+/// command channel / per-stream `SendOp` queues so a slow/stalled peer cannot
+/// drive send-side memory without limit.
+///
+/// The accounting domain is **admitted** bytes only — a byte enters residency
+/// when the front end reserves it just before enqueuing a `Send` command, and
+/// leaves when the carrying [`SendBytesPermit`] drops (the SF-3 completion
+/// chokepoint: write completion, terminal drain, unapplied-close, or enqueue
+/// rollback). The front-end per-stream `stash` is **excluded** — it is a single
+/// not-yet-admitted `WriteBuf` bounded by the h3 single-outstanding-write
+/// contract, not aggregate buffering.
+///
+/// `cap == None` (the default) means unlimited: `try_reserve` always succeeds
+/// and no admission ever parks, so behavior is byte-for-byte unchanged from
+/// before SF-6 apart from two relaxed atomics per write. A finite cap bounds
+/// residency to at most `cap + one admission unit` (the oversize/`cap == 0`
+/// exception below guarantees forward progress).
+pub(crate) struct SendAccounting {
+    /// Resident admitted buffered send bytes.
+    resident: AtomicUsize,
+    /// Optional finite cap. `None` = unlimited (default; behavior unchanged).
+    cap: Option<usize>,
+    /// Parked admissions waiting for residency to drop under the cap. A
+    /// hand-rolled multi-waiter (NOT a single [`AtomicWaker`], which would drop
+    /// other streams' wakers when several stalled streams contend — SH-E).
+    ///
+    /// `tokio::sync::Notify` is deliberately **not** used here: its `Notified`
+    /// future borrows the `Notify` and must be held across polls to stay
+    /// registered, which is infeasible inside the synchronous `poll_ready`
+    /// (§12 S3 trade-off note).
+    waiters: Mutex<Vec<Waker>>,
+}
+
+impl SendAccounting {
+    /// Create shared accounting with an optional finite `cap`.
+    pub(crate) fn new(cap: Option<usize>) -> Arc<Self> {
+        Arc::new(SendAccounting {
+            resident: AtomicUsize::new(0),
+            cap,
+            waiters: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Currently resident admitted send bytes (inspection / tests).
+    pub(crate) fn resident(&self) -> usize {
+        self.resident.load(Ordering::Acquire)
+    }
+
+    /// The configured cap, if finite.
+    pub(crate) fn cap(&self) -> Option<usize> {
+        self.cap
+    }
+
+    /// Try to admit `bytes`. Reserves atomically iff the new residency fits
+    /// under the cap, **or** if nothing is currently resident — the
+    /// one-in-flight-unit exception that lets an oversize buffer (or a `cap == 0`
+    /// configuration) still make progress, preserving liveness. Returns a
+    /// [`SendBytesPermit`] whose `Drop` releases the reservation exactly once.
+    ///
+    /// Unlimited (`cap == None`) always succeeds. `bytes == 0` always succeeds
+    /// with a zero-cost permit.
+    pub(crate) fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<SendBytesPermit> {
+        let outcome = self
+            .resident
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                let next = cur.checked_add(bytes)?;
+                match self.cap {
+                    // Over cap, and something is already resident: reject and let
+                    // the caller park until a permit drops.
+                    Some(cap) if next > cap && cur != 0 => None,
+                    _ => Some(next),
+                }
+            });
+        match outcome {
+            Ok(_) => Some(SendBytesPermit {
+                accounting: Arc::clone(self),
+                bytes,
+            }),
+            Err(_) => None,
+        }
+    }
+
+    /// Register `waker` to be woken when residency next drops (multi-waiter).
+    /// Callers MUST register *before* the final over-cap re-check so a release
+    /// racing between check and park cannot be missed (SF-2 discipline, N-1).
+    pub(crate) fn register_waiter(&self, waker: &Waker) {
+        let mut waiters = self.waiters.lock().expect("send-accounting waiters lock");
+        if !waiters.iter().any(|w| w.will_wake(waker)) {
+            waiters.push(waker.clone());
+        }
+    }
+
+    /// Release `bytes` back to the pool and wake every parked admission (they
+    /// re-check under the atomic). Invoked only by [`SendBytesPermit::drop`].
+    fn release(&self, bytes: usize) {
+        if bytes != 0 {
+            // Saturating guard: each permit releases exactly once, so this never
+            // underflows in practice, but guard defensively rather than wrap.
+            let _ = self
+                .resident
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                    Some(cur.saturating_sub(bytes))
+                });
+        }
+        // Wake all waiters even for a zero-byte release: a zero-byte permit still
+        // signals an admission slot may have opened elsewhere. Drain-and-wake so
+        // a re-parking admission re-registers freshly.
+        let wakers: Vec<Waker> = {
+            let mut waiters = self.waiters.lock().expect("send-accounting waiters lock");
+            std::mem::take(&mut *waiters)
+        };
+        for w in wakers {
+            w.wake();
+        }
+    }
+}
+
+/// RAII reservation of `bytes` against a [`SendAccounting`] pool. Created by
+/// [`SendAccounting::try_reserve`] at admission and carried with the outbound
+/// `Send` command / `SendOp::Write`; its `Drop` decrements residency exactly
+/// once and wakes parked admissions. Moving the permit (through the command
+/// channel into the worker's op queue) never releases — only the final drop at
+/// the SF-3 completion chokepoint (or an unapplied-command / rollback drop)
+/// does.
+pub(crate) struct SendBytesPermit {
+    accounting: Arc<SendAccounting>,
+    bytes: usize,
+}
+
+impl SendBytesPermit {
+    /// The number of bytes this permit holds resident (inspection / tests).
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for SendBytesPermit {
+    fn drop(&mut self) {
+        self.accounting.release(self.bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +693,137 @@ mod tests {
             Poll::Ready(WriteOutcome::Done(Ok(()))) => {}
             other => panic!("expected Ready(Done(Ok)), got {other:?}"),
         }
+    }
+
+    // ---- SF-6 send-byte accounting ----
+
+    #[test]
+    fn send_accounting_unlimited_increments_and_releases_once() {
+        // Default (cap == None): every reserve succeeds and residency tracks the
+        // outstanding bytes, returning to zero after the permits drop.
+        let acct = SendAccounting::new(None);
+        assert_eq!(acct.resident(), 0);
+        assert_eq!(acct.cap(), None);
+
+        let p1 = acct.try_reserve(1000).expect("unlimited reserve");
+        let p2 = acct.try_reserve(2500).expect("unlimited reserve");
+        assert_eq!(acct.resident(), 3500);
+        assert_eq!(p1.bytes(), 1000);
+
+        drop(p1);
+        assert_eq!(acct.resident(), 2500);
+        drop(p2);
+        assert_eq!(acct.resident(), 0);
+    }
+
+    #[test]
+    fn send_accounting_capped_rejects_over_cap_then_admits_after_release() {
+        // A finite cap parks admissions that would exceed it, and re-admits once
+        // an outstanding permit drops (the front end retries after a wake).
+        let acct = SendAccounting::new(Some(100));
+        let p1 = acct.try_reserve(60).expect("fits under cap");
+        assert_eq!(acct.resident(), 60);
+
+        // 60 + 60 = 120 > 100 and residency is non-zero → rejected (park).
+        assert!(acct.try_reserve(60).is_none());
+        assert_eq!(
+            acct.resident(),
+            60,
+            "rejected reserve must not mutate residency"
+        );
+
+        // A smaller reserve that still fits is admitted.
+        let p2 = acct.try_reserve(40).expect("40 fits (100 total == cap)");
+        assert_eq!(acct.resident(), 100);
+        assert!(acct.try_reserve(1).is_none(), "at cap, nothing more admits");
+
+        drop(p1);
+        // 40 resident now; the 60 retry fits.
+        let _p3 = acct.try_reserve(60).expect("fits after release");
+        assert_eq!(acct.resident(), 100);
+        drop(p2);
+    }
+
+    #[test]
+    fn send_accounting_oversize_admits_one_unit_and_bounds_at_cap_plus_unit() {
+        // The `current == 0` exception lets a single oversize buffer through so
+        // an item larger than the cap can still make progress, but only one such
+        // unit is ever admitted: residency is bounded by cap + one unit.
+        let acct = SendAccounting::new(Some(100));
+        let big = acct
+            .try_reserve(250)
+            .expect("oversize admits when nothing resident");
+        assert_eq!(acct.resident(), 250);
+
+        // With the oversize unit resident, nothing else admits until it drops.
+        assert!(acct.try_reserve(1).is_none());
+        assert!(acct.try_reserve(250).is_none());
+        assert_eq!(acct.resident(), 250);
+
+        drop(big);
+        assert_eq!(acct.resident(), 0);
+        // cap == 0 is the degenerate oversize case: only the single-unit
+        // exception ever admits.
+        let acct0 = SendAccounting::new(Some(0));
+        let unit = acct0
+            .try_reserve(10)
+            .expect("cap==0 admits one in-flight unit");
+        assert!(acct0.try_reserve(1).is_none());
+        drop(unit);
+        assert!(acct0.try_reserve(10).is_some());
+    }
+
+    #[test]
+    fn send_accounting_release_wakes_parked_waiter() {
+        // A parked admission registers a waker; dropping a permit wakes it so it
+        // can retry. Register-before-recheck (SF-2) means a release racing the
+        // park is never missed.
+        let acct = SendAccounting::new(Some(100));
+        let p = acct.try_reserve(100).expect("fills cap");
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let waker = flag_waker(flag.clone());
+        // Over-cap attempt fails; the front end registers then re-checks.
+        assert!(acct.try_reserve(50).is_none());
+        acct.register_waiter(&waker);
+        assert!(acct.try_reserve(50).is_none());
+        assert!(!flag.load(Ordering::SeqCst));
+
+        drop(p);
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "release must wake the parked admission"
+        );
+        // After the wake the retry now fits.
+        assert!(acct.try_reserve(50).is_some());
+    }
+
+    #[test]
+    fn send_accounting_register_waiter_dedups_equal_waker() {
+        // Repeated registration of the same waker (a stream polled repeatedly)
+        // must not grow the waiter list without bound.
+        let acct = SendAccounting::new(Some(10));
+        let _p = acct.try_reserve(10).expect("fills cap");
+        let flag = Arc::new(AtomicBool::new(false));
+        let waker = flag_waker(flag.clone());
+        acct.register_waiter(&waker);
+        acct.register_waiter(&waker);
+        acct.register_waiter(&waker);
+        assert_eq!(acct.waiters.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn send_accounting_zero_byte_reserve_is_free() {
+        // A zero-byte write still yields a permit (uniform enqueue path) without
+        // perturbing residency.
+        let acct = SendAccounting::new(Some(100));
+        let p = acct
+            .try_reserve(0)
+            .expect("zero-byte reserve always admits");
+        assert_eq!(acct.resident(), 0);
+        assert_eq!(p.bytes(), 0);
+        drop(p);
+        assert_eq!(acct.resident(), 0);
     }
 
     // ---- test waker plumbing ----

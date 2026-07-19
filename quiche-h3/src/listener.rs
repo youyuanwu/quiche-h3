@@ -75,6 +75,14 @@ pub struct H3QuicheServerConfig {
     /// batch without a datapath assessment** (§5, §12): it can regress egress
     /// batching/throughput.
     pub packet_buffer_size: usize,
+    /// Optional aggregate cap (bytes) on buffered outbound send data admitted to
+    /// each accepted connection's worker (SF-6). `None` (default) leaves the send
+    /// path unbounded, preserving historical behavior. A finite cap bounds
+    /// resident admitted send bytes to at most `cap + one admission unit`, so a
+    /// slow/stalled peer cannot grow send-side memory without limit. Front-end
+    /// writes past the cap park (async backpressure) rather than being dropped or
+    /// reordered (§12 S3).
+    pub max_buffered_send_bytes: Option<usize>,
 }
 
 impl Default for H3QuicheServerConfig {
@@ -90,6 +98,7 @@ impl Default for H3QuicheServerConfig {
                 .expect("DEFAULT_MAX_IN_FLIGHT_HANDSHAKES is non-zero"),
             recv_channel_depth: BYTE_CHANNEL_DEPTH,
             packet_buffer_size: PKT_BUF_LEN,
+            max_buffered_send_bytes: None,
         }
     }
 }
@@ -173,6 +182,7 @@ impl H3QuicheAcceptor {
                 buffers: DriverBufferConfig {
                     recv_channel_depth: config.recv_channel_depth,
                     packet_buffer_size: config.packet_buffer_size,
+                    max_buffered_send_bytes: config.max_buffered_send_bytes,
                 },
                 incoming_done: false,
                 shared: Arc::clone(&shared),
@@ -433,5 +443,19 @@ mod tests {
         };
         assert_eq!(custom.recv_channel_depth, 16);
         assert_eq!(custom.packet_buffer_size, 8192);
+    }
+
+    /// SF-6 (SC-007): the aggregate send-byte cap defaults to `None` (unbounded,
+    /// behavior unchanged) and a configured cap is preserved on the config.
+    #[test]
+    fn server_config_send_cap_defaults_none_and_overrides() {
+        let def = H3QuicheServerConfig::default();
+        assert_eq!(def.max_buffered_send_bytes, None);
+
+        let custom = H3QuicheServerConfig {
+            max_buffered_send_bytes: Some(1 << 20),
+            ..H3QuicheServerConfig::default()
+        };
+        assert_eq!(custom.max_buffered_send_bytes, Some(1 << 20));
     }
 }

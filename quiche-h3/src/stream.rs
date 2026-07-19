@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use h3::quic::{self, ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf};
 
-use crate::buffer::{TerminalCell, WriteCompletion, WriteOutcome};
+use crate::buffer::{SendAccounting, TerminalCell, WriteCompletion, WriteOutcome};
 use crate::driver::{BidiHandoff, ConnShared, DriverCommand, RecvHandoff, SendHandoff};
 use crate::error::{internal_stream_error, ConnTerminal, RecvEnd, SendEnd};
 
@@ -212,6 +212,10 @@ pub struct H3SendStream<B: Buf> {
     /// A locally-issued `reset` terminal, visible immediately (the worker's
     /// `status` cell is only set asynchronously afterward).
     local_terminal: Option<SendEnd>,
+    /// Shared aggregate send-byte accounting for cap admission (SF-6, §12 S3).
+    /// `cap == None` (default) makes every reservation succeed immediately, so
+    /// admission is a no-op beyond two relaxed atomics per write.
+    send_accounting: Arc<SendAccounting>,
 }
 
 impl<B: Buf> H3SendStream<B> {
@@ -229,6 +233,7 @@ impl<B: Buf> H3SendStream<B> {
             finish_result: None,
             finalized: false,
             local_terminal: None,
+            send_accounting: h.send_accounting,
         }
     }
 
@@ -314,10 +319,33 @@ impl<B: Buf> quic::SendStream<B> for H3SendStream<B> {
             None => return Poll::Ready(Ok(())),
             Some(buf) => buf,
         };
-        // (4) Flush the stash as exactly one `Send`. Reuse the per-stream cell:
-        // begin a fresh generation (clears any consumed prior slot — safe under
-        // the single-outstanding-write contract) and hand the worker a completer
-        // stamped with it, instead of allocating a `oneshot` per chunk (SF-3).
+        // (4) Flush the stash as exactly one `Send`. First reserve the write's
+        // bytes against the aggregate send-byte cap (SF-6). Under the default
+        // unlimited config this always succeeds; a finite cap parks the write
+        // (async backpressure) rather than dropping or reordering it (§12 S3).
+        let bytes = buf.remaining();
+        let permit = match self.send_accounting.try_reserve(bytes) {
+            Some(permit) => permit,
+            None => {
+                // Over the cap. Register our waker BEFORE a final re-check so a
+                // permit released between check and park is never missed (SF-2
+                // lost-wake discipline). Re-stash the buffer so a later poll
+                // retries this exact write in order (no data loss/reorder).
+                self.send_accounting.register_waiter(cx.waker());
+                match self.send_accounting.try_reserve(bytes) {
+                    Some(permit) => permit,
+                    None => {
+                        self.stash = Some(buf);
+                        return Poll::Pending;
+                    }
+                }
+            }
+        };
+        // Admitted: reuse the per-stream cell — begin a fresh generation (clears
+        // any consumed prior slot — safe under the single-outstanding-write
+        // contract) and hand the worker a completer stamped with it, instead of
+        // allocating a `oneshot` per chunk (SF-3). The `permit` rides with the
+        // command and releases the reserved bytes on the op's completion/drop.
         let generation = self.write_completion.begin();
         let done = self.write_completion.completer(generation);
         if self
@@ -326,6 +354,7 @@ impl<B: Buf> quic::SendStream<B> for H3SendStream<B> {
                 id: self.id,
                 buf,
                 done,
+                permit: Some(permit),
             })
             .is_err()
         {
@@ -875,6 +904,34 @@ mod tests {
         WAKER.get_or_init(|| unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) })
     }
 
+    /// A waker that sets a shared flag when woken, so a test can assert the
+    /// SF-6 cap release actually re-scheduled a parked `poll_ready`.
+    fn flag_waker(flag: Arc<AtomicBool>) -> Waker {
+        let ptr = Arc::into_raw(flag) as *const ();
+        unsafe { Waker::from_raw(RawWaker::new(ptr, &FLAG_VTABLE)) }
+    }
+
+    static FLAG_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |p| unsafe {
+            let arc = Arc::from_raw(p as *const AtomicBool);
+            let cloned = arc.clone();
+            std::mem::forget(arc);
+            RawWaker::new(Arc::into_raw(cloned) as *const (), &FLAG_VTABLE)
+        },
+        |p| unsafe {
+            let arc = Arc::from_raw(p as *const AtomicBool);
+            arc.store(true, std::sync::atomic::Ordering::SeqCst);
+        },
+        |p| unsafe {
+            let arc = Arc::from_raw(p as *const AtomicBool);
+            arc.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::mem::forget(arc);
+        },
+        |p| unsafe {
+            drop(Arc::from_raw(p as *const AtomicBool));
+        },
+    );
+
     #[allow(clippy::type_complexity)]
     fn recv_channel() -> (
         mpsc::Sender<Bytes>,
@@ -908,12 +965,26 @@ mod tests {
         H3SendStream<Bytes>,
         mpsc::UnboundedReceiver<DriverCommand<Bytes>>,
     ) {
+        send_half_with(id, SendAccounting::new(None))
+    }
+
+    /// Like [`send_half`] but with caller-supplied [`SendAccounting`] so a test
+    /// can drive the SF-6 cap-admission path and inspect residency.
+    fn send_half_with(
+        id: u64,
+        accounting: Arc<SendAccounting>,
+    ) -> (
+        TerminalCell<SendEnd>,
+        H3SendStream<Bytes>,
+        mpsc::UnboundedReceiver<DriverCommand<Bytes>>,
+    ) {
         let (ctx, crx) = mpsc::unbounded_channel();
         let status = TerminalCell::new();
         let send = H3SendStream::from_handoff(SendHandoff {
             id,
             status: status.clone(),
             cmd_tx: ctx.clone(),
+            send_accounting: accounting,
             cleanup: crate::driver::HandoffCleanup::new(id, false, ctx),
         });
         (status, send, crx)
@@ -921,6 +992,12 @@ mod tests {
 
     fn wbuf(payload: &'static [u8]) -> WriteBuf<Bytes> {
         WriteBuf::from(h3::proto::frame::Frame::Data(Bytes::from_static(payload)))
+    }
+
+    /// The full wire size (DATA frame header + payload) a `wbuf(payload)` buffers,
+    /// which is what SF-6 accounting reserves.
+    fn wire_len(payload: &'static [u8]) -> usize {
+        wbuf(payload).remaining()
     }
 
     // ---- H3RecvStream ----
@@ -1125,6 +1202,90 @@ mod tests {
         );
     }
 
+    /// SF-6: with the default (unlimited) accounting a `poll_ready` flush always
+    /// admits immediately, reserving the write's bytes and releasing them when
+    /// the worker completes it — residency is tracked but never bounds admission.
+    #[test]
+    fn sf6_unlimited_accounting_tracks_and_releases_bytes() {
+        let acct = SendAccounting::new(None);
+        let (_status, mut send, mut crx) = send_half_with(0, Arc::clone(&acct));
+        let mut cx = noop_cx();
+        assert_eq!(acct.resident(), 0);
+        send.send_data(wbuf(b"hello")).unwrap();
+        // Admits immediately (unlimited) and awaits completion; the buffer's wire
+        // size (frame header + payload) is resident.
+        assert!(matches!(send.poll_ready(&mut cx), Poll::Pending));
+        let hello = wire_len(b"hello");
+        assert_eq!(acct.resident(), hello, "reserved on admission");
+        let (done, permit) = match crx.try_recv() {
+            Ok(DriverCommand::Send { done, permit, .. }) => (done, permit),
+            other => panic!("expected Send, got {other:?}"),
+        };
+        assert!(permit.is_some(), "front end carries a byte permit (SF-6)");
+        assert_eq!(permit.as_ref().unwrap().bytes(), hello);
+        // Residency persists while the command is in flight (permit held here).
+        assert_eq!(acct.resident(), hello);
+        done.complete(Ok(()));
+        // Dropping the permit at the completion chokepoint releases the bytes.
+        drop(permit);
+        assert_eq!(acct.resident(), 0, "released once the permit dropped");
+        assert!(matches!(send.poll_ready(&mut cx), Poll::Ready(Ok(()))));
+    }
+
+    /// SF-6: a finite aggregate cap parks a write that would exceed it (async
+    /// backpressure — never dropped or reordered) and re-admits it, waking the
+    /// parked task, once an outstanding permit releases. Two streams share one
+    /// accounting to exercise the *aggregate* bound.
+    #[test]
+    fn sf6_capped_accounting_parks_then_admits_on_release() {
+        let hello = wire_len(b"hello");
+        let x = wire_len(b"x");
+        // Cap sized so one "hello" exactly fills it; a second write must park.
+        let acct = SendAccounting::new(Some(hello));
+        let (_sa, mut send_a, mut crx_a) = send_half_with(0, Arc::clone(&acct));
+        let (_sb, mut send_b, mut crx_b) = send_half_with(4, Arc::clone(&acct));
+
+        // Stream A fills the cap and awaits completion.
+        let mut cx_a = noop_cx();
+        send_a.send_data(wbuf(b"hello")).unwrap();
+        assert!(matches!(send_a.poll_ready(&mut cx_a), Poll::Pending));
+        assert_eq!(acct.resident(), hello);
+        let cmd_a = crx_a.try_recv().expect("A admitted");
+
+        // Stream B's write would exceed the cap → parks (Pending) and emits NO
+        // command. Its waker is registered for the release.
+        let woken = Arc::new(AtomicBool::new(false));
+        let waker = flag_waker(woken.clone());
+        let mut cx_b = Context::from_waker(&waker);
+        send_b.send_data(wbuf(b"x")).unwrap();
+        assert!(matches!(send_b.poll_ready(&mut cx_b), Poll::Pending));
+        assert!(crx_b.try_recv().is_err(), "B must not enqueue over the cap");
+        assert_eq!(
+            acct.resident(),
+            hello,
+            "B's bytes not reserved while parked"
+        );
+
+        // A's write completes; dropping its command releases the permit and wakes
+        // B's parked task.
+        drop(cmd_a);
+        assert_eq!(acct.resident(), 0, "A released");
+        assert!(
+            woken.load(std::sync::atomic::Ordering::SeqCst),
+            "release woke B"
+        );
+
+        // B retries (as the runtime would after the wake) and now admits in order.
+        assert!(matches!(send_b.poll_ready(&mut cx_b), Poll::Pending));
+        assert_eq!(acct.resident(), x, "B admitted after A freed capacity");
+        match crx_b.try_recv() {
+            Ok(DriverCommand::Send { id: 4, permit, .. }) => {
+                assert_eq!(permit.as_ref().unwrap().bytes(), x);
+            }
+            other => panic!("expected B's Send after release, got {other:?}"),
+        }
+    }
+
     /// SF-3: a `Send` still queued (unapplied) when the connection closes resolves
     /// its generation exactly once through the reusable completer — never a bare
     /// cancel, never a hang (gpt#7 lifecycle). Here the completer is dropped
@@ -1266,6 +1427,7 @@ mod tests {
             id: 8,
             status: TerminalCell::new(),
             cmd_tx: ctx.clone(),
+            send_accounting: SendAccounting::new(None),
             cleanup: crate::driver::HandoffCleanup::new(8, false, ctx),
         };
         drop(handoff);
@@ -1300,7 +1462,7 @@ mod tests {
         Arc<ConnShared>,
     ) {
         let (ctx, crx) = mpsc::unbounded_channel();
-        let shared = ConnShared::new();
+        let shared = ConnShared::new(None);
         (
             StreamOpener::from_parts(ctx, Arc::clone(&shared)),
             crx,
@@ -1361,6 +1523,7 @@ mod tests {
                 id: 0,
                 status: TerminalCell::new(),
                 cmd_tx: ictx.clone(),
+                send_accounting: SendAccounting::new(None),
                 cleanup: crate::driver::HandoffCleanup::new(0, false, ictx.clone()),
             },
             recv: RecvHandoff {
@@ -1398,7 +1561,7 @@ mod tests {
         let at_uni = TerminalCell::new();
         let rb = Arc::new(AtomicBool::new(false));
         let ru = Arc::new(AtomicBool::new(false));
-        let shared = ConnShared::new();
+        let shared = ConnShared::new(None);
         let opener = StreamOpener::from_parts(ctx, shared);
         let conn = Connection::from_parts(
             brx,
@@ -1420,6 +1583,7 @@ mod tests {
                 id: 0,
                 status: TerminalCell::new(),
                 cmd_tx: ictx.clone(),
+                send_accounting: SendAccounting::new(None),
                 cleanup: crate::driver::HandoffCleanup::new(0, false, ictx.clone()),
             },
             recv: RecvHandoff {

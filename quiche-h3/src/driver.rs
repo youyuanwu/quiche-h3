@@ -22,7 +22,10 @@ use tokio_quiche::quic::HandshakeInfo;
 use tokio_quiche::quic::QuicheConnection;
 use tokio_quiche::{ApplicationOverQuic, QuicResult};
 
-use crate::buffer::{send_from_buf, TerminalCell, WriteCompleter, MAX_CHUNK, PKT_BUF_LEN};
+use crate::buffer::{
+    send_from_buf, SendAccounting, SendBytesPermit, TerminalCell, WriteCompleter, MAX_CHUNK,
+    PKT_BUF_LEN,
+};
 use crate::conn::QuicConn;
 use crate::error::{
     classify_stream_recv_error, classify_stream_send_error, conn_terminal_from_error, CloseOrigin,
@@ -79,6 +82,11 @@ pub(crate) struct DriverBufferConfig {
     /// Outbound packet-buffer size in bytes (default [`PKT_BUF_LEN`]).
     /// Effective value is clamped to at least 1.
     pub packet_buffer_size: usize,
+    /// Optional aggregate cap (bytes) on buffered outbound send data admitted to
+    /// the worker command/op queues (SF-6, FR-010/FR-011). `None` (default) =
+    /// unlimited, preserving the historical unbounded behavior. A finite cap
+    /// bounds resident admitted send bytes to at most `cap + one admission unit`.
+    pub max_buffered_send_bytes: Option<usize>,
 }
 
 impl Default for DriverBufferConfig {
@@ -86,6 +94,7 @@ impl Default for DriverBufferConfig {
         Self {
             recv_channel_depth: BYTE_CHANNEL_DEPTH,
             packet_buffer_size: PKT_BUF_LEN,
+            max_buffered_send_bytes: None,
         }
     }
 }
@@ -145,6 +154,12 @@ pub(crate) enum DriverCommand<B: Buf> {
         id: u64,
         buf: h3::quic::WriteBuf<B>,
         done: WriteCompleter<SendEnd>,
+        /// Aggregate send-byte reservation for this write (SF-6). Held for the
+        /// buffer's whole worker lifetime; its `Drop` releases the reserved
+        /// bytes exactly once at the SF-3 completion chokepoint (or on an
+        /// unapplied-command / rollback drop). `None` only for synthetic
+        /// internal sends that bypass front-end admission.
+        permit: Option<SendBytesPermit>,
     },
     /// `SendStream::poll_finish` — queue a FIN after any buffered writes.
     Finish {
@@ -194,12 +209,17 @@ impl<B: Buf> std::fmt::Debug for DriverCommand<B> {
 pub(crate) struct ConnShared {
     /// Published exactly once at the connection-terminal edge.
     pub(crate) conn_terminal: TerminalCell<Arc<ConnTerminal>>,
+    /// Aggregate buffered-send-byte accounting shared with every front-end
+    /// `H3SendStream` for cap admission (SF-6, §12 S3). `cap == None` (default)
+    /// leaves admission unbounded (behavior unchanged).
+    pub(crate) send_accounting: Arc<SendAccounting>,
 }
 
 impl ConnShared {
-    pub(crate) fn new() -> Arc<Self> {
+    pub(crate) fn new(max_buffered_send_bytes: Option<usize>) -> Arc<Self> {
         Arc::new(ConnShared {
             conn_terminal: TerminalCell::new(),
+            send_accounting: SendAccounting::new(max_buffered_send_bytes),
         })
     }
 }
@@ -233,6 +253,8 @@ pub(crate) struct SendHandoff<B: Buf> {
     pub(crate) status: TerminalCell<SendEnd>,
     /// For `send_data`/`poll_finish`/`reset` and drop cleanup.
     pub(crate) cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
+    /// Shared aggregate send-byte accounting for cap admission (SF-6, §12 S3).
+    pub(crate) send_accounting: Arc<SendAccounting>,
     /// Armed cleanup if this handoff is dropped before conversion (§6.2).
     pub(crate) cleanup: HandoffCleanup<B>,
 }
@@ -334,6 +356,8 @@ pub(crate) enum SendOp<B: Buf> {
     Write {
         buf: h3::quic::WriteBuf<B>,
         done: WriteCompleter<SendEnd>,
+        /// SF-6 byte reservation; released on drop (completion / drain / reset).
+        permit: Option<SendBytesPermit>,
     },
     Finish {
         done: oneshot::Sender<Result<(), SendEnd>>,
@@ -346,6 +370,8 @@ impl<B: Buf> SendOp<B> {
     /// generation, SF-3); a `Finish` stays a per-stream one-shot `oneshot`.
     fn complete(self, result: Result<(), SendEnd>) {
         match self {
+            // Dropping the destructured `permit` here releases the SF-6 byte
+            // reservation at the exactly-once completion chokepoint.
             SendOp::Write { done, .. } => done.complete(result),
             // Ignore send error: the front end may have stopped polling (drop).
             SendOp::Finish { done } => {
@@ -744,7 +770,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         let (accept_bidi_tx, accept_bidi_rx) = mpsc::channel(accept_bidi_cap.max(1));
         let (accept_uni_tx, accept_uni_rx) = mpsc::channel(accept_uni_cap.max(1));
         let (est_tx, est_rx) = oneshot::channel();
-        let shared = ConnShared::new();
+        let shared = ConnShared::new(buffers.max_buffered_send_bytes);
         let accept_terminal_bidi = TerminalCell::new();
         let accept_terminal_uni = TerminalCell::new();
         let accept_bidi_resume = Arc::new(AtomicBool::new(false));
@@ -1527,8 +1553,12 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             };
             let (recv_state, recv_handoff, recv_done) =
                 self.build_recv(id, cmd_tx.clone(), peer.pending_recv_terminal.take());
-            let (send_handoff, send_state, send_done) =
-                build_send(id, cmd_tx, peer.pending_send_terminal.take());
+            let (send_handoff, send_state, send_done) = build_send(
+                id,
+                cmd_tx,
+                Arc::clone(&self.shared.send_accounting),
+                peer.pending_send_terminal.take(),
+            );
             if let Some(state) = recv_state {
                 self.recv.insert(id, state);
             }
@@ -1780,8 +1810,13 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 DriverCommand::AcceptUniResume => {
                     self.accept_uni_resume.store(true, Ordering::Relaxed);
                 }
-                DriverCommand::Send { id, buf, done } => {
-                    self.enqueue_send_op(id, SendOp::Write { buf, done });
+                DriverCommand::Send {
+                    id,
+                    buf,
+                    done,
+                    permit,
+                } => {
+                    self.enqueue_send_op(id, SendOp::Write { buf, done, permit });
                 }
                 DriverCommand::Finish { id, done } => {
                     self.enqueue_send_op(id, SendOp::Finish { done });
@@ -1916,7 +1951,8 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             self.next_bidi_id = id.wrapping_add(4);
             // (6) Build both halves, retaining live registry state.
             let (recv_state, recv_handoff, _recv_done) = self.build_recv(id, cmd_tx.clone(), None);
-            let (send_handoff, send_state, _send_done) = build_send(id, cmd_tx, None);
+            let (send_handoff, send_state, _send_done) =
+                build_send(id, cmd_tx, Arc::clone(&self.shared.send_accounting), None);
             if let Some(state) = recv_state {
                 self.recv.insert(id, state);
             }
@@ -1971,7 +2007,8 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 continue;
             }
             self.next_uni_id = id.wrapping_add(4);
-            let (send_handoff, send_state, _send_done) = build_send(id, cmd_tx, None);
+            let (send_handoff, send_state, _send_done) =
+                build_send(id, cmd_tx, Arc::clone(&self.shared.send_accounting), None);
             if let Some(state) = send_state {
                 self.send.insert(id, state);
             }
@@ -2481,6 +2518,7 @@ enum TurnOutcome {
 fn build_send<B: Buf>(
     id: u64,
     cmd_tx: mpsc::UnboundedSender<DriverCommand<B>>,
+    send_accounting: Arc<SendAccounting>,
     retained: Option<SendEnd>,
 ) -> (SendHandoff<B>, Option<StreamSendState<B>>, bool) {
     let status = TerminalCell::new();
@@ -2492,6 +2530,7 @@ fn build_send<B: Buf>(
         id,
         status: status.clone(),
         cmd_tx: cmd_tx.clone(),
+        send_accounting,
         cleanup: HandoffCleanup::new(id, false, cmd_tx),
     };
     let state = if send_done {
@@ -2666,6 +2705,7 @@ mod tests {
             DriverBufferConfig {
                 recv_channel_depth: 8,
                 packet_buffer_size: 4096,
+                max_buffered_send_bytes: None,
             },
         );
         assert_eq!(d.recv_channel_depth, 8);
@@ -2688,6 +2728,7 @@ mod tests {
             DriverBufferConfig {
                 recv_channel_depth: 0,
                 packet_buffer_size: 0,
+                max_buffered_send_bytes: None,
             },
         );
         assert_eq!(d.buffer().len(), 1);
@@ -3524,15 +3565,27 @@ mod tests {
         payload: &'static [u8],
     ) -> SendProbe {
         let generation = cell.begin();
+        let buf = wbuf(payload);
+        // Reserve the buffer's full wire size (frame header + payload) against the
+        // driver's shared accounting, exactly as the front end does (SF-6); the
+        // permit rides with the command and releases on the op's completion/drop.
+        let permit = d.shared.send_accounting.try_reserve(buf.remaining());
         d.inbox.push_back(DriverCommand::Send {
             id,
-            buf: wbuf(payload),
+            buf,
             done: cell.completer(generation),
+            permit,
         });
         SendProbe {
             cell: cell.clone(),
             generation,
         }
+    }
+
+    /// The full wire size (DATA frame header + payload) a `wbuf(payload)` buffers,
+    /// which is what SF-6 accounting reserves.
+    fn wire_len(payload: &'static [u8]) -> usize {
+        wbuf(payload).remaining()
     }
 
     fn push_send(d: &mut QuicheDriver<Bytes>, id: u64, payload: &'static [u8]) -> SendProbe {
@@ -3652,6 +3705,88 @@ mod tests {
             is_write: true,
             code: 42,
         }));
+    }
+
+    /// SF-6: a `Send` reserves its bytes against the shared accounting on
+    /// admission and releases them exactly once when the write completes (default
+    /// unlimited config keeps residency accurate without ever bounding admission).
+    #[test]
+    fn sf6_accounting_reserves_on_admission_releases_on_completion() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        assert_eq!(d.shared.send_accounting.resident(), 0);
+        // push_send reserves the buffer's wire size against d.shared.send_accounting,
+        // mirroring the front end.
+        let done = push_send(&mut d, 0, b"hello");
+        assert_eq!(
+            d.shared.send_accounting.resident(),
+            wire_len(b"hello"),
+            "reserved when the command is admitted"
+        );
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+        assert!(
+            matches!(done.state(), ProbeState::Ok),
+            "write completes once"
+        );
+        assert_eq!(
+            d.shared.send_accounting.resident(),
+            0,
+            "released exactly once at the completion chokepoint"
+        );
+    }
+
+    /// SF-6: a `Reset` that preempts a queued `Write` drains the op and thereby
+    /// releases its byte reservation — the RAII permit ties release to the same
+    /// exactly-once drain as the completion path.
+    #[test]
+    fn sf6_accounting_released_when_reset_drains_queued_write() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        let done = push_send(&mut d, 0, b"abcd");
+        d.apply_inbox(&mut c); // move Write into send_ops (permit rides along)
+        assert_eq!(d.shared.send_accounting.resident(), wire_len(b"abcd"));
+        d.inbox.push_back(DriverCommand::Reset { id: 0, code: 7 });
+        d.apply_inbox(&mut c); // apply_reset drains the op with the reset terminal
+        assert!(matches!(
+            done.state(),
+            ProbeState::Err(SendEnd::Reset { error_code: 7 })
+        ));
+        assert_eq!(
+            d.shared.send_accounting.resident(),
+            0,
+            "reset drain releases the reservation"
+        );
+    }
+
+    /// SF-6: a finite worker-level cap bounds admitted send bytes; once the cap
+    /// is full, a further admission via [`SendAccounting::try_reserve`] is
+    /// refused (the front end would park) until an outstanding permit releases.
+    #[test]
+    fn sf6_worker_cap_bounds_admitted_bytes() {
+        let cap = wire_len(b"abc");
+        let (mut d, _h) = QuicheDriver::<Bytes>::with_buffers(
+            false,
+            4,
+            4,
+            DriverBufferConfig {
+                recv_channel_depth: BYTE_CHANNEL_DEPTH,
+                packet_buffer_size: PKT_BUF_LEN,
+                max_buffered_send_bytes: Some(cap),
+            },
+        );
+        let mut c = MockConn::new();
+        assert_eq!(d.shared.send_accounting.cap(), Some(cap));
+        let done = push_send(&mut d, 0, b"abc"); // fills the cap exactly
+        assert_eq!(d.shared.send_accounting.resident(), cap);
+        // Over the cap now → a fresh reservation is refused.
+        assert!(d.shared.send_accounting.try_reserve(1).is_none());
+        // Drain the write; the permit releases and capacity reopens.
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+        assert!(matches!(done.state(), ProbeState::Ok));
+        assert_eq!(d.shared.send_accounting.resident(), 0);
+        assert!(d.shared.send_accounting.try_reserve(cap).is_some());
     }
 
     /// §11 / Q3: a `Reset` at **zero** send capacity still emits `RESET_STREAM`
@@ -3837,6 +3972,7 @@ mod tests {
             id: 0,
             buf: WriteBuf::from(h3::proto::frame::Frame::Data(Bytes::from_static(&BULK))),
             done: bulk_cell.completer(bulk_gen),
+            permit: None,
         });
         let bulk = SendProbe {
             cell: bulk_cell,
@@ -4428,7 +4564,8 @@ mod tests {
         // Simulate retained halves for a materialized-but-undeliverable bidi.
         let cmd_tx = d.cmd_tx_weak.upgrade().unwrap();
         let (recv_state, _rh, _rd) = d.build_recv(0, cmd_tx.clone(), None);
-        let (_sh, send_state, _sd) = build_send(0, cmd_tx, None);
+        let (_sh, send_state, _sd) =
+            build_send(0, cmd_tx, Arc::clone(&d.shared.send_accounting), None);
         d.recv.insert(0, recv_state.unwrap());
         d.send.insert(0, send_state.unwrap());
 
@@ -4445,7 +4582,12 @@ mod tests {
             .any(|s| !s.is_write && s.code == H3_REQUEST_CANCELLED));
 
         // Uni: only Shutdown::Write.
-        let (_sh, send_state, _sd) = build_send(2, d.cmd_tx_weak.upgrade().unwrap(), None);
+        let (_sh, send_state, _sd) = build_send(
+            2,
+            d.cmd_tx_weak.upgrade().unwrap(),
+            Arc::clone(&d.shared.send_accounting),
+            None,
+        );
         d.send.insert(2, send_state.unwrap());
         d.cleanup_undeliverable_open(&mut c, 2, false);
         assert!(!d.send.contains_key(&2));
