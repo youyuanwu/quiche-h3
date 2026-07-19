@@ -2292,13 +2292,15 @@ explicitly targeted.
   drop-driven teardown.
   However, the additive **endpoint-initiated** shutdown control surface
   (`H3QuicheEndpoint::close`/`wait_idle`, design `quiche-h3-endpoint-shutdown.md`)
-  *does* layer a lightweight opt-in registration on top: each accepted server
+  *does* layer a lightweight registration on top: **every** accepted server
   worker registers a `WeakUnboundedSender` + RAII deregistration guard in a shared
-  endpoint registry, so `close()` can broadcast the terminal `DriverCommand::Close`
-  to every live worker and `wait_idle()` can await their exit. This is a
-  server-side control surface distinct from — and not required by — the
-  drop-driven path above (unlike `msquic-h3`, it is opt-in and registration is
-  keyed off the endpoint handle, not every connection).
+  endpoint registry, keyed by a monotonic `next_id` — unconditionally, whether or
+  not the process ever calls the control API. This lets `close()` broadcast the
+  terminal `DriverCommand::Close` to every live worker and `wait_idle()` await
+  their exit. It is a server-side control surface distinct from — and not required
+  by — the drop-driven path above; only *using* the API is optional (unlike
+  `msquic-h3`, registration is per server worker, not tied to holding an endpoint
+  handle).
 - After establishment, `on_conn_close` is the single funnel that publishes the
   terminal to every out-of-band cell (§5) so all front-end polls resolve to a
   classified error rather than hanging. It publishes the connection-level

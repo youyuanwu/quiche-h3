@@ -397,24 +397,34 @@ note in S1).
 accept-sink closes; a short bounded rebind retry may be needed. This mirrors the
 `tonic-h3` reconnect scenario.
 
-**Observed (6 runs × 50 iters = 300 shutdowns, Linux):**
+**Observed — two measurement points (Linux loopback, `#[ignore]`d test, 50
+iters/invocation):**
+
+The residual is sensitive to *when* the rebind is attempted relative to
+`wait_idle()`:
 
 ```text
-# early runs, 5 ms backoff:
+# (A) rebind measured IMMEDIATELY after wait_idle() (the tightest window, and
+#     what the shipped test now measures — matches the tonic-h3 reconnect race):
+S1 rebind: iters=50 needing_retry=50 worst_attempts=2 worst_latency=11.979026ms
+S1 rebind: iters=50 needing_retry=50 worst_attempts=2 worst_latency=12.298068ms
+S1 rebind: iters=50 needing_retry=50 worst_attempts=2 worst_latency=12.598355ms
+
+# (B) earlier config, with incidental client/drive cleanup between wait_idle()
+#     and the rebind (gives the router task a scheduler tick to be polled):
 S1 rebind: iters=50 needing_retry=6  worst_attempts=2 worst_latency=6.723448ms
 S1 rebind: iters=50 needing_retry=3  worst_attempts=2 worst_latency=6.468537ms
-S1 rebind: iters=50 needing_retry=6  worst_attempts=2 worst_latency=6.673210ms
-# shipped test config, 10 ms backoff:
 S1 rebind: iters=50 needing_retry=12 worst_attempts=2 worst_latency=11.686635ms
-S1 rebind: iters=50 needing_retry=6  worst_attempts=2 worst_latency=11.547556ms
-S1 rebind: iters=50 needing_retry=4  worst_attempts=2 worst_latency=11.568680ms
 ```
 
-The immediate rebind succeeded on the first attempt in ~75–94% of shutdowns.
-When it did not, **exactly one** backoff retry always sufficed: the worst case
-across all 300 shutdowns was **2 attempts** (one retry). The retry latency is
-essentially one backoff interval (≈ 6–12 ms for the 5/10 ms backoffs used); the
-*attempts* metric is the backoff-independent invariant. The rebound port was
+The decisive, backoff-independent invariant is stable across BOTH measurement
+points: the immediate same-port rebind may fail its first attempt, and **exactly
+one** backoff retry always sufficed — the worst case observed anywhere was **2
+attempts** (one retry), with retry latency ≈ one backoff interval. The *rate* of
+first-attempt failure depends on timing: at the tightest window (A) it is
+effectively 100% (the router task has not yet been polled to release its socket
+clone), whereas even a few hundred microseconds of unrelated work (B) drops it to
+~5–25%. Either way, one bounded retry closes the window. The rebound port was
 proven usable each iteration by completing a fresh handshake on it.
 
 **Verdict:** **Bounded retry required (nuanced, not "effectively exact").** The

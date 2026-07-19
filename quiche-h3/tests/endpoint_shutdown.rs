@@ -168,11 +168,18 @@ async fn close_then_wait_idle_drains_the_connection() {
         "no live workers remain after wait_idle"
     );
 
-    // The peer's connection terminates as a result of the server close.
-    tokio::time::timeout(DEADLINE, client)
+    // The peer's connection terminates as a result of the server close. `h3`
+    // preserves the application close *code* (mapped to a remote
+    // `ApplicationClose`), though not the reason bytes (error.rs to_h3, §8.4).
+    let client_err = tokio::time::timeout(DEADLINE, client)
         .await
         .expect("client driver terminated after server close")
         .expect("client task did not panic");
+    assert!(
+        client_err.is_h3_no_error(),
+        "peer should observe the H3_NO_ERROR application close broadcast by \
+         close(); got: {client_err:?}"
+    );
 
     server_drive.abort();
 }
@@ -358,11 +365,14 @@ async fn s1_same_port_rebind_after_wait_idle() {
         tokio::time::timeout(DEADLINE, endpoint.wait_idle())
             .await
             .unwrap_or_else(|_| panic!("iter {i}: wait_idle hung"));
+
+        // Measure the same-port rebind IMMEDIATELY after `wait_idle()` resolves —
+        // before any client/drive cleanup — so the sample captures the tightest
+        // residual window (the router task releasing the socket after its
+        // accept_sink closed, §5.6). This is exactly the tonic-h3 reconnect race.
+        let (attempts, latency, sock) = rebind_same_port(addr, MAX_ATTEMPTS, BACKOFF).await;
         drive.abort();
         let _ = tokio::time::timeout(DEADLINE, client).await;
-
-        // Measure the same-port rebind.
-        let (attempts, latency, sock) = rebind_same_port(addr, MAX_ATTEMPTS, BACKOFF).await;
         let sock = sock.unwrap_or_else(|| {
             panic!("iter {i}: same port never rebound within {MAX_ATTEMPTS} attempts")
         });
@@ -475,22 +485,29 @@ async fn s2_admission_fence_under_concurrent_close() {
     let mut acceptor = acceptors.pop().unwrap();
     let endpoint = acceptor.endpoint();
 
-    // Accept loop: count how many connections are yielded (post-close ones must
-    // never be yielded).
+    // Accept loop: it must NEVER yield a connection once `closing` has
+    // linearized (FR-006/SC-003). The task checks the closing flag at the exact
+    // moment it receives each `Some` and records a hard violation if one is
+    // yielded post-`closing` — the deterministic half of the fence assertion.
+    let task_endpoint = endpoint.clone();
     let accept_task = tokio::spawn(async move {
         let mut yielded = 0usize;
+        let mut yielded_after_closing = 0usize;
         let mut drives = Vec::new();
         loop {
             match acceptor.accept().await {
                 Ok(Some(conn)) => {
                     yielded += 1;
+                    if task_endpoint.__test_is_closing() {
+                        yielded_after_closing += 1;
+                    }
                     drives.push(spawn_server_drive(conn));
                 }
                 Ok(None) => break,
                 Err(_) => break,
             }
         }
-        (yielded, drives)
+        (yielded, yielded_after_closing, drives)
     });
 
     // Establish a handful of live connections before the fence.
@@ -511,12 +528,18 @@ async fn s2_admission_fence_under_concurrent_close() {
         "no worker may be admitted after close() (fence breached: {next_id_at_close} -> {next_id_after})"
     );
 
-    // Drain the acceptor to end-of-stream and check nothing was yielded beyond
-    // the pre-close registrations.
-    let (yielded, drives) = tokio::time::timeout(DEADLINE, accept_task)
+    // Drain the acceptor to end-of-stream.
+    let (yielded, yielded_after_closing, drives) = tokio::time::timeout(DEADLINE, accept_task)
         .await
         .expect("accept loop drained to Ok(None)")
         .expect("accept task did not panic");
+    // (a) No connection is yielded once `closing` is observed (the strong,
+    //     boundary-precise invariant), and (b) no connection is yielded beyond
+    //     those registered before close (a coarser cross-check).
+    assert_eq!(
+        yielded_after_closing, 0,
+        "accept() yielded {yielded_after_closing} connection(s) after `closing` linearized (FR-006/SC-003)"
+    );
     assert!(
         (yielded as u64) <= next_id_at_close,
         "no connection may be yielded beyond those registered at close \
@@ -643,9 +666,16 @@ async fn s3_mid_handshake_bounded_by_timeout() {
         "S3 mid-handshake: wait_idle elapsed={elapsed:?} (handshake_timeout={HANDSHAKE_TIMEOUT:?})"
     );
 
+    // SC-004: bounded by ~the handshake timeout. The worker cannot self-terminate
+    // before its timeout fires, so assert a lower sanity bound too (the resolve is
+    // driven by the timeout, not by close() racing it away).
     assert!(
-        elapsed <= HANDSHAKE_TIMEOUT * 3,
-        "wait_idle must complete within a bounded margin of the handshake timeout (elapsed={elapsed:?})"
+        elapsed >= HANDSHAKE_TIMEOUT / 2,
+        "wait_idle should be gated by the handshake timeout, not resolve early (elapsed={elapsed:?})"
+    );
+    assert!(
+        elapsed <= HANDSHAKE_TIMEOUT * 2,
+        "wait_idle must complete within ~2x the handshake timeout (SC-004; elapsed={elapsed:?})"
     );
     assert_eq!(
         endpoint.__test_registry_snapshot().1,
@@ -653,5 +683,9 @@ async fn s3_mid_handshake_bounded_by_timeout() {
         "the stalled worker deregistered on handshake-timeout exit"
     );
 
-    let _ = tokio::time::timeout(DEADLINE, accept_task).await;
+    // The accept loop must reach end-of-stream (it never yields the stalled probe).
+    tokio::time::timeout(DEADLINE, accept_task)
+        .await
+        .expect("accept loop drained to end-of-stream")
+        .expect("accept task did not panic");
 }

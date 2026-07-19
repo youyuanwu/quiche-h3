@@ -541,8 +541,9 @@ returns, before `wait_idle`.
     exact for this build; if it sometimes does, the bounded retry is the
     documented contract (and motivates the upstream ask, §11).
     **[RESOLVED]** implemented as `s1_same_port_rebind_after_wait_idle`; verdict
-    **bounded retry required** (~5–25% of shutdowns needed one retry;
-    worst 2 attempts) — see §5.6 [RESOLVED] note and `SPIKE_OUTCOMES.md`.
+    **bounded retry required** (immediate rebind at the tightest window needs one
+    retry ~always; ~5–25% when the router task gets a scheduler tick first; worst
+    2 attempts either way) — see §5.6 [RESOLVED] note and `SPIKE_OUTCOMES.md`.
   - **S2 — admission fence:** hammer `accept()` while calling `close()`
     concurrently; assert no worker is started after `close()` and no connection is
     yielded after idle is observed.
@@ -600,8 +601,9 @@ returns, before `wait_idle`.
 - **[SPIKE S1]** FD-release timing vs. `wait_idle` — the router task owns socket
   `Arc`s and releases them only when polled after stream-closed + conns-gone
   (§2.2/§5.3). Quantify the residual with the S1 rebind test.
-  **[RESOLVED — Linux]** measured: bounded retry required (~5–25% of shutdowns
-  need one retry; worst 2 attempts). The bounded rebind retry is
+  **[RESOLVED — Linux]** measured: bounded retry required (immediate rebind at
+  the tightest window needs one retry ~always; ~5–25% if the router task is
+  polled first; worst 2 attempts either way). The bounded rebind retry is
   the shipped contract.
 - **Upstream ask (preferred real fix for S1):** request a `tokio-quiche` API to
   **await listener/router-task completion** (or a socket-released signal). With

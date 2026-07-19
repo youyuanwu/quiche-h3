@@ -125,7 +125,17 @@ impl Drop for ConnRegistration {
         // `notify_waiters()` (§5.5).
         let became_idle = {
             let mut state = self.shared.state.lock().unwrap();
-            state.conns.remove(&self.id);
+            let removed = state.conns.remove(&self.id).is_some();
+            // Every id is inserted exactly once at registration and this guard is
+            // the sole, once-only remover, so the entry must be present. The
+            // `saturating_sub` is a belt-and-braces guard against a hypothetical
+            // double-decrement; assert the invariant in debug builds so a real
+            // accounting bug is caught rather than silently masked.
+            debug_assert!(
+                removed,
+                "ConnRegistration::drop for id {} that was not in the registry",
+                self.id
+            );
             state.live = state.live.saturating_sub(1);
             state.live == 0
         };
@@ -144,9 +154,11 @@ impl Drop for ConnRegistration {
 ///
 /// # Example
 ///
-/// Take the shutdown handle before serving, then drive a graceful shutdown
-/// (clone the endpoint → serve → `close()` → `wait_idle()`), matching the
-/// ordering in design §6:
+/// Take the shutdown handle before serving, then drive a graceful shutdown.
+/// The acceptor is *moved into* the serving task, so awaiting that task to
+/// completion is what drops the acceptor; drive `wait_idle()` from the retained
+/// `endpoint` handle afterwards (clone the endpoint → serve → `close()` → join
+/// the acceptor task → `wait_idle()`), matching the ordering in design §6:
 ///
 /// ```no_run
 /// # use quiche_h3::{H3QuicheAcceptor, H3QuicheServerConfig};
@@ -163,7 +175,9 @@ impl Drop for ConnRegistration {
 /// // Take a shutdown handle BEFORE serving; it clones and moves freely.
 /// let endpoint = acceptor.endpoint();
 ///
-/// // Serve on a task: `accept()` yields until the endpoint is closed + drained.
+/// // Serve on a task: `accept()` yields until the endpoint is closed and the
+/// // pending handshakes drain, then returns `Ok(None)` and the task ends —
+/// // dropping the acceptor.
 /// let server = tokio::spawn(async move {
 ///     while let Ok(Some(_conn)) = acceptor.accept().await {
 ///         // ... spawn a task to drive each connection ...
@@ -172,8 +186,10 @@ impl Drop for ConnRegistration {
 ///
 /// // ... later, shut the server down gracefully:
 /// endpoint.close(h3::error::Code::H3_NO_ERROR, b"server shutting down");
+/// server.await?;              // accept loop ends → the acceptor is dropped
 /// endpoint.wait_idle().await; // resolves once every live worker has ended
-/// server.await?;
+/// // The same UDP port can now be rebound (use the bounded retry documented on
+/// // `H3QuicheAcceptor::endpoint()` — the socket may release slightly later).
 /// # Ok(())
 /// # }
 /// ```
@@ -261,7 +277,7 @@ impl H3QuicheEndpoint {
     /// should use a short bounded retry; see
     /// [`H3QuicheAcceptor::endpoint()`](crate::H3QuicheAcceptor::endpoint) for
     /// the measured rebind guidance (spike S1: at most one retry — worst
-    /// observed 2 attempts across 300 shutdowns on Linux).
+    /// observed 2 attempts in the Linux loopback samples).
     pub async fn wait_idle(&self) {
         loop {
             // Register the waiter (via `enable()`) BEFORE observing `live`, so a
@@ -288,6 +304,15 @@ impl H3QuicheEndpoint {
     pub fn __test_registry_snapshot(&self) -> (u64, usize) {
         let state = self.0.state.lock().unwrap();
         (state.next_id, state.live)
+    }
+
+    /// Test-only view of the `closing` flag for the S2 admission-fence spike, so
+    /// the loopback accept loop can assert it never yields a connection once
+    /// `closing` has linearized (FR-006/SC-003). Exposed as `#[doc(hidden)] pub`
+    /// for the separate `tests/` crate; NOT part of the stable API.
+    #[doc(hidden)]
+    pub fn __test_is_closing(&self) -> bool {
+        self.0.is_closing()
     }
 }
 
@@ -380,13 +405,23 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel::<DriverCommand<Bytes>>();
         let reg = try_register(&shared, &tx).expect("registers");
 
-        // Construct the future BEFORE the guard drop, then drop, then await:
-        // the `enable()`-before-check discipline must not lose the wakeup.
+        // Poll the future ONCE while `live == 1`: this runs the `notified.enable()`
+        // arming step and parks (Poll::Pending), reproducing the exact lost-wakeup
+        // window. Only THEN do we drop the guard, firing `idle.notify_waiters()`
+        // *after* the check but on an already-armed waiter. The `enable()`-before-
+        // check discipline (§5.5) must deliver that wakeup on the next poll.
         let fut = endpoint.wait_idle();
-        drop(reg);
+        tokio::pin!(fut);
+        assert!(
+            matches!(futures::poll!(fut.as_mut()), std::task::Poll::Pending),
+            "wait_idle must park while a worker is still live"
+        );
+
+        drop(reg); // 1→0 edge → idle.notify_waiters(), after the waiter armed
+
         tokio::time::timeout(Duration::from_secs(2), fut)
             .await
-            .expect("no missed notification for a pre-created wait_idle future");
+            .expect("no missed notification for a pre-armed wait_idle future");
     }
 
     #[tokio::test]
