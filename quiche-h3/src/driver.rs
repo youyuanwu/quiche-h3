@@ -634,6 +634,12 @@ pub(crate) struct QuicheDriver<B: Buf = Bytes> {
     accept_terminal_bidi: TerminalCell<Arc<ConnTerminal>>,
     /// Accept-terminal cell shared with `poll_accept_uni` (§5).
     accept_terminal_uni: TerminalCell<Arc<ConnTerminal>>,
+    /// Endpoint deregistration guard (server accept path only, §5.3/§5.5). When
+    /// present, its `Drop` — reached here at `QuicheDriver::drop`, the single
+    /// worker-exit funnel for both pre- and post-handshake exits — deregisters
+    /// this worker from the endpoint registry and fires the idle notify at the
+    /// `live` 1→0 edge. `None` on the connector path, which is unregistered.
+    conn_registration: Option<crate::endpoint::ConnRegistration>,
 }
 
 impl<B: Buf + Send + 'static> QuicheDriver<B> {
@@ -701,6 +707,9 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             close_bug: None,
             accept_terminal_bidi: accept_terminal_bidi.clone(),
             accept_terminal_uni: accept_terminal_uni.clone(),
+            // Unregistered by default; the server accept path attaches a guard
+            // via `set_conn_registration` before `start` (§5.3).
+            conn_registration: None,
         };
 
         let handles = DriverHandles {
@@ -716,6 +725,14 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         };
 
         (driver, handles)
+    }
+
+    /// Attach the endpoint deregistration guard to this driver (server accept
+    /// path, §5.3). Called by the acceptor after a successful `try_register`
+    /// and before `start`, so the guard's `Drop` runs at worker exit via
+    /// `QuicheDriver::drop`.
+    pub(crate) fn set_conn_registration(&mut self, reg: crate::endpoint::ConnRegistration) {
+        self.conn_registration = Some(reg);
     }
 
     /// The `wait_for_data` pre-await decision (§5, finding 2).

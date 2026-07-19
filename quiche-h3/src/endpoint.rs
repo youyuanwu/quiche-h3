@@ -13,13 +13,6 @@
 //! (§5.1): once `close()` has been observed, no further worker is admitted, and
 //! every worker registered before that point receives the close broadcast.
 
-// The registry admission API (`try_register`, `ConnRegistration`,
-// `EndpointShared`/`H3QuicheEndpoint` constructors, `is_closing`) is wired into
-// the acceptor and driver in Phase 2 (§5.2, §5.4). Until then it is exercised
-// only by this module's unit tests, so a non-test build sees it as unused;
-// the allow is removed once the acceptor wiring lands.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -457,5 +450,46 @@ mod tests {
             .await
             .expect("wait_idle wakes on organic drain")
             .expect("waiter task did not panic");
+    }
+
+    // --- shared-registry semantics across handles (§5.1/FR-002) ------------
+
+    #[test]
+    fn cloned_handles_share_one_registry() {
+        // Two `H3QuicheEndpoint` handles over the same shared registry stand in
+        // for endpoints obtained from two acceptors of the same `bind()` call
+        // (FR-002): a registration seen through one is visible through the other
+        // via the shared `live`/`next_id` state.
+        let shared = EndpointShared::new();
+        let a = H3QuicheEndpoint::new(Arc::clone(&shared));
+        let b = a.clone();
+
+        assert_eq!(a.__test_registry_snapshot(), (0, 0));
+        let (tx, _rx) = mpsc::unbounded_channel::<DriverCommand<Bytes>>();
+        let _reg = try_register(&shared, &tx).expect("registers");
+
+        // The registration is observable through BOTH handles.
+        assert_eq!(a.__test_registry_snapshot(), (1, 1));
+        assert_eq!(b.__test_registry_snapshot(), (1, 1));
+    }
+
+    #[test]
+    fn close_via_one_handle_fences_registration_seen_through_shared() {
+        // `close()` from one handle latches `closing` on the shared registry, so
+        // a subsequent `try_register` (as the acceptor would attempt) is refused
+        // regardless of which handle drove the close.
+        let shared = EndpointShared::new();
+        let a = H3QuicheEndpoint::new(Arc::clone(&shared));
+        let b = a.clone();
+
+        b.close(h3::error::Code::H3_NO_ERROR, b"bye");
+
+        let (tx, _rx) = mpsc::unbounded_channel::<DriverCommand<Bytes>>();
+        assert!(
+            try_register(&shared, &tx).is_none(),
+            "close() through any handle fences admission on the shared registry"
+        );
+        // next_id did not advance for the refused registration.
+        assert_eq!(a.__test_registry_snapshot(), (0, 0));
     }
 }
