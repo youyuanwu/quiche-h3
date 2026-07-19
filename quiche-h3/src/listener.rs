@@ -158,6 +158,41 @@ impl H3QuicheAcceptor {
     /// ([`wait_idle`](H3QuicheEndpoint::wait_idle)); it shares state with every
     /// acceptor from the same `bind()` call and outlives the acceptor(s), so it
     /// still reaches live workers after the acceptor is dropped.
+    ///
+    /// # Same-port rebind after shutdown
+    ///
+    /// [`wait_idle`](H3QuicheEndpoint::wait_idle) resolves when every bridge
+    /// worker has ended, but the underlying UDP socket is owned by
+    /// tokio-quiche's router task, which releases its socket handles only when it
+    /// is next polled after the acceptor is dropped. Rebinding the **same** UDP
+    /// port immediately after `wait_idle()` therefore usually succeeds on the
+    /// first try but may transiently fail for a scheduler tick. Spike S1
+    /// (`tests/endpoint_shutdown.rs`, Linux) measured this residual: across 300
+    /// shutdowns the immediate rebind needed a retry ~5–25% of the time, and a
+    /// single backoff retry always sufficed (worst case: **2 attempts**; retry
+    /// latency ≈ one backoff interval). Callers that must rebind the exact port
+    /// should use a short **bounded retry**, e.g.:
+    ///
+    /// ```no_run
+    /// # use std::net::SocketAddr;
+    /// # use tokio::net::UdpSocket;
+    /// # async fn rebind(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    /// let mut last_err = None;
+    /// for _ in 0..20 {
+    ///     match UdpSocket::bind(addr).await {
+    ///         Ok(sock) => return Ok(sock),
+    ///         Err(e) => {
+    ///             last_err = Some(e);
+    ///             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    ///         }
+    ///     }
+    /// }
+    /// Err(last_err.unwrap())
+    /// # }
+    /// ```
+    ///
+    /// Note also that **all** acceptors from one `bind()` call (and any live
+    /// connection workers) must be dropped/drained before the FD is released.
     pub fn endpoint(&self) -> H3QuicheEndpoint {
         H3QuicheEndpoint::new(Arc::clone(&self.shared))
     }

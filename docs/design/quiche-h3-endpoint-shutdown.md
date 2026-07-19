@@ -344,6 +344,15 @@ the same teardown that drops that worker's send-socket `Arc` (§2.2).
 > task's scheduling remains. **Preferred real fix:** an upstream `tokio-quiche`
 > signal to await listener/router completion (§11) — then `wait_idle` can be
 > exact.
+>
+> **[RESOLVED — measured, Linux]** The S1 loopback test
+> (`s1_same_port_rebind_after_wait_idle`, 6×50 iters) confirms the expected
+> outcome: the immediate same-port rebind succeeds first-try in ~75–94% of
+> shutdowns; when it does not, a single backoff retry always sufficed (worst
+> observed across 300 shutdowns: **2 attempts**; retry latency ≈ one backoff
+> interval, ~6–12 ms). Verdict: **bounded retry required** (not "effectively
+> exact"). The shipped contract pairs `wait_idle()` with a short bounded rebind
+> retry; see `tests/SPIKE_OUTCOMES.md` and the `close`/`wait_idle` rustdoc.
 
 ### 5.4 `close()`
 
@@ -531,12 +540,21 @@ returns, before `wait_idle`.
     needs a retry across many runs, `wait_idle` can be documented as effectively
     exact for this build; if it sometimes does, the bounded retry is the
     documented contract (and motivates the upstream ask, §11).
+    **[RESOLVED]** implemented as `s1_same_port_rebind_after_wait_idle`; verdict
+    **bounded retry required** (~5–25% of shutdowns needed one retry;
+    worst 2 attempts) — see §5.6 [RESOLVED] note and `SPIKE_OUTCOMES.md`.
   - **S2 — admission fence:** hammer `accept()` while calling `close()`
     concurrently; assert no worker is started after `close()` and no connection is
     yielded after idle is observed.
+    **[RESOLVED]** implemented as `s2_admission_fence_under_concurrent_close`
+    (asserts `next_id` frozen post-`close()` via the test accessor, and nothing
+    yielded after `closing`) — **Confirmed**.
   - **S3 — mid-handshake bound:** with a finite `handshake_timeout`, start a
     handshake that never completes, `close()` + `wait_idle()`; assert `wait_idle`
     completes within ~the timeout (validates the §7 mitigation).
+    **[RESOLVED]** implemented as `s3_mid_handshake_bounded_by_timeout` (raw
+    Initial-only client + `handshake_timeout = 800 ms`; `wait_idle` ≈ 801 ms) —
+    **Confirmed**.
   - peers receive a `CONNECTION_CLOSE` with the supplied code/reason after
     `close()` (front-end poll resolves to the classified terminal, bridge §8).
 - **Downstream acceptance:** the un-`#[ignore]`d `tonic-h3`
@@ -582,13 +600,20 @@ returns, before `wait_idle`.
 - **[SPIKE S1]** FD-release timing vs. `wait_idle` — the router task owns socket
   `Arc`s and releases them only when polled after stream-closed + conns-gone
   (§2.2/§5.3). Quantify the residual with the S1 rebind test.
+  **[RESOLVED — Linux]** measured: bounded retry required (~5–25% of shutdowns
+  need one retry; worst 2 attempts). The bounded rebind retry is
+  the shipped contract.
 - **Upstream ask (preferred real fix for S1):** request a `tokio-quiche` API to
   **await listener/router-task completion** (or a socket-released signal). With
   it, `wait_idle` becomes exact and the bounded rebind retry can be dropped. This
   is the clean analog of quinn owning its socket. Track as an upstream issue.
+  (Still open — the measured residual is small but non-zero, so this remains the
+  preferred exact fix.)
 - **[SPIKE S2]** admission-fence completeness under concurrent `close()`/`accept()`
-  (§7). **[SPIKE S3]** mid-handshake `wait_idle` bound with a finite
-  `handshake_timeout` (§7).
+  (§7) — **[RESOLVED]** Confirmed by `s2_admission_fence_under_concurrent_close`.
+  **[SPIKE S3]** mid-handshake `wait_idle` bound with a finite
+  `handshake_timeout` (§7) — **[RESOLVED]** Confirmed by
+  `s3_mid_handshake_bounded_by_timeout` (`wait_idle` ≈ the timeout).
 - **Mid-handshake force-close** is bounded only by the configured handshake/idle
   timeout (§5.4/§7). Document on `close()`; recommend a finite `handshake_timeout`
   in server `QuicSettings`.

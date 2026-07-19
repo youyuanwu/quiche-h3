@@ -2281,13 +2281,24 @@ explicitly targeted.
   (§14 T1b). During closing/draining, `wait_for_data` remains pending rather than
   re-reading EOF; only packets/timers drive the worker, so teardown cannot hot-spin.
   `on_conn_close` publishes the resulting terminal.
-- Unlike `msquic-h3` there is **no registration/rundown**: `tokio-quiche` owns
+- The base data path has **no registration/rundown**: `tokio-quiche` owns
   worker-task lifetime. The `QuicConnection` handle returned by
   `start`/`connect_with_config` is only connection *metadata* and is **not**
   load-bearing for the worker (§2.3 spike T2), so `connect`/`accept` may drop their
-  `let _qconn = …` binding without ending the session. Server teardown = drop the
-  `Listener` (stops the `listen` stream); in-flight connections drain on their own
-  worker tasks. We do not need the `wait_idle` machinery from `msquic-h3`.
+  `let _qconn = …` binding without ending the session. **Drop-driven** server
+  teardown = drop the `Listener` (stops the `listen` stream); in-flight
+  connections drain on their own worker tasks, and there is no way to await that
+  drain. The steady-state bridge therefore needs no `wait_idle` machinery for
+  drop-driven teardown.
+  However, the additive **endpoint-initiated** shutdown control surface
+  (`H3QuicheEndpoint::close`/`wait_idle`, design `quiche-h3-endpoint-shutdown.md`)
+  *does* layer a lightweight opt-in registration on top: each accepted server
+  worker registers a `WeakUnboundedSender` + RAII deregistration guard in a shared
+  endpoint registry, so `close()` can broadcast the terminal `DriverCommand::Close`
+  to every live worker and `wait_idle()` can await their exit. This is a
+  server-side control surface distinct from — and not required by — the
+  drop-driven path above (unlike `msquic-h3`, it is opt-in and registration is
+  keyed off the endpoint handle, not every connection).
 - After establishment, `on_conn_close` is the single funnel that publishes the
   terminal to every out-of-band cell (§5) so all front-end polls resolve to a
   classified error rather than hanging. It publishes the connection-level

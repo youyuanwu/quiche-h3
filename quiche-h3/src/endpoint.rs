@@ -144,13 +144,43 @@ impl Drop for ConnRegistration {
 ///
 /// # Example
 ///
+/// Take the shutdown handle before serving, then drive a graceful shutdown
+/// (clone the endpoint → serve → `close()` → `wait_idle()`), matching the
+/// ordering in design §6:
+///
 /// ```no_run
-/// # async fn doc(endpoint: quiche_h3::H3QuicheEndpoint) {
-/// // `endpoint` is obtained from `acceptor.endpoint()`.
+/// # use quiche_h3::{H3QuicheAcceptor, H3QuicheServerConfig};
+/// # use tokio::net::UdpSocket;
+/// # async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// let socket = UdpSocket::bind("127.0.0.1:4433").await?;
+/// let config = H3QuicheServerConfig {
+///     cert_path: "cert.pem".into(),
+///     key_path: "key.pem".into(),
+///     ..H3QuicheServerConfig::default()
+/// };
+/// let mut acceptor = H3QuicheAcceptor::bind([socket], &config)?.pop().unwrap();
+///
+/// // Take a shutdown handle BEFORE serving; it clones and moves freely.
+/// let endpoint = acceptor.endpoint();
+///
+/// // Serve on a task: `accept()` yields until the endpoint is closed + drained.
+/// let server = tokio::spawn(async move {
+///     while let Ok(Some(_conn)) = acceptor.accept().await {
+///         // ... spawn a task to drive each connection ...
+///     }
+/// });
+///
+/// // ... later, shut the server down gracefully:
 /// endpoint.close(h3::error::Code::H3_NO_ERROR, b"server shutting down");
-/// endpoint.wait_idle().await;
+/// endpoint.wait_idle().await; // resolves once every live worker has ended
+/// server.await?;
+/// # Ok(())
 /// # }
 /// ```
+///
+/// `H3_NO_ERROR` (`0x100`) is the conventional graceful-shutdown code; any
+/// [`h3::error::Code`] may be supplied instead (a caller wiring through, e.g.,
+/// `0u16.into()` selects application code `0`).
 #[derive(Clone)]
 pub struct H3QuicheEndpoint(pub(crate) Arc<EndpointShared>);
 
@@ -174,6 +204,15 @@ impl H3QuicheEndpoint {
     ///
     /// This does not block. Follow it with [`wait_idle`](Self::wait_idle) to
     /// await full drain.
+    ///
+    /// # Mid-handshake limitation
+    ///
+    /// A worker that has registered but is still **mid-handshake** is not yet
+    /// established and does not process the broadcast close command; it is torn
+    /// down only when its handshake completes or its `handshake_timeout` /
+    /// `max_idle_timeout` expires. Configure a finite `handshake_timeout` in the
+    /// server `QuicSettings` so a stalled peer cannot delay
+    /// [`wait_idle`](Self::wait_idle) beyond that bound (spike S3).
     pub fn close(&self, code: h3::error::Code, reason: &[u8]) {
         // Under the lock: mark closing, record the first frame, and snapshot the
         // live (upgradable) recipients. Do the accept wake and the per-worker
@@ -218,9 +257,11 @@ impl H3QuicheEndpoint {
     ///
     /// Note: `wait_idle()` reflects this crate's per-connection worker
     /// lifetimes. The underlying UDP socket is owned by tokio-quiche's router
-    /// task and may be released slightly later; see `H3QuicheAcceptor::endpoint()`
-    /// (on [`H3QuicheAcceptor`](crate::H3QuicheAcceptor)) for the rebind guidance
-    /// established by spike S1.
+    /// task and may be released slightly later, so an immediate same-port rebind
+    /// should use a short bounded retry; see
+    /// [`H3QuicheAcceptor::endpoint()`](crate::H3QuicheAcceptor::endpoint) for
+    /// the measured rebind guidance (spike S1: at most one retry — worst
+    /// observed 2 attempts across 300 shutdowns on Linux).
     pub async fn wait_idle(&self) {
         loop {
             // Register the waiter (via `enable()`) BEFORE observing `live`, so a
