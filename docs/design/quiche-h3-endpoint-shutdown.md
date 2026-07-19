@@ -1,13 +1,25 @@
 # Design: endpoint shutdown & wait-for-idle for `quiche-h3`
 
-> **Status:** proposal / pre-implementation. Section numbers below are local to
-> this document; references of the form "bridge §N" point at
-> [`quiche-h3-bridge.md`](./quiche-h3-bridge.md).
+> **Status: Implemented.** This design is realized in `quiche-h3/src/endpoint.rs`
+> (the socket-free state machine), `quiche-h3/src/listener.rs`
+> (`H3QuicheAcceptor::endpoint()` + the `accept()` admission fence), and
+> `quiche-h3/src/driver.rs` (the `ConnRegistration` worker-exit guard), exported
+> from `lib.rs` as [`H3QuicheEndpoint`]. All three spikes are **[RESOLVED]**
+> (§5.3/§9/§11) with loopback tests in `quiche-h3/tests/endpoint_shutdown.rs` and
+> outcomes recorded in `quiche-h3/tests/SPIKE_OUTCOMES.md`. The document is kept
+> as the authoritative rationale/spec (the implementation's rustdoc references its
+> section numbers); the proposal-tense prose below is preserved for the design
+> narrative, with `[RESOLVED]`/implementation notes inline where reality refined
+> the plan. Inline `file.rs:NN` line references were written against the
+> pre-implementation code and are approximate pointers, not exact post-merge lines.
 >
-> **Spike-driven, like the bridge design.** Several claims are marked
-> **[SPIKE]** — they must be confirmed against the pinned build
-> (`tokio-quiche 0.19.1` / `quiche 0.29.3`) before or during implementation, in
-> the same spirit as bridge §14.
+> Section numbers below are local to this document; references of the form
+> "bridge §N" point at [`quiche-h3-bridge.md`](./quiche-h3-bridge.md).
+>
+> **Spike-driven, like the bridge design.** Claims originally marked **[SPIKE]**
+> were confirmed against the pinned build (`tokio-quiche 0.19.1` /
+> `quiche 0.29.3`) during implementation, in the same spirit as bridge §14; see
+> the **[RESOLVED]** notes.
 
 ## 1. Goal
 
@@ -412,8 +424,18 @@ check so the serve loop terminates and the acceptor/stream is dropped
 - A handshake that **completes after** `closing` is observed must **not** be
   yielded to the caller (the caller's serve loop is winding down); drop it — its
   worker was registered (§5.2) and will be force-closed by the `close()` snapshot
-  or has already received `Close`. Do not leak it out of `accept()`
-  (`listener.rs:155-160` currently returns it unconditionally).
+  or has already received `Close`. Do not leak it out of `accept()`.
+
+> **[RESOLVED — shipped mechanism]** The as-built `accept()` enforces the last
+> bullet with a defense-in-depth **re-check of `is_closing()` under the endpoint
+> lock at the yield point** (`listener.rs`, "Re-read `closing` under the endpoint
+> lock HERE"), in addition to the `closing` snapshot taken at the top of the loop.
+> This closes a TOCTOU found in final review: `close()` could linearize *between*
+> the top-of-loop snapshot and the `biased` select poll, so a connection that
+> established in that window would otherwise be yielded after `closing`. The
+> under-lock recheck at the moment of yielding makes the "never yield after
+> `closing`" guarantee exact, and it is asserted deterministically by the S2 spike
+> (`s2_admission_fence_under_concurrent_close`).
 
 This preserves "already-established connections keep running until force-closed":
 `close()` force-closes via §5.4; `accept()` merely stops yielding new ones and
