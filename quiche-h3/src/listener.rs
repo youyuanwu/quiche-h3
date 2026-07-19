@@ -11,6 +11,7 @@
 //! conditions (§7.1, §8.4).
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -22,6 +23,7 @@ use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificat
 use tokio_quiche::{ConnectionParams, QuicConnectionStream};
 
 use crate::driver::QuicheDriver;
+use crate::endpoint::{EndpointShared, H3QuicheEndpoint};
 use crate::stream::Connection;
 use crate::Error;
 
@@ -84,6 +86,11 @@ pub struct H3QuicheAcceptor {
     accept_bidi_cap: usize,
     accept_uni_cap: usize,
     incoming_done: bool,
+    /// Endpoint registry shared by every acceptor from the same `bind()` call
+    /// and by the [`H3QuicheEndpoint`] handles it hands out (§5.1). Registration
+    /// at accept time and `close()` linearize under this one lock (the admission
+    /// fence), so a single endpoint governs shutdown across all its sockets.
+    shared: Arc<EndpointShared>,
 }
 
 impl H3QuicheAcceptor {
@@ -125,6 +132,12 @@ impl H3QuicheAcceptor {
         let streams = tokio_quiche::listen(sockets, params, DefaultMetrics)
             .map_err(|e| -> Error { Box::new(e) })?;
 
+        // One endpoint registry governs every acceptor produced by this
+        // `bind()` call (FR-002/§5.1): all per-socket acceptors and the
+        // `H3QuicheEndpoint` handles they hand out share this single `Arc`, so a
+        // shutdown fences admission and drains workers across all sockets.
+        let shared = EndpointShared::new();
+
         Ok(streams
             .into_iter()
             .map(|stream| Self {
@@ -134,8 +147,59 @@ impl H3QuicheAcceptor {
                 accept_bidi_cap: config.accept_bidi_cap,
                 accept_uni_cap: config.accept_uni_cap,
                 incoming_done: false,
+                shared: Arc::clone(&shared),
             })
             .collect())
+    }
+
+    /// Return a cloneable [`H3QuicheEndpoint`] handle over this acceptor's shared
+    /// endpoint registry (§5.2). The handle drives graceful shutdown
+    /// ([`close`](H3QuicheEndpoint::close)) and drain observation
+    /// ([`wait_idle`](H3QuicheEndpoint::wait_idle)); it shares state with every
+    /// acceptor from the same `bind()` call and outlives the acceptor(s), so it
+    /// still reaches live workers after the acceptor is dropped.
+    ///
+    /// # Same-port rebind after shutdown
+    ///
+    /// [`wait_idle`](H3QuicheEndpoint::wait_idle) resolves when every bridge
+    /// worker has ended, but the underlying UDP socket is owned by
+    /// tokio-quiche's router task, which releases its socket handles only when it
+    /// is next polled after the acceptor is dropped. Rebinding the **same** UDP
+    /// port immediately after `wait_idle()` therefore commonly fails its first
+    /// attempt and succeeds on the next. Spike S1 (`tests/endpoint_shutdown.rs`)
+    /// measured this residual on Linux loopback: when the rebind is attempted at
+    /// the tightest window (immediately after `wait_idle()` resolves) the first
+    /// attempt essentially always needed one retry, and a **single** backoff
+    /// retry always sufficed (worst observed: **2 attempts**; retry latency ≈ one
+    /// backoff interval). Giving the router task even a few hundred microseconds
+    /// of unrelated work first drops the first-attempt-failure rate to ~5–25%,
+    /// but the bound is the same. Treat this as an observed-on-Linux sample, not a
+    /// cross-platform guarantee: the robust contract is simply *"a same-port
+    /// rebind may need a short bounded retry,"* so callers that must rebind the
+    /// exact port should use one, e.g.:
+    ///
+    /// ```no_run
+    /// # use std::net::SocketAddr;
+    /// # use tokio::net::UdpSocket;
+    /// # async fn rebind(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    /// let mut last_err = None;
+    /// for _ in 0..20 {
+    ///     match UdpSocket::bind(addr).await {
+    ///         Ok(sock) => return Ok(sock),
+    ///         Err(e) => {
+    ///             last_err = Some(e);
+    ///             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    ///         }
+    ///     }
+    /// }
+    /// Err(last_err.unwrap())
+    /// # }
+    /// ```
+    ///
+    /// Note also that **all** acceptors from one `bind()` call (and any live
+    /// connection workers) must be dropped/drained before the FD is released.
+    pub fn endpoint(&self) -> H3QuicheEndpoint {
+        H3QuicheEndpoint::new(Arc::clone(&self.shared))
     }
 
     /// Accept the next established connection (§7.1). Returns `Ok(Some(conn))`
@@ -145,19 +209,64 @@ impl H3QuicheAcceptor {
     /// are logged and skipped — one peer can never fail `accept` for everyone.
     pub async fn accept(&mut self) -> Result<Option<Connection<Bytes>>, Error> {
         loop {
-            if self.incoming_done && self.handshakes.is_empty() {
+            // Register the accept-wake waiter BEFORE observing `closing`, so a
+            // `close()` racing this check cannot be lost (§5.5 lost-wakeup
+            // discipline). Enabling the `Notified` future arms it without
+            // awaiting.
+            let accept_wake = self.shared.accept_wake.notified();
+            tokio::pin!(accept_wake);
+            accept_wake.as_mut().enable();
+
+            // Once `close()` is observed the acceptor stops admitting: it neither
+            // starts new workers nor yields freshly-established connections
+            // (§5.4). It still drains in-flight handshakes so their workers are
+            // registered and force-closed, then reports end-of-stream.
+            let closing = self.shared.is_closing();
+            let admission_done = self.incoming_done || closing;
+
+            if admission_done && self.handshakes.is_empty() {
                 return Ok(None);
             }
 
             tokio::select! {
                 biased;
 
+                // 0. `close()` woke a parked `accept()`: fall through to re-read
+                //    `closing` at the top of the loop (never returns early). Only
+                //    armed until `closing` latches — afterwards there is nothing
+                //    more to wake for.
+                _ = &mut accept_wake, if !closing => {
+                    continue;
+                }
+
                 // 1. A started handshake finished. Decoupled from how many other
                 //    handshakes are still in flight, so one stalled peer cannot
                 //    block delivery of a ready connection.
                 Some(res) = self.handshakes.next(), if !self.handshakes.is_empty() => {
                     match res {
-                        Ok(conn) => return Ok(Some(conn)),
+                        Ok(conn) => {
+                            // A handshake that completed once `close()` has been
+                            // observed must be dropped, not yielded (§5.5): its
+                            // worker was registered and is force-closed by the
+                            // `close()` snapshot. Dropping the `Connection`
+                            // releases its strong `cmd_tx`; the peer may then
+                            // observe a teardown close rather than the exact
+                            // `(code, reason)` (acceptable, Spec AS-1.1/P3.2).
+                            //
+                            // Re-read `closing` under the endpoint lock HERE,
+                            // rather than trusting the stale snapshot taken at the
+                            // top of the loop: `close()` can linearize on another
+                            // thread between that snapshot and this `select!`
+                            // poll, and `biased` polling means the ready-handshake
+                            // arm can win the same poll in which the `accept_wake`
+                            // arm saw `Pending`. The fresh read makes this the
+                            // true accept/yield linearization point (§5.4, FR-006).
+                            if closing || self.shared.is_closing() {
+                                drop(conn);
+                                continue;
+                            }
+                            return Ok(Some(conn));
+                        }
                         Err(_e) => {
                             // Per-connection pre-handshake failure. `accept` has
                             // no per-connection error channel, so surface it
@@ -173,11 +282,12 @@ impl H3QuicheAcceptor {
                 }
 
                 // 2. A new incoming connection: START its handshake but DO NOT
-                //    await it here. Disabled while the in-flight set is full, so
-                //    backpressure is exerted by not polling the stream again
-                //    until a slot frees.
+                //    await it here. Disabled once admission is done (listener
+                //    ended or endpoint closing) or while the in-flight set is
+                //    full, so backpressure is exerted by not polling the stream
+                //    again until a slot frees.
                 iqc = self.stream.next(),
-                    if !self.incoming_done
+                    if !admission_done
                         && self.handshakes.len() < self.max_in_flight_handshakes.get() =>
                 {
                     let Some(item) = iqc else {
@@ -186,21 +296,37 @@ impl H3QuicheAcceptor {
                     };
                     match item {
                         Ok(iqc) => {
-                            let (driver, handles) = QuicheDriver::<Bytes>::new(
+                            let (mut driver, handles) = QuicheDriver::<Bytes>::new(
                                 true,
                                 self.accept_bidi_cap,
                                 self.accept_uni_cap,
                             );
-                            // `start` is synchronous and returns before the
-                            // handshake runs; the returned `QuicConnection` is
-                            // metadata only and safe to drop (§2.3 T2).
-                            let _qconn = iqc.start(driver);
-                            self.handshakes.push(
-                                handles
-                                    .into_established_connection()
-                                    .map(|res| res.map_err(|e| -> Error { Box::new(e) }))
-                                    .boxed(),
-                            );
+                            // Admission fence (§5.1): register under the endpoint
+                            // lock at the true linearization point. If `close()`
+                            // landed between the top-of-loop check and here,
+                            // `try_register` returns `None` and we drop the
+                            // nascent connection WITHOUT starting a worker (§5.4).
+                            match crate::endpoint::try_register(&self.shared, &handles.cmd_tx) {
+                                None => {
+                                    // Dropping `iqc`/`driver`/`handles` abandons
+                                    // the connection; no worker is spawned.
+                                    continue;
+                                }
+                                Some(reg) => {
+                                    // Move the deregistration guard into the
+                                    // driver so it drops at worker exit (§5.5),
+                                    // then start (synchronous; the returned
+                                    // `QuicConnection` is metadata only, §2.3 T2).
+                                    driver.set_conn_registration(reg);
+                                    let _qconn = iqc.start(driver);
+                                    self.handshakes.push(
+                                        handles
+                                            .into_established_connection()
+                                            .map(|res| res.map_err(|e| -> Error { Box::new(e) }))
+                                            .boxed(),
+                                    );
+                                }
+                            }
                         }
                         Err(_e) => {
                             // A stream item `Err` is a per-packet/per-attempt

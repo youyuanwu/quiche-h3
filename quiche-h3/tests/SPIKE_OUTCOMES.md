@@ -365,3 +365,114 @@ by this scenario and is not reproducible on loopback with the standard
 completion order; contract A ships as-is, with the upstream
 `stream_collected(id)` fallback (A-plus-upstream-API) reserved only if that
 adversarial path is later shown to resurrect an id.
+
+---
+
+# Endpoint graceful-shutdown spike outcomes (design `quiche-h3-endpoint-shutdown.md` §5.6/§11)
+
+Observed by the loopback probes in `quiche-h3/tests/endpoint_shutdown.rs`. Run:
+
+```text
+cargo test -p quiche-h3 --test endpoint_shutdown -- --ignored --nocapture
+```
+
+These resolve the three spikes the endpoint-shutdown design intentionally left
+empirical. Measurements are Linux-local (the CI matrix additionally builds/tests
+on Windows, but the S1 timing verdict below is Linux-measured — see the platform
+note in S1).
+
+| gate | verdict |
+|---|---|
+| S1 | **Bounded retry required** (same-port rebind: ~5–25% of shutdowns need exactly one retry; worst observed **2 attempts** across 300 shutdowns; latency ≈ one backoff interval) |
+| S2 | Confirmed (admission fence holds: `next_id` frozen after `close()`; nothing yielded post-`closing`) |
+| S3 | Confirmed (stalled mid-handshake worker bounded by `handshake_timeout`; `wait_idle` ≈ timeout) |
+
+## S1 — same-port rebind after `close()` → drop acceptor → `wait_idle()`
+
+**Test:** `s1_same_port_rebind_after_wait_idle` (50 iterations/run)
+
+**Assumption (§5.6):** after graceful shutdown, the SAME UDP port may not be
+*instantly* rebindable because tokio-quiche's router task owns its own
+`Arc<UdpSocket>` clones and releases them only when next polled after its
+accept-sink closes; a short bounded rebind retry may be needed. This mirrors the
+`tonic-h3` reconnect scenario.
+
+**Observed — two measurement points (Linux loopback, `#[ignore]`d test, 50
+iters/invocation):**
+
+The residual is sensitive to *when* the rebind is attempted relative to
+`wait_idle()`:
+
+```text
+# (A) rebind measured IMMEDIATELY after wait_idle() (the tightest window, and
+#     what the shipped test now measures — matches the tonic-h3 reconnect race):
+S1 rebind: iters=50 needing_retry=50 worst_attempts=2 worst_latency=11.979026ms
+S1 rebind: iters=50 needing_retry=50 worst_attempts=2 worst_latency=12.298068ms
+S1 rebind: iters=50 needing_retry=50 worst_attempts=2 worst_latency=12.598355ms
+
+# (B) earlier config, with incidental client/drive cleanup between wait_idle()
+#     and the rebind (gives the router task a scheduler tick to be polled):
+S1 rebind: iters=50 needing_retry=6  worst_attempts=2 worst_latency=6.723448ms
+S1 rebind: iters=50 needing_retry=3  worst_attempts=2 worst_latency=6.468537ms
+S1 rebind: iters=50 needing_retry=12 worst_attempts=2 worst_latency=11.686635ms
+```
+
+The decisive, backoff-independent invariant is stable across BOTH measurement
+points: the immediate same-port rebind may fail its first attempt, and **exactly
+one** backoff retry always sufficed — the worst case observed anywhere was **2
+attempts** (one retry), with retry latency ≈ one backoff interval. The *rate* of
+first-attempt failure depends on timing: at the tightest window (A) it is
+effectively 100% (the router task has not yet been polled to release its socket
+clone), whereas even a few hundred microseconds of unrelated work (B) drops it to
+~5–25%. Either way, one bounded retry closes the window. The rebound port was
+proven usable each iteration by completing a fresh handshake on it.
+
+**Verdict:** **Bounded retry required (nuanced, not "effectively exact").** The
+port is reliably rebindable after at most one retry; a caller that must rebind
+the exact port immediately after `wait_idle()` should use a bounded retry loop.
+The shipped test budgets a generous safety margin (≤ 60 attempts / 10 ms backoff)
+to stay robust under CI scheduler contention — distinct from the measured-typical
+worst case above. This is encoded in the `close`/`wait_idle`/`endpoint()` rustdoc.
+
+**Platform note:** measured on Linux only. The documented contract for
+un-measured platforms (incl. Windows, which the CI matrix builds) stays the
+conservative "bounded retry may be required" wording.
+
+## S2 — admission fence under concurrent `accept()`/`close()`
+
+**Test:** `s2_admission_fence_under_concurrent_close`
+
+**Assumption (§5.4/§5.5):** registration and `close()` serialize under the single
+endpoint lock, giving a linearizable admission fence: no worker is started after
+`close()`, and no established connection is yielded out of `accept()` once
+`closing` is observed (post-`closing` handshakes are dropped, not yielded).
+
+**Observed:** with ≥ 3 live connections established, `close()` is fired and the
+registration counter (`next_id`, via the `#[doc(hidden)]` test accessor) is
+snapshotted at the linearization point. A post-close burst of 24 new clients is
+launched; after 400 ms the counter is unchanged, and the acceptor drains to
+`Ok(None)` having yielded no more connections than were registered before close.
+
+**Verdict:** **Confirmed.** The single-lock registration/close serialization
+holds the fence exactly as designed.
+
+## S3 — mid-handshake worker bounded by `handshake_timeout`
+
+**Test:** `s3_mid_handshake_bounded_by_timeout`
+
+**Assumption (§5.5/§11):** a connection that registers a worker but stalls
+mid-handshake must not pin `wait_idle()` open forever. With a finite
+`handshake_timeout` configured, the stalled worker self-terminates at the
+timeout (a mid-handshake worker is not yet established, so it does not process
+the broadcast `Close` command), and `wait_idle()` completes within a bounded
+margin of the timeout.
+
+**Observed:** with `handshake_timeout = 800 ms` and
+`disable_client_ip_validation = true`, a raw quiche client that sends only its
+Initial flight then stalls causes the server to start and register exactly one
+worker (proven via the registry snapshot — registration precedes `close()`).
+After `close()`, `wait_idle()` resolved in **~801 ms** (≈ the handshake timeout),
+and the worker deregistered on its timeout exit.
+
+**Verdict:** **Confirmed.** The mid-handshake case is bounded by the configured
+`handshake_timeout`, not by `close()` responsiveness.

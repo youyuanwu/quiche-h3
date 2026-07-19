@@ -63,6 +63,37 @@ while let Some(conn) = acceptor.accept().await? {
 # Ok(()) }
 ```
 
+Graceful shutdown (server): obtain a cloneable `H3QuicheEndpoint` from the
+acceptor *before* serving, then close and wait for idle. `accept()` stops
+yielding new connections once `close()` is observed and returns `None` once the
+pending handshakes drain (already-established connections keep their own workers,
+which are torn down by the broadcast close). Await the serve task to completion
+to drop the acceptor, then drive `wait_idle()` from the retained handle.
+
+```rust,no_run
+use quiche_h3::{H3QuicheAcceptor, H3QuicheServerConfig};
+
+# async fn run(config: H3QuicheServerConfig) -> Result<(), quiche_h3::Error> {
+let socket = tokio::net::UdpSocket::bind("0.0.0.0:4433").await?;
+let mut acceptor = H3QuicheAcceptor::bind([socket], &config)?.pop().unwrap();
+
+// Take the shutdown handle before moving the acceptor into the serve loop.
+let endpoint = acceptor.endpoint();
+let server = tokio::spawn(async move {
+    while let Ok(Some(_conn)) = acceptor.accept().await {
+        // ... spawn a task to serve each connection ...
+    }
+});
+
+// Later — graceful shutdown, in this order:
+endpoint.close(h3::error::Code::H3_NO_ERROR, b"server shutting down");
+server.await.unwrap();      // accept loop ends → the acceptor is dropped
+endpoint.wait_idle().await; // resolves once every live connection worker ends
+// The same UDP port is now rebindable (use a short bounded retry to absorb the
+// tokio-quiche router-task residual — see `H3QuicheAcceptor::endpoint` docs).
+# Ok(()) }
+```
+
 Client:
 
 ```rust,no_run
