@@ -26,6 +26,7 @@ mod buffer;
 mod conn;
 mod connector;
 mod driver;
+mod endpoint;
 mod error;
 mod listener;
 mod stream;
@@ -68,6 +69,7 @@ pub(crate) fn ensure_nonempty_alpn(
 }
 
 pub use connector::{H3QuicheClientConfig, H3QuicheConnector};
+pub use endpoint::H3QuicheEndpoint;
 pub use listener::{H3QuicheAcceptor, H3QuicheServerConfig, DEFAULT_MAX_IN_FLIGHT_HANDSHAKES};
 
 // Front-end `h3::quic` surface. These name the connection/stream types produced
@@ -87,6 +89,11 @@ const _: fn() = || {
 
     fn assert_clone_send_static<T: Clone + Send + 'static>() {}
     assert_clone_send_static::<H3QuicheConnector>();
+
+    // The endpoint control surface must be cheaply cloneable and shareable
+    // across tasks (design §5.2).
+    fn assert_clone_send_sync<T: Clone + Send + Sync + 'static>() {}
+    assert_clone_send_sync::<H3QuicheEndpoint>();
 
     // Pin the accept/connect return types to `Connection<Bytes>` (behind the
     // outer `Result`/`Option`). Never called; the coercion is the assertion.
