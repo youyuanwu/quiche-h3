@@ -2753,6 +2753,9 @@ mod tests {
             "park flag must be published"
         );
     }
+
+    /// §11: destructive intake + admission — a new peer id is admitted exactly
+    /// once; re-running the pump does not re-admit (membership).
     #[test]
     fn destructive_intake_admits_new_peer_once() {
         let (mut d, mut h) = driver();
