@@ -1,5 +1,10 @@
 # quiche-h3
 
+[![build](https://github.com/youyuanwu/quiche-h3/actions/workflows/build.yaml/badge.svg)](https://github.com/youyuanwu/quiche-h3/actions/workflows/build.yaml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://raw.githubusercontent.com/youyuanwu/quiche-h3/main/LICENSE)
+[![Crates.io](https://img.shields.io/crates/v/quiche-h3)](https://crates.io/crates/quiche-h3)
+[![Documentation](https://docs.rs/quiche-h3/badge.svg)](https://docs.rs/quiche-h3)
+
 > ⚠️ **Experimental / work in progress.** This crate is pre-1.0 and under active
 > development. The API is unstable and may change without notice, and it is not
 > yet recommended for production use.
@@ -11,7 +16,8 @@ An [`h3::quic`](https://docs.rs/h3) transport-adapter bridge that runs hyperium
 
 It exposes a standalone acceptor/connector whose `accept()` / `connect()` yield a
 `Connection` that implements `h3::quic::Connection<Bytes>`, so it plugs directly
-into `h3::client` / `h3::server`.
+into `h3::client` / `h3::server`. It is usable as the `quiche` backend for
+[`tonic-h3`](https://github.com/youyuanwu/tonic-h3) (gRPC over HTTP/3).
 
 ## Design
 
