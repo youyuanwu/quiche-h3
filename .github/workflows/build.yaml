@@ -2,6 +2,9 @@ name: build
 
 on: [push, pull_request, workflow_dispatch]
 
+permissions:
+  contents: read
+
 jobs:
   toolchain:
     runs-on: ubuntu-latest
