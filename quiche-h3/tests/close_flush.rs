@@ -42,7 +42,7 @@ impl TestCerts {
         let cert_path = dir.join(format!("{uniq}.crt"));
         let key_path = dir.join(format!("{uniq}.key"));
         std::fs::write(&cert_path, ck.cert.pem()).expect("write cert");
-        std::fs::write(&key_path, ck.key_pair.serialize_pem()).expect("write key");
+        std::fs::write(&key_path, ck.signing_key.serialize_pem()).expect("write key");
         Self {
             cert_path: cert_path.to_string_lossy().into_owned(),
             key_path: key_path.to_string_lossy().into_owned(),
