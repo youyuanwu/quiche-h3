@@ -3,5 +3,5 @@
 # also exercises the MSRV (1.90) via its build matrix; this pin tracks the
 # upper toolchain and is kept current by Dependabot (.github/dependabot.yml,
 # package-ecosystem: "rust-toolchain").
-channel = "1.97.0"
+channel = "1.97.1"
 components = ["rustfmt", "clippy"]
