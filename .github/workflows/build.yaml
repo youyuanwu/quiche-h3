@@ -2,14 +2,32 @@ name: build
 
 on: [push, pull_request, workflow_dispatch]
 
+permissions:
+  contents: read
+
 jobs:
+  toolchain:
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.read.outputs.channel }}
+    steps:
+    - uses: actions/checkout@v7
+    - name: Read rust channel from rust-toolchain.toml
+      id: read
+      run: |
+        channel=$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
+        echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: toolchain
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ windows-latest, ubuntu-latest ]
-        rust: [ 1.90.0, 1.97.0 ]
+        # 1.90.0 is the MSRV; the second entry is the pinned toolchain read
+        # from rust-toolchain.toml by the `toolchain` job.
+        rust: [ "1.90.0", "${{ needs.toolchain.outputs.channel }}" ]
     steps:
     - uses: actions/checkout@v7
 
@@ -21,6 +39,13 @@ jobs:
     - name: Install nasm (windows)
       if: runner.os == 'Windows'
       run: winget install nasm --accept-package-agreements --accept-source-agreements --disable-interactivity
+
+    # The matrix already selects the exact toolchain (MSRV + the pinned channel),
+    # so remove the file to keep `cargo +${{ matrix.rust }}` authoritative and
+    # avoid conflicts with the rust cache.
+    - name: Remove toolchain file to avoid conflict with rust cache
+      shell: bash
+      run: rm rust-toolchain.toml
 
     - name: Install rust
       uses: dtolnay/rust-toolchain@stable
