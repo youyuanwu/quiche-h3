@@ -204,9 +204,7 @@ async fn concurrent_requests_all_complete_no_tail_stall() {
                     assert_eq!(resp.status(), http::StatusCode::OK, "status is 200");
 
                     let mut len = 0usize;
-                    while let Some(mut chunk) =
-                        stream.recv_data().await.expect("recv body chunk")
-                    {
+                    while let Some(mut chunk) = stream.recv_data().await.expect("recv body chunk") {
                         len += chunk.remaining();
                         chunk.advance(chunk.remaining());
                     }
