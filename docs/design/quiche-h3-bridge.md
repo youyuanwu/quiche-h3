@@ -1336,17 +1336,57 @@ Because the front-end single-slot contract (§2.1) allows at most one in-flight
 `Write`/`Finish` receipt remains FIFO. `Reset` is the deliberate cancellation
 exception. Execution and **exactly-once** completion (iter12 findings 3 & 4):
 
-- **`Write { buf, done }`** — `stream_send(id, chunk, fin=false)` honoring partial
-  writes; the unsent remainder stays at the **head** of `send_ops`, re-armed via
-  the low-water mark (§5.3). When the whole buffer is accepted, fire
-  `done.send(Ok(()))`. On `Err(StreamStopped(code))`, invoke the same send-terminal
-  transition as writable discovery: set/publish
-  `SendEnd::Stopped{code}`, drain the current and every later not-yet-completed
-  `send_ops` entry exactly once with that error, mark `send_done`, and remove
-  logical runnable membership.
-- **`Finish { done }`** — `stream_send(id, &[], fin=true)`; `done.send(Ok(()))` on
-  acceptance. `StreamStopped(code)` invokes the same all-remaining-ops terminal
-  transition, rather than completing only the selected FIN.
+- **`Write { buf, done }`** — two shapes (issue #10 FIN-coalescing; see the
+  coalescing note below):
+  - **Hold (coalesce-ready):** when the whole buffer fits the current
+    `stream_capacity(id)`, the transport `stream_send` is **deferred** — the
+    buffer is moved into a per-stream `held` slot (a transient ≤1-buffer driver
+    hold), `done.send(Ok(()))` fires immediately (the bytes are guaranteed
+    sendable, so the front end proceeds to its `Finish`), the SF-6 permit is
+    released at that completion point (as before), and the op is popped. The held
+    bytes leave later — coalesced with the following `Finish` (`fin=true`), or
+    flushed `fin=false` when a subsequent `Write` arrives (a pre-existing held
+    write is always flushed first to preserve FIFO byte order, §2.1).
+  - **Immediate partial write:** a capacity-limited buffer keeps the single
+    bounded `stream_send(id, chunk, fin=false)` honoring partial writes; the
+    unsent remainder stays at the **head** of `send_ops`, re-armed via the
+    low-water mark (§5.3). When the whole buffer is accepted, fire
+    `done.send(Ok(()))`.
+  - On `Err(StreamStopped(code))` (either shape), invoke the same send-terminal
+    transition as writable discovery: set/publish `SendEnd::Stopped{code}`, drain
+    the current and every later not-yet-completed `send_ops` entry exactly once
+    with that error, mark `send_done`, and remove logical runnable membership.
+    A drained stream also clears any `held` buffer.
+- **`Finish { done }`** — if a `held` (deferred) write is present, its bytes are
+  flushed **coalesced** with the FIN as a single
+  `stream_send(id, last_chunk, fin=true)` (the FIN rides the chunk that empties
+  the held buffer); otherwise — the empty-body / 0-length response — a lone
+  `stream_send(id, &[], fin=true)` is emitted (accepted even at zero send
+  capacity, §14 Q5). `done.send(Ok(()))` fires when the FIN leaves.
+  `StreamStopped(code)` invokes the same all-remaining-ops terminal transition,
+  rather than completing only the selected FIN.
+
+> **FIN-coalescing note (issue #10).** quiche's `send.is_complete()` becomes true
+> once the body bytes are ACKed *regardless of whether the FIN frame was emitted*;
+> on that edge quiche's `collect()` drops a still-queued **standalone empty-FIN**
+> frame (`is_complete && !is_readable && !is_writable`). At concurrency > 1 this
+> races roughly `concurrency − 1` trailing streams into an indefinite stall (the
+> body is ACKed, the separate empty-FIN is dropped and never re-emitted once the
+> stream quiesces). Coalescing the FIN onto the final DATA chunk removes the
+> standalone empty-FIN entirely, so there is nothing to drop. Because the front
+> end completes a `Write` (via `poll_ready`) a full round-trip **before** it
+> issues `Finish`, the `Write` and `Finish` are never adjacent in `send_ops`; the
+> driver therefore *holds* the fully-sendable write and coalesces it when the
+> `Finish` arrives. **Tradeoff:** the hold defers a written message's delivery
+> until the next write/finish. For unary request/response (and any case where
+> `Finish` follows immediately) this is transient. For **server-streaming with
+> producer pauses** it delays message N until N+1; for **strict ping-pong bidi
+> streaming** (server's next write depends on the client receiving message N) it
+> can **deadlock**, because the worker parks on `cmd_rx` with N still held. This
+> is inherent to any FIN-coalescing scheme (the last data must be held
+> speculatively until the FIN is known). Streaming ping-pong use should be gated
+> (or a bounded flush-on-park timer added) before relying on this path; the
+> unary/tail-drain fix is unaffected.
 - **`Reset { code }` preemption** — when stage (a) applies the first effective
   reset, it sets and publishes `SendEnd::Reset { error_code: code }`, takes every
   queued `Write`/`Finish` that has not reached its completion boundary, and sends
@@ -2866,6 +2906,20 @@ Scenario tests that must be covered explicitly (from the design reviews):
       wake for parked admissions uses a hand-rolled `Mutex<Vec<Waker>>` rather than
       `tokio::sync::Notify` (whose `Notified` future borrows the `Notify` and cannot
       be held across the synchronous `poll_ready`).
+- **FIN-coalescing held write (issue #10, §5.3a):** the send path now *holds* a
+  fully-sendable `Write` in a transient per-stream `held` slot and coalesces it
+  with the following `Finish` so the FIN rides the final DATA chunk (no standalone
+  empty-FIN for quiche to drop on the body-ACK edge). The write's completion
+  oneshot and its SF-6 permit are released at **hold** time (as pre-#10), so the
+  held buffer is *not* SF-6-accounted — it is a ≤1-buffer-per-stream driver hold
+  analogous to quiche's own send buffer, flushed on the very next send action and
+  cleared at every drain site. **Follow-up / risk:** the hold defers a message's
+  delivery until the next write/finish, which is transient for unary
+  request/response but delays server-streaming messages across producer pauses and
+  can **deadlock** strict ping-pong bidi streaming (worker parks on `cmd_rx` with
+  data still held). This is inherent to FIN-coalescing; gating streaming use or
+  adding a bounded flush-on-park timer is the follow-up before relying on the path
+  for ping-pong bidi.
 - **Cross-socket acceptor fan-in (S1)**: v1 returns one `H3QuicheAcceptor` per
   socket (`bind -> Vec<Self>`, §7.1); a single acceptor that multiplexes all
   listener streams behind one `accept()` is a possible follow-up, not undocumented

@@ -378,6 +378,40 @@ pub(crate) enum SendOp<B: Buf> {
     },
 }
 
+/// A fully-admitted `Write` whose transport `stream_send` has been **deferred**
+/// so an immediately-following `Finish` can be coalesced onto it as a single
+/// `stream_send(id, last_chunk, fin=true)` (§5.3a, issue #10 tail-drain fix).
+///
+/// Holding is only entered when the whole remaining buffer fits in the stream's
+/// current send capacity (`stream_capacity(id) >= buf.remaining()`), so a
+/// capacity-limited (partial) write never holds — it keeps the immediate
+/// `stream_send` + low-water re-arm backpressure path (§5.1). The write's
+/// completion oneshot is resolved `Ok` at hold time (the bytes are guaranteed
+/// sendable), so the front end proceeds to issue its `Finish`; the SF-6 `permit`
+/// releases at that same completion point (as it did pre-#10), leaving only a
+/// transient ≤1-buffer-per-stream driver hold (analogous to quiche's own send
+/// buffer, not SF-6 counted) that is flushed on the very next send action.
+pub(crate) struct HeldWrite<B: Buf> {
+    buf: h3::quic::WriteBuf<B>,
+}
+
+/// The result of flushing one turn of a stream's held (deferred) write to the
+/// transport (issue #10 coalesce). See [`QuicheDriver::flush_held_once`].
+enum HeldFlush {
+    /// The held buffer emptied this turn (its `permit` was released and `held`
+    /// cleared). When a FIN was requested it left with the final chunk.
+    Complete,
+    /// Progress made but bytes remain; the caller should requeue for another
+    /// turn (a requested FIN has NOT been emitted yet — it rides the last chunk).
+    More,
+    /// Capacity-exhausted mid-flush: the low-water mark was re-armed and the id
+    /// parked; the held remainder stays for a later capacity edge.
+    Blocked,
+    /// A terminal transition fired (StreamStopped / conn-gone / bug) and drained
+    /// the stream; nothing more to service.
+    Terminal,
+}
+
 impl<B: Buf> SendOp<B> {
     /// Resolve this op's completion exactly once (§5.3a exactly-once). A `Write`
     /// completes through its reusable [`WriteCompleter`] (set-if-current-
@@ -410,6 +444,11 @@ pub(crate) struct StreamSendState<B: Buf> {
     /// drop-driven cleanup to reclaim a retained entry once both directions of a
     /// stream are terminal and its front-end halves are gone (§6.2, invariant 8).
     pub(crate) finished: bool,
+    /// A deferred, fully-sendable `Write` whose transport `stream_send` is held
+    /// so a following `Finish` coalesces into one `stream_send(.., fin=true)`
+    /// (issue #10 tail-drain fix, §5.3a). `None` in the steady/partial-write
+    /// state; at most one held write per stream (FIFO single-slot, §2.1).
+    pub(crate) held: Option<HeldWrite<B>>,
 }
 
 impl<B: Buf> StreamSendState<B> {
@@ -422,6 +461,7 @@ impl<B: Buf> StreamSendState<B> {
             terminal: None,
             status: TerminalCell::new(),
             finished: false,
+            held: None,
         }
     }
 }
@@ -2157,6 +2197,9 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         }
         let terminal = state.terminal.clone().expect("terminal just set");
         let ops: Vec<SendOp<B>> = state.send_ops.drain(..).collect();
+        // Drop any held (deferred) write buffer; its write completion (and
+        // SF-6 permit) already resolved Ok/released at hold time (#10).
+        state.held = None;
         for op in ops {
             op.complete(Err(terminal.clone()));
         }
@@ -2175,6 +2218,9 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 if state.terminal.is_none() {
                     state.terminal = Some(end.clone());
                 }
+                // Drop any held (deferred) write buffer; its write completion (and
+                // SF-6 permit) already resolved Ok/released at hold time (#10).
+                state.held = None;
                 state.send_ops.drain(..).collect()
             }
             None => return,
@@ -2275,11 +2321,123 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         }
     }
 
-    /// One `Write` turn: a single bounded `stream_send(id, chunk, fin=false)`
-    /// honoring partial writes (§5.3a). Full acceptance pops the op and completes
-    /// `Ok(())`; a capacity-exhausted partial / `Done` re-arms the low-water mark
-    /// (§5.3) and parks; `StreamStopped` runs the send-terminal transition.
+    /// Flush one `stream_send` turn of the stream's held (deferred) write to the
+    /// transport (issue #10 coalesce). `fin` requests the FIN bit on the chunk
+    /// that empties the held buffer this turn. Mirrors the partial-write
+    /// machinery of [`Self::service_write_turn`]: a full drain clears `held`; a
+    /// capacity-exhausted partial re-arms the low-water mark (§5.3) and parks;
+    /// `StreamStopped` / conn-gone / bug run the send-terminal transition. A
+    /// missing `held` is a completed no-op. (The SF-6 permit was already released
+    /// when the write completed at hold time, so there is none to release here.)
+    fn flush_held_once<C: QuicConn>(&mut self, qconn: &mut C, id: u64, fin: bool) -> HeldFlush {
+        let remaining = match self.send.get(&id).and_then(|s| s.held.as_ref()) {
+            Some(held) => held.buf.remaining(),
+            None => return HeldFlush::Complete,
+        };
+        let mut offered = 0usize;
+        let result = {
+            let held = self
+                .send
+                .get_mut(&id)
+                .and_then(|s| s.held.as_mut())
+                .expect("held present");
+            send_from_buf(&mut held.buf, |chunk| {
+                let n = chunk.len().min(MAX_WRITE_CHUNK);
+                offered = n;
+                // The FIN rides only the chunk that empties the whole held
+                // buffer (n == the total remaining at turn entry). quiche/Mock
+                // both downgrade the FIN if this chunk is only partially
+                // accepted, so a capacity-exhausted final chunk re-arms below.
+                let last = fin && n == remaining;
+                qconn.stream_send(id, &chunk[..n], last)
+            })
+        };
+        match result {
+            Ok(written) => {
+                let drained = self
+                    .send
+                    .get(&id)
+                    .and_then(|s| s.held.as_ref())
+                    .map(|held| !held.buf.has_remaining())
+                    .unwrap_or(true);
+                if drained {
+                    // Whole held buffer flushed: clear held (permit already released).
+                    if let Some(state) = self.send.get_mut(&id) {
+                        state.held = None;
+                    }
+                    HeldFlush::Complete
+                } else if written == offered {
+                    HeldFlush::More
+                } else {
+                    match self.rearm_send(qconn, id) {
+                        TurnOutcome::Drop => HeldFlush::Terminal,
+                        _ => HeldFlush::Blocked,
+                    }
+                }
+            }
+            Err(err) => match self.classify_send_err(qconn, id, &err) {
+                TurnOutcome::Park => HeldFlush::Blocked,
+                TurnOutcome::Requeue => HeldFlush::More,
+                TurnOutcome::Drop => HeldFlush::Terminal,
+            },
+        }
+    }
+
+    /// One `Write` turn (§5.3a). Two shapes:
+    ///
+    /// - **Hold (coalesce-ready, issue #10):** when the whole buffer fits in the
+    ///   current send capacity, the transport `stream_send` is *deferred* — the
+    ///   buffer moves into `held`, the write completion resolves `Ok` immediately
+    ///   (bytes are guaranteed sendable) which releases its SF-6 permit, and the
+    ///   op pops. The bytes leave later coalesced with the following `Finish`
+    ///   (`fin=true`) or
+    ///   flushed `fin=false` when a subsequent `Write` arrives. This is what
+    ///   drives the trailing in-flight streams to completion at concurrency > 1.
+    /// - **Immediate partial write:** a capacity-limited buffer keeps the single
+    ///   bounded `stream_send(id, chunk, fin=false)` + low-water re-arm
+    ///   backpressure path (§5.1). Full acceptance pops + completes `Ok`.
+    ///
+    /// A pre-existing `held` write is always flushed first (`fin=false`) to
+    /// preserve FIFO byte order (§2.1). `StreamStopped` runs the send-terminal
+    /// transition.
     fn service_write_turn<C: QuicConn>(&mut self, qconn: &mut C, id: u64) -> TurnOutcome {
+        // (a) Flush any previously held (deferred) write FIRST, without a FIN, so
+        //     bytes leave in FIFO order before the current op (§2.1, §5.3a). A
+        //     fresh Write behind a held write forces the held bytes out now.
+        if self.send.get(&id).is_some_and(|s| s.held.is_some()) {
+            match self.flush_held_once(qconn, id, false) {
+                HeldFlush::Complete => {} // fall through to service the current op
+                HeldFlush::More => return TurnOutcome::Requeue,
+                HeldFlush::Blocked => return TurnOutcome::Park,
+                HeldFlush::Terminal => return TurnOutcome::Drop,
+            }
+        }
+        // (b) Hold vs. immediate: defer only when the whole buffer fits in the
+        //     current send capacity (the coalesce-ready state, issue #10).
+        let remaining = match self.send.get(&id).and_then(|s| s.send_ops.front()) {
+            Some(SendOp::Write { buf, .. }) => buf.remaining(),
+            _ => return TurnOutcome::Drop,
+        };
+        let cap = match qconn.stream_capacity(id) {
+            Ok(cap) => cap,
+            Err(err) => return self.classify_send_err(qconn, id, &err),
+        };
+        if remaining > 0 && cap >= remaining {
+            // Defer: move the buffer into `held`, resolve the write completion
+            // `Ok` now (the front end proceeds to its Finish), release the SF-6
+            // permit at this completion point (as pre-#10), and pop the op.
+            if let Some(state) = self.send.get_mut(&id) {
+                if let Some(SendOp::Write { buf, done, permit }) = state.send_ops.pop_front() {
+                    done.complete(Ok(()));
+                    drop(permit); // release SF-6 reservation at completion (§12)
+                    state.held = Some(HeldWrite { buf });
+                }
+            }
+            return self.runnable_after_pop(id);
+        }
+        // (c) Capacity-limited (or 0-byte): single bounded partial write. A
+        //     0-byte Write is fully accepted here (nothing sent), preserving the
+        //     empty-body path where the FIN follows as a lone `stream_send`.
         let mut offered = 0usize;
         let result = {
             let state = self.send.get_mut(&id).expect("send state present");
@@ -2326,32 +2484,58 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         }
     }
 
-    /// One `Finish` turn: `stream_send(id, &[], fin=true)` (§5.3a). Accepted even
-    /// at zero send capacity (§14 Q5); on acceptance pop + complete `Ok(())`.
+    /// One `Finish` turn (§5.3a). When a held (deferred) write is present, its
+    /// bytes are flushed **coalesced** with the FIN as a single
+    /// `stream_send(id, last_chunk, fin=true)` — this is the issue #10 tail-drain
+    /// fix that keeps quiche from dropping a standalone empty-FIN once the body
+    /// is ACKed. Otherwise (empty body / 0-length) a lone
+    /// `stream_send(id, &[], fin=true)` is emitted (accepted even at zero send
+    /// capacity, §14 Q5). On the FIN leaving, the `Finish` op pops + completes
+    /// `Ok(())` exactly once and the send half is marked done + reclaimed.
     fn service_finish_turn<C: QuicConn>(&mut self, qconn: &mut C, id: u64) -> TurnOutcome {
-        match qconn.stream_send(id, &[], true) {
-            Ok(_) => {
-                if let Some(state) = self.send.get_mut(&id) {
-                    if let Some(op) = state.send_ops.pop_front() {
-                        op.complete(Ok(()));
-                    }
+        if self.send.get(&id).is_some_and(|s| s.held.is_some()) {
+            // Coalesce: flush the held bytes carrying the FIN on the final chunk.
+            match self.flush_held_once(qconn, id, true) {
+                HeldFlush::Complete => {
+                    self.complete_finish_op(id);
+                    TurnOutcome::Drop
                 }
-                // A sent FIN closes the send direction: mark it done so contract
-                // A reclaims an admitted bidi once its recv half also ends.
-                self.mark_send_done(id);
-                // Reclaim the retained send entry now IF the recv half is already
-                // gone (the normal server order: request read to FIN → recv
-                // reclaimed, then response + FIN). The send half is `finalized`
-                // after a graceful FIN, so no late Send/Finish can legitimately
-                // arrive; the guard keeps it retained while a bidi recv half is
-                // still live (client order → reclaimed at the recv-done edge).
-                // Without this, one send entry leaks per handled request (§6.2
-                // invariant 8).
-                self.reclaim_finished_send(id);
-                TurnOutcome::Drop
+                // FIN not emitted yet (more held bytes): keep the Finish queued.
+                HeldFlush::More => TurnOutcome::Requeue,
+                HeldFlush::Blocked => TurnOutcome::Park,
+                HeldFlush::Terminal => TurnOutcome::Drop,
             }
-            Err(err) => self.classify_send_err(qconn, id, &err),
+        } else {
+            match qconn.stream_send(id, &[], true) {
+                Ok(_) => {
+                    self.complete_finish_op(id);
+                    TurnOutcome::Drop
+                }
+                Err(err) => self.classify_send_err(qconn, id, &err),
+            }
         }
+    }
+
+    /// Pop + complete the head `Finish` op `Ok(())` once its FIN has left, then
+    /// mark the send half done and reclaim the retained entry if the recv half is
+    /// already gone (§5.3a, §6.2 invariant 8).
+    fn complete_finish_op(&mut self, id: u64) {
+        if let Some(state) = self.send.get_mut(&id) {
+            if let Some(op) = state.send_ops.pop_front() {
+                op.complete(Ok(()));
+            }
+        }
+        // A sent FIN closes the send direction: mark it done so contract A
+        // reclaims an admitted bidi once its recv half also ends.
+        self.mark_send_done(id);
+        // Reclaim the retained send entry now IF the recv half is already gone
+        // (the normal server order: request read to FIN → recv reclaimed, then
+        // response + FIN). The send half is `finalized` after a graceful FIN, so
+        // no late Send/Finish can legitimately arrive; the guard keeps it
+        // retained while a bidi recv half is still live (client order → reclaimed
+        // at the recv-done edge). Without this, one send entry leaks per handled
+        // request (§6.2 invariant 8).
+        self.reclaim_finished_send(id);
     }
 
     /// Classify a `stream_send` error into a turn outcome (§8.3): `StreamStopped`
@@ -2485,6 +2669,9 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             if state.terminal.is_none() {
                 state.terminal = Some(end);
             }
+            // Drop any held (deferred) write buffer; its write completion (and
+            // SF-6 permit) already resolved Ok/released at hold time (#10).
+            state.held = None;
             pending_ops.extend(state.send_ops.drain(..));
         }
         for op in pending_ops {
@@ -2592,6 +2779,7 @@ fn build_send<B: Buf>(
             terminal: None,
             status,
             finished: false,
+            held: None,
         })
     };
     (handoff, state, send_done)
@@ -3730,8 +3918,11 @@ mod tests {
         let (mut d, _h) = driver();
         let mut c = MockConn::new();
         let total = wbuf_len(b"hello world");
-        // Accept at most 3 bytes per stream_send call.
+        // Accept at most 3 bytes per stream_send call, and report a matching
+        // 3-byte stream capacity so the write stays on the immediate partial-send
+        // + low-water re-arm path (a fully-fitting write would coalesce-hold, #10).
         c.send_capacity.insert(0, 3);
+        c.capacity.insert(0, Ok(3));
         let done = push_send(&mut d, 0, b"hello world");
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
@@ -3788,6 +3979,84 @@ mod tests {
             done.try_recv(),
             Err(oneshot::error::TryRecvError::Closed)
         ));
+    }
+
+    /// Issue #10 (§5.3a coalesce): a `Write` whose buffer fully fits the send
+    /// window is *held* (deferred) and the following `Finish` flushes it as a
+    /// SINGLE `stream_send(id, body, fin=true)` — never the pre-fix pair of a
+    /// standalone body write + standalone empty-FIN (the empty-FIN quiche could
+    /// drop once the body is ACKed, stranding the stream). Both completions
+    /// resolve `Ok` exactly once. A lone `Finish` (empty body) still emits
+    /// `stream_send(id, &[], true)` — the concurrency-1-safe path that must stay.
+    #[test]
+    fn coalesced_write_then_finish_emits_single_fin_frame() {
+        // (1) Write(body) then Finish → ONE coalesced (id, body, fin=true) entry.
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        let body_wire = wbuf_len(b"hi");
+        let done = push_send(&mut d, 0, b"hi");
+        let mut fin = push_finish(&mut d, 0);
+        d.apply_inbox(&mut c);
+        // One batch services the held Write then coalesces the Finish onto it.
+        d.stage_send(&mut c);
+
+        // The h3 DATA `WriteBuf` is chained ([frame header][payload]), so the
+        // send path emits one `stream_send` per contiguous chunk; the #10
+        // invariant is that the FIN rides the FINAL DATA chunk and NO standalone
+        // empty-FIN frame is produced (that is the frame quiche drops once the
+        // body is ACKed). Pre-fix there was an extra trailing `(0, [], true)`.
+        assert!(
+            !c.sent
+                .iter()
+                .any(|(id, b, f)| *id == 0 && b.is_empty() && *f),
+            "no standalone empty-FIN frame is emitted (issue #10)"
+        );
+        let fin_frames: Vec<&(u64, Vec<u8>, bool)> =
+            c.sent.iter().filter(|(id, _, f)| *id == 0 && *f).collect();
+        assert_eq!(
+            fin_frames.len(),
+            1,
+            "exactly one FIN, coalesced onto a DATA frame — not the pre-fix pair"
+        );
+        assert!(
+            !fin_frames[0].1.is_empty(),
+            "the FIN rides a non-empty final DATA chunk"
+        );
+        assert_eq!(
+            sent_len(&c, 0),
+            body_wire,
+            "the whole body (frame header + payload) is sent"
+        );
+        assert!(
+            matches!(done.state(), ProbeState::Ok),
+            "the body write completes Ok exactly once"
+        );
+        assert!(
+            matches!(fin.try_recv(), Ok(Ok(()))),
+            "the finish completes Ok exactly once"
+        );
+        // The send half is reclaimed after the coalesced FIN leaves.
+        assert!(
+            !d.runnable_send_set.contains(&0),
+            "runnable membership released after the coalesced FIN"
+        );
+
+        // (2) A lone Finish (empty body / 0-length response) still records the
+        //     standalone empty-FIN — the concurrency-1-safe path is preserved.
+        let (mut d2, _h2) = driver();
+        let mut c2 = MockConn::new();
+        let mut lone = push_finish(&mut d2, 4);
+        d2.apply_inbox(&mut c2);
+        d2.stage_send(&mut c2);
+        let sent2: Vec<&(u64, Vec<u8>, bool)> =
+            c2.sent.iter().filter(|(id, _, _)| *id == 4).collect();
+        assert_eq!(sent2.len(), 1, "lone finish emits exactly one empty-FIN");
+        assert!(sent2[0].1.is_empty(), "empty-body FIN carries no data");
+        assert!(sent2[0].2, "empty-body FIN sets the FIN bit");
+        assert!(
+            matches!(lone.try_recv(), Ok(Ok(()))),
+            "lone finish completes Ok exactly once"
+        );
     }
 
     /// §11: `Reset` preempts an in-flight/queued `Write` — the queued op is
@@ -4033,10 +4302,7 @@ mod tests {
         // Peer STOP_SENDING on the send half → send terminal + contract A (recv
         // already done) reclaims admit/recv but retains self.send's terminal.
         let w1 = push_send(&mut d, 0, b"aa");
-        c.send_errors
-            .entry(0)
-            .or_default()
-            .push_back(quiche::Error::StreamStopped(55));
+        c.capacity.insert(0, Err(quiche::Error::StreamStopped(55)));
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
         assert!(matches!(
@@ -4067,11 +4333,10 @@ mod tests {
         let w2 = push_send(&mut d, 0, b"bb");
         let mut fin = push_finish(&mut d, 0);
         d.apply_inbox(&mut c);
-        // The first stream_send call reports the peer stopped us.
-        c.send_errors
-            .entry(0)
-            .or_default()
-            .push_back(quiche::Error::StreamStopped(9));
+        // The peer STOP_SENDING surfaces on the capacity probe the send turn
+        // makes before it would coalesce-hold a fully-fitting write (#10): real
+        // quiche returns StreamStopped from both stream_capacity and stream_send.
+        c.capacity.insert(0, Err(quiche::Error::StreamStopped(9)));
         d.stage_send(&mut c);
 
         for (label, st) in [("w1", w1.state()), ("w2", w2.state())] {
@@ -4130,6 +4395,10 @@ mod tests {
         // (WRITE_BUDGET turns × MAX_WRITE_CHUNK = 512 KiB), so it cannot finish
         // within a single batch even if it takes every remaining turn.
         static BULK: [u8; 1024 * 1024] = [b'x'; 1024 * 1024];
+        // Report a bounded per-turn stream capacity so the bulk write takes the
+        // partial-send path (never the fully-fits coalesce-hold, #10): it makes
+        // MAX_WRITE_CHUNK progress per turn and cannot drain in one batch.
+        c.capacity.insert(0, Ok(MAX_WRITE_CHUNK));
         let bulk_cell = crate::buffer::WriteCompletion::<SendEnd>::new();
         let bulk_gen = bulk_cell.begin();
         d.inbox.push_back(DriverCommand::Send {
@@ -4417,10 +4686,7 @@ mod tests {
         let (mut d, _h) = driver();
         let mut c = MockConn::new();
         let done = push_send(&mut d, 0, b"x");
-        c.send_errors
-            .entry(0)
-            .or_default()
-            .push_back(quiche::Error::InvalidState);
+        c.capacity.insert(0, Err(quiche::Error::InvalidState));
         d.apply_inbox(&mut c);
         d.stage_send(&mut c);
         // Not completed, not pinned: op retained, status cell empty.
