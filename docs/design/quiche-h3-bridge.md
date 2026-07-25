@@ -1336,7 +1336,7 @@ Because the front-end single-slot contract (§2.1) allows at most one in-flight
 `Write`/`Finish` receipt remains FIFO. `Reset` is the deliberate cancellation
 exception. Execution and **exactly-once** completion (iter12 findings 3 & 4):
 
-- **`Write { buf, done }`** — two shapes (issue #43 FIN-coalescing; see the
+- **`Write { buf, done }`** — two shapes (issue #10 FIN-coalescing; see the
   coalescing note below):
   - **Hold (coalesce-ready):** when the whole buffer fits the current
     `stream_capacity(id)`, the transport `stream_send` is **deferred** — the
@@ -1366,7 +1366,7 @@ exception. Execution and **exactly-once** completion (iter12 findings 3 & 4):
   `StreamStopped(code)` invokes the same all-remaining-ops terminal transition,
   rather than completing only the selected FIN.
 
-> **FIN-coalescing note (issue #43).** quiche's `send.is_complete()` becomes true
+> **FIN-coalescing note (issue #10).** quiche's `send.is_complete()` becomes true
 > once the body bytes are ACKed *regardless of whether the FIN frame was emitted*;
 > on that edge quiche's `collect()` drops a still-queued **standalone empty-FIN**
 > frame (`is_complete && !is_readable && !is_writable`). At concurrency > 1 this
@@ -2906,11 +2906,11 @@ Scenario tests that must be covered explicitly (from the design reviews):
       wake for parked admissions uses a hand-rolled `Mutex<Vec<Waker>>` rather than
       `tokio::sync::Notify` (whose `Notified` future borrows the `Notify` and cannot
       be held across the synchronous `poll_ready`).
-- **FIN-coalescing held write (issue #43, §5.3a):** the send path now *holds* a
+- **FIN-coalescing held write (issue #10, §5.3a):** the send path now *holds* a
   fully-sendable `Write` in a transient per-stream `held` slot and coalesces it
   with the following `Finish` so the FIN rides the final DATA chunk (no standalone
   empty-FIN for quiche to drop on the body-ACK edge). The write's completion
-  oneshot and its SF-6 permit are released at **hold** time (as pre-#43), so the
+  oneshot and its SF-6 permit are released at **hold** time (as pre-#10), so the
   held buffer is *not* SF-6-accounted — it is a ≤1-buffer-per-stream driver hold
   analogous to quiche's own send buffer, flushed on the very next send action and
   cleared at every drain site. **Follow-up / risk:** the hold defers a message's

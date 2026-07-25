@@ -380,7 +380,7 @@ pub(crate) enum SendOp<B: Buf> {
 
 /// A fully-admitted `Write` whose transport `stream_send` has been **deferred**
 /// so an immediately-following `Finish` can be coalesced onto it as a single
-/// `stream_send(id, last_chunk, fin=true)` (§5.3a, issue #43 tail-drain fix).
+/// `stream_send(id, last_chunk, fin=true)` (§5.3a, issue #10 tail-drain fix).
 ///
 /// Holding is only entered when the whole remaining buffer fits in the stream's
 /// current send capacity (`stream_capacity(id) >= buf.remaining()`), so a
@@ -388,7 +388,7 @@ pub(crate) enum SendOp<B: Buf> {
 /// `stream_send` + low-water re-arm backpressure path (§5.1). The write's
 /// completion oneshot is resolved `Ok` at hold time (the bytes are guaranteed
 /// sendable), so the front end proceeds to issue its `Finish`; the SF-6 `permit`
-/// releases at that same completion point (as it did pre-#43), leaving only a
+/// releases at that same completion point (as it did pre-#10), leaving only a
 /// transient ≤1-buffer-per-stream driver hold (analogous to quiche's own send
 /// buffer, not SF-6 counted) that is flushed on the very next send action.
 pub(crate) struct HeldWrite<B: Buf> {
@@ -396,7 +396,7 @@ pub(crate) struct HeldWrite<B: Buf> {
 }
 
 /// The result of flushing one turn of a stream's held (deferred) write to the
-/// transport (issue #43 coalesce). See [`QuicheDriver::flush_held_once`].
+/// transport (issue #10 coalesce). See [`QuicheDriver::flush_held_once`].
 enum HeldFlush {
     /// The held buffer emptied this turn (its `permit` was released and `held`
     /// cleared). When a FIN was requested it left with the final chunk.
@@ -446,7 +446,7 @@ pub(crate) struct StreamSendState<B: Buf> {
     pub(crate) finished: bool,
     /// A deferred, fully-sendable `Write` whose transport `stream_send` is held
     /// so a following `Finish` coalesces into one `stream_send(.., fin=true)`
-    /// (issue #43 tail-drain fix, §5.3a). `None` in the steady/partial-write
+    /// (issue #10 tail-drain fix, §5.3a). `None` in the steady/partial-write
     /// state; at most one held write per stream (FIFO single-slot, §2.1).
     pub(crate) held: Option<HeldWrite<B>>,
 }
@@ -2198,7 +2198,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         let terminal = state.terminal.clone().expect("terminal just set");
         let ops: Vec<SendOp<B>> = state.send_ops.drain(..).collect();
         // Drop any held (deferred) write buffer; its write completion (and
-        // SF-6 permit) already resolved Ok/released at hold time (#43).
+        // SF-6 permit) already resolved Ok/released at hold time (#10).
         state.held = None;
         for op in ops {
             op.complete(Err(terminal.clone()));
@@ -2219,7 +2219,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                     state.terminal = Some(end.clone());
                 }
                 // Drop any held (deferred) write buffer; its write completion (and
-                // SF-6 permit) already resolved Ok/released at hold time (#43).
+                // SF-6 permit) already resolved Ok/released at hold time (#10).
                 state.held = None;
                 state.send_ops.drain(..).collect()
             }
@@ -2322,7 +2322,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
     }
 
     /// Flush one `stream_send` turn of the stream's held (deferred) write to the
-    /// transport (issue #43 coalesce). `fin` requests the FIN bit on the chunk
+    /// transport (issue #10 coalesce). `fin` requests the FIN bit on the chunk
     /// that empties the held buffer this turn. Mirrors the partial-write
     /// machinery of [`Self::service_write_turn`]: a full drain clears `held`; a
     /// capacity-exhausted partial re-arms the low-water mark (§5.3) and parks;
@@ -2385,7 +2385,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
 
     /// One `Write` turn (§5.3a). Two shapes:
     ///
-    /// - **Hold (coalesce-ready, issue #43):** when the whole buffer fits in the
+    /// - **Hold (coalesce-ready, issue #10):** when the whole buffer fits in the
     ///   current send capacity, the transport `stream_send` is *deferred* — the
     ///   buffer moves into `held`, the write completion resolves `Ok` immediately
     ///   (bytes are guaranteed sendable) which releases its SF-6 permit, and the
@@ -2413,7 +2413,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             }
         }
         // (b) Hold vs. immediate: defer only when the whole buffer fits in the
-        //     current send capacity (the coalesce-ready state, issue #43).
+        //     current send capacity (the coalesce-ready state, issue #10).
         let remaining = match self.send.get(&id).and_then(|s| s.send_ops.front()) {
             Some(SendOp::Write { buf, .. }) => buf.remaining(),
             _ => return TurnOutcome::Drop,
@@ -2425,7 +2425,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         if remaining > 0 && cap >= remaining {
             // Defer: move the buffer into `held`, resolve the write completion
             // `Ok` now (the front end proceeds to its Finish), release the SF-6
-            // permit at this completion point (as pre-#43), and pop the op.
+            // permit at this completion point (as pre-#10), and pop the op.
             if let Some(state) = self.send.get_mut(&id) {
                 if let Some(SendOp::Write { buf, done, permit }) = state.send_ops.pop_front() {
                     done.complete(Ok(()));
@@ -2486,7 +2486,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
 
     /// One `Finish` turn (§5.3a). When a held (deferred) write is present, its
     /// bytes are flushed **coalesced** with the FIN as a single
-    /// `stream_send(id, last_chunk, fin=true)` — this is the issue #43 tail-drain
+    /// `stream_send(id, last_chunk, fin=true)` — this is the issue #10 tail-drain
     /// fix that keeps quiche from dropping a standalone empty-FIN once the body
     /// is ACKed. Otherwise (empty body / 0-length) a lone
     /// `stream_send(id, &[], fin=true)` is emitted (accepted even at zero send
@@ -2670,7 +2670,7 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
                 state.terminal = Some(end);
             }
             // Drop any held (deferred) write buffer; its write completion (and
-            // SF-6 permit) already resolved Ok/released at hold time (#43).
+            // SF-6 permit) already resolved Ok/released at hold time (#10).
             state.held = None;
             pending_ops.extend(state.send_ops.drain(..));
         }
@@ -3920,7 +3920,7 @@ mod tests {
         let total = wbuf_len(b"hello world");
         // Accept at most 3 bytes per stream_send call, and report a matching
         // 3-byte stream capacity so the write stays on the immediate partial-send
-        // + low-water re-arm path (a fully-fitting write would coalesce-hold, #43).
+        // + low-water re-arm path (a fully-fitting write would coalesce-hold, #10).
         c.send_capacity.insert(0, 3);
         c.capacity.insert(0, Ok(3));
         let done = push_send(&mut d, 0, b"hello world");
@@ -3981,7 +3981,7 @@ mod tests {
         ));
     }
 
-    /// Issue #43 (§5.3a coalesce): a `Write` whose buffer fully fits the send
+    /// Issue #10 (§5.3a coalesce): a `Write` whose buffer fully fits the send
     /// window is *held* (deferred) and the following `Finish` flushes it as a
     /// SINGLE `stream_send(id, body, fin=true)` — never the pre-fix pair of a
     /// standalone body write + standalone empty-FIN (the empty-FIN quiche could
@@ -4001,7 +4001,7 @@ mod tests {
         d.stage_send(&mut c);
 
         // The h3 DATA `WriteBuf` is chained ([frame header][payload]), so the
-        // send path emits one `stream_send` per contiguous chunk; the #43
+        // send path emits one `stream_send` per contiguous chunk; the #10
         // invariant is that the FIN rides the FINAL DATA chunk and NO standalone
         // empty-FIN frame is produced (that is the frame quiche drops once the
         // body is ACKed). Pre-fix there was an extra trailing `(0, [], true)`.
@@ -4009,7 +4009,7 @@ mod tests {
             !c.sent
                 .iter()
                 .any(|(id, b, f)| *id == 0 && b.is_empty() && *f),
-            "no standalone empty-FIN frame is emitted (issue #43)"
+            "no standalone empty-FIN frame is emitted (issue #10)"
         );
         let fin_frames: Vec<&(u64, Vec<u8>, bool)> =
             c.sent.iter().filter(|(id, _, f)| *id == 0 && *f).collect();
@@ -4334,7 +4334,7 @@ mod tests {
         let mut fin = push_finish(&mut d, 0);
         d.apply_inbox(&mut c);
         // The peer STOP_SENDING surfaces on the capacity probe the send turn
-        // makes before it would coalesce-hold a fully-fitting write (#43): real
+        // makes before it would coalesce-hold a fully-fitting write (#10): real
         // quiche returns StreamStopped from both stream_capacity and stream_send.
         c.capacity.insert(0, Err(quiche::Error::StreamStopped(9)));
         d.stage_send(&mut c);
@@ -4396,7 +4396,7 @@ mod tests {
         // within a single batch even if it takes every remaining turn.
         static BULK: [u8; 1024 * 1024] = [b'x'; 1024 * 1024];
         // Report a bounded per-turn stream capacity so the bulk write takes the
-        // partial-send path (never the fully-fits coalesce-hold, #43): it makes
+        // partial-send path (never the fully-fits coalesce-hold, #10): it makes
         // MAX_WRITE_CHUNK progress per turn and cannot drain in one batch.
         c.capacity.insert(0, Ok(MAX_WRITE_CHUNK));
         let bulk_cell = crate::buffer::WriteCompletion::<SendEnd>::new();

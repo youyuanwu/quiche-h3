@@ -1,5 +1,5 @@
-//! Concurrency stall repro for tonic-h3 issue #43
-//! (<https://github.com/youyuanwu/tonic-h3/issues/43>).
+//! Concurrency stall repro for issue #10
+//! (<https://github.com/youyuanwu/quiche-h3/issues/10>).
 //!
 //! The reported symptom: the quiche HTTP/3 backend stalls when more than one
 //! request is in flight concurrently over a single loopback connection. The bulk
@@ -108,7 +108,7 @@ fn client_config() -> H3QuicheClientConfig {
 
 /// Many concurrent requests over one connection must all complete; the trailing
 /// `CONCURRENCY - 1` requests must be driven to completion after the issuing
-/// loop stops (the tonic-h3 #43 tail-drain stall).
+/// loop stops (the issue #10 tail-drain stall).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "binds UDP + runs a real handshake"]
 async fn concurrent_requests_all_complete_no_tail_stall() {
@@ -221,7 +221,7 @@ async fn concurrent_requests_all_complete_no_tail_stall() {
     };
 
     // The core assertion: the whole concurrent run drains within the deadline.
-    // Under the #43 stall the trailing `CONCURRENCY - 1` requests never complete
+    // Under the #10 stall the trailing `CONCURRENCY - 1` requests never complete
     // and this times out.
     let result = tokio::time::timeout(DEADLINE, run).await;
 
@@ -229,7 +229,7 @@ async fn concurrent_requests_all_complete_no_tail_stall() {
     assert!(
         result.is_ok(),
         "concurrent run stalled: only {done}/{TOTAL} requests completed before \
-         the {DEADLINE:?} deadline (tonic-h3 #43 tail-drain stall)",
+         the {DEADLINE:?} deadline (issue #10 tail-drain stall)",
     );
     assert_eq!(done, TOTAL, "every issued request must complete");
 

@@ -1,4 +1,4 @@
-# Design: issue #43 — concurrency tail-drain stall & FIN coalescing
+# Design: issue #10 — concurrency tail-drain stall & FIN coalescing
 
 > **Status: Fixed for unary request/response; streaming caveat outstanding.**
 > The tail-drain stall is resolved in `quiche-h3/src/driver.rs` (held-write FIN
@@ -15,8 +15,8 @@
 
 ## 1. Summary
 
-A downstream consumer ([tonic-h3 issue
-#43](https://github.com/youyuanwu/tonic-h3/issues/43)) reported that the
+A downstream consumer reported (tracked as [issue
+#10](https://github.com/youyuanwu/quiche-h3/issues/10)) that the
 `quiche-h3` backend **stalls above concurrency 1** on loopback: with `N`
 requests in flight concurrently over a single QUIC connection, the bulk of a run
 completes but the final `N − 1` in-flight requests **hang indefinitely**.
@@ -160,7 +160,7 @@ Implemented in `quiche-h3/src/driver.rs` (driver-confined):
 - **`service_write_turn`**: when the whole buffer fits `stream_capacity(id)`,
   **defer** the transport `stream_send` — move the buffer into `held`, resolve
   the write completion `Ok` and release its SF-6 send permit *now* (preserving
-  pre-#43 completion timing), and pop the op. Capacity-limited or 0-byte writes
+  pre-#10 completion timing), and pop the op. Capacity-limited or 0-byte writes
   keep the unchanged partial-send + low-water re-arm backpressure path
   (bridge §5.1).
 - **`flush_held_once`** (`driver.rs:2332`) + **`service_finish_turn`**: flush the
@@ -208,12 +208,12 @@ hold is problematic for streaming:
   and then *awaits a client response before producing the next one*, the held
   message is never flushed (the worker parks on `cmd_rx` with data still held),
   the client never receives it, so it never responds — a **deadlock**. This
-  pattern is common in gRPC bidi streaming, which **tonic-h3 supports**.
+  pattern is common in gRPC bidi streaming.
 
 This tension is inherent to *any* FIN-coalescing scheme: the final data must be
 held speculatively until the FIN is known, which conflicts with sending data
 eagerly for streaming liveness. It cannot be cheaply removed without either
-reverting to immediate sends (which re-opens #43) or adding a flush trigger.
+reverting to immediate sends (which re-opens #10) or adding a flush trigger.
 
 ### 5.1 Candidate remedies (for a follow-up)
 
@@ -233,11 +233,11 @@ reverting to immediate sends (which re-opens #43) or adding a flush trigger.
    correct long-term fix but is outside the `quiche-h3` bridge.
 
 Until a remedy lands, `quiche-h3` is safe for **unary** request/response (the
-#43 scenario) and remains **experimental for streaming** workloads.
+#10 scenario) and remains **experimental for streaming** workloads.
 
 ## 6. References
 
-- Issue: <https://github.com/youyuanwu/tonic-h3/issues/43>
+- Issue: <https://github.com/youyuanwu/quiche-h3/issues/10>
 - Fix commit: `4620d11` (`fix(driver): coalesce FIN onto final data write …`).
 - Repro: `quiche-h3/tests/concurrency.rs`.
 - Bridge send model: [`quiche-h3-bridge.md`](./quiche-h3-bridge.md) §5.3a
