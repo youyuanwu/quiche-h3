@@ -20,10 +20,10 @@
 //! and the whole run times out at [`DEADLINE`]; if the bridge drains the tail
 //! correctly, every request completes well under the deadline.
 //!
-//! `#[ignore]`d because it binds UDP and runs a real handshake. Run with:
+//! Run with:
 //!
 //! ```text
-//! cargo test -p quiche-h3 --test concurrency -- --ignored --nocapture
+//! cargo test -p quiche-h3 --test concurrency -- --nocapture
 //! ```
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -110,7 +110,6 @@ fn client_config() -> H3QuicheClientConfig {
 /// `CONCURRENCY - 1` requests must be driven to completion after the issuing
 /// loop stops (the issue #10 tail-drain stall).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "binds UDP + runs a real handshake"]
 async fn concurrent_requests_all_complete_no_tail_stall() {
     let certs = TestCerts::generate();
 

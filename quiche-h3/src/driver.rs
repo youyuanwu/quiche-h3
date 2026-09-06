@@ -5260,8 +5260,7 @@ mod tests {
 }
 
 /// Phase 2 loopback: a real handshake reaches `on_conn_established` on both
-/// sides, driving the `established` oneshot to `Ok`. `#[ignore]`d (binds UDP +
-/// runs a handshake); run with `--ignored`.
+/// sides, driving the `established` oneshot to `Ok`.
 #[cfg(test)]
 mod loopback_tests {
     use super::*;
@@ -5333,7 +5332,6 @@ mod loopback_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "loopback: binds UDP + runs a real handshake"]
     async fn handshake_reaches_on_conn_established() {
         let certs = TestCerts::generate();
 

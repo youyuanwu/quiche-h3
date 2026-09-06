@@ -134,12 +134,12 @@ drop-in adapter contract, pending an upstream stream-enumeration API.
 ## Testing
 
 ```sh
-cargo test -p quiche-h3                       # unit + CI compatibility tests
-cargo test -p quiche-h3 -- --include-ignored  # + loopback/e2e integration tests
+cargo test -p quiche-h3  # unit, compatibility, and UDP loopback/e2e tests
 ```
 
-The ignored suite includes a real end-to-end HTTP/3 GET round-trip
-(`tests/h3_e2e.rs`) through `h3::client` ↔ `h3::server` over the bridge.
+The default suite includes real end-to-end HTTP/3 unary and bidirectional
+streaming round-trips (`tests/h3_e2e.rs`) through `h3::client` ↔ `h3::server`
+over the bridge.
 
 ## License
 

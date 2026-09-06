@@ -36,10 +36,10 @@
 //! server-initiated stream reset must surface on the *client* as
 //! `h3::error::StreamError::RemoteTerminate { code }` (the bridge maps
 //! `RecvEnd::Reset { error_code }` → `StreamErrorIncoming::StreamTerminated`,
-//! §8.4). `#[ignore]`d (binds UDP + handshake). Run with:
+//! §8.4). Run with:
 //!
 //! ```text
-//! cargo test -p quiche-h3 --test regression_index -- --ignored --nocapture
+//! cargo test -p quiche-h3 --test regression_index -- --nocapture
 //! ```
 
 use std::time::Duration;
@@ -122,7 +122,6 @@ fn assert_remote_terminate(e: h3::error::StreamError) {
 /// A server-initiated `stop_stream` reset surfaces on the client as
 /// `RemoteTerminate` with the same code (end-to-end Q3 / §8.4 guard).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "binds UDP + runs a real handshake"]
 async fn reset_stream_surfaces_as_remote_terminate() {
     let certs = TestCerts::generate();
 

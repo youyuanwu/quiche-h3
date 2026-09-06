@@ -297,9 +297,9 @@ impl H3QuicheEndpoint {
 
     /// Test-only snapshot of `(next_id, live)` for the S2/S3 admission-fence
     /// spikes. Exposed as `#[doc(hidden)] pub` (not `pub(crate)`) so the
-    /// `#[ignore]`d loopback spikes in `quiche-h3/tests/` — compiled as a
-    /// separate crate that only sees the public surface — can assert that
-    /// `next_id` does not advance after `close()`. NOT part of the stable API.
+    /// loopback spikes in `quiche-h3/tests/` — compiled as a separate crate that
+    /// only sees the public surface — can assert that `next_id` does not advance
+    /// after `close()`. NOT part of the stable API.
     #[doc(hidden)]
     pub fn __test_registry_snapshot(&self) -> (u64, usize) {
         let state = self.0.state.lock().unwrap();

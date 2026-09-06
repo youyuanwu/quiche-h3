@@ -4,10 +4,10 @@
 //! hyperium `h3`, and exercises the [`H3QuicheEndpoint`] control surface
 //! (`close` + `wait_idle`) end to end.
 //!
-//! `#[ignore]`d because they bind UDP and run real handshakes. Run with:
+//! Run with:
 //!
 //! ```text
-//! cargo test -p quiche-h3 --test endpoint_shutdown -- --ignored --nocapture
+//! cargo test -p quiche-h3 --test endpoint_shutdown -- --nocapture
 //! ```
 //!
 //! The empirical shutdown spike tests (S1 rebind, S2 admission fence, S3
@@ -135,7 +135,6 @@ async fn wait_for_live(endpoint: &quiche_h3::H3QuicheEndpoint, target: usize, de
 /// Sanity (§5.5): with a live connection, `close()` broadcasts to the worker and
 /// `wait_idle()` resolves once it drains; the peer observes the connection close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "binds UDP + runs a real handshake"]
 async fn close_then_wait_idle_drains_the_connection() {
     let certs = TestCerts::generate();
     let server_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -187,7 +186,6 @@ async fn close_then_wait_idle_drains_the_connection() {
 /// P2 acceptor-independent lifetime (§5.2): a cloned endpoint handle still
 /// reaches the live worker and drains it after the acceptor has been dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "binds UDP + runs a real handshake"]
 async fn endpoint_handle_outlives_the_acceptor() {
     let certs = TestCerts::generate();
     let server_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -237,7 +235,6 @@ async fn endpoint_handle_outlives_the_acceptor() {
 /// visible through the endpoint obtained from the first, and one `close()`
 /// drains it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "binds UDP + runs a real handshake"]
 async fn endpoint_registry_is_shared_across_sockets() {
     let certs = TestCerts::generate();
     let udp0 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -324,7 +321,6 @@ async fn rebind_same_port(
 /// frequency and worst-case attempts/latency, then proves the rebound port is
 /// usable by completing a fresh handshake on it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "S1 spike: binds UDP repeatedly + runs real handshakes"]
 async fn s1_same_port_rebind_after_wait_idle() {
     const ITERS: usize = 50;
     // Generous SAFETY budget (distinct from the measured-typical verdict): the
@@ -474,8 +470,11 @@ async fn wait_for_live_at_least(
 /// "No worker started after close" is not observable through the public API, so
 /// it is asserted via the `#[doc(hidden)]` test-only registry snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "S2 spike: binds UDP + runs concurrent handshakes"]
 async fn s2_admission_fence_under_concurrent_close() {
+    // Allow worker shutdown to pass the configured 10-second QUIC idle timeout
+    // on slower platforms without weakening the admission-fence assertions.
+    const DRAIN_DEADLINE: Duration = Duration::from_secs(20);
+
     let certs = TestCerts::generate();
     let config = server_config(&certs);
 
@@ -546,7 +545,7 @@ async fn s2_admission_fence_under_concurrent_close() {
          (yielded={yielded}, registered_at_close={next_id_at_close})"
     );
 
-    tokio::time::timeout(DEADLINE, endpoint.wait_idle())
+    tokio::time::timeout(DRAIN_DEADLINE, endpoint.wait_idle())
         .await
         .expect("wait_idle drained after fenced close");
 
@@ -617,7 +616,6 @@ fn send_initial_and_stall(server_addr: SocketAddr) -> std::net::UdpSocket {
 /// timeout (the worker self-terminates when the timeout expires — a
 /// mid-handshake worker does not process the broadcast Close command).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "S3 spike: binds UDP + stalls a raw handshake"]
 async fn s3_mid_handshake_bounded_by_timeout() {
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(800);
 

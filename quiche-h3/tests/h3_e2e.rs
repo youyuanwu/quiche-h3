@@ -4,10 +4,10 @@
 //! bridge* and asserts the status, headers, and body round-trip exactly. This
 //! is the crown-jewel validation that the whole stack works with real `h3`.
 //!
-//! `#[ignore]`d because it binds UDP and runs a real handshake. Run with:
+//! Run with:
 //!
 //! ```text
-//! cargo test -p quiche-h3 --test h3_e2e -- --ignored --nocapture
+//! cargo test -p quiche-h3 --test h3_e2e -- --nocapture
 //! ```
 
 use std::time::Duration;
@@ -86,7 +86,6 @@ fn client_config() -> H3QuicheClientConfig {
 /// Drive one GET request/response through real hyperium `h3` over the bridge,
 /// asserting the status, a custom header, and the full body round-trip exactly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "binds UDP + runs a real handshake"]
 async fn end_to_end_get_round_trips_status_headers_and_body() {
     let certs = TestCerts::generate();
 
@@ -194,6 +193,155 @@ async fn end_to_end_get_round_trips_status_headers_and_body() {
         .await
         .expect("client work completed before deadline");
 
+    tokio::time::timeout(DEADLINE, server_task)
+        .await
+        .expect("server task joined before deadline")
+        .expect("server task ok");
+
+    drive.abort();
+}
+
+/// Issue #12: each side sends one DATA frame and then waits for its peer before
+/// producing the next. A quiescent held write used to make this strict
+/// bidirectional ping-pong deadlock on the first round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bidirectional_ping_pong_streaming_never_deadlocks() {
+    const ROUNDS: usize = 8;
+
+    let certs = TestCerts::generate();
+
+    // --- server ---
+    let server_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_udp.local_addr().unwrap();
+    let mut acceptors =
+        H3QuicheAcceptor::bind([server_udp], &server_config(&certs)).expect("bind acceptor");
+    let mut acceptor = acceptors.pop().unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let conn: quiche_h3::Connection<Bytes> = acceptor
+            .accept()
+            .await
+            .expect("accept ok")
+            .expect("accepted a connection");
+        let mut h3_conn = h3::server::Connection::new(conn)
+            .await
+            .expect("h3 server handshake");
+        let resolver = h3_conn
+            .accept()
+            .await
+            .expect("accept request")
+            .expect("one request stream");
+        let (req, mut stream) = resolver.resolve_request().await.expect("resolve request");
+        assert_eq!(req.method(), http::Method::POST);
+
+        for round in 0..ROUNDS {
+            let expected = format!("ping-{round}");
+            let mut received = Vec::with_capacity(expected.len());
+            while received.len() < expected.len() {
+                let mut chunk = stream
+                    .recv_data()
+                    .await
+                    .expect("recv ping")
+                    .expect("request stream remains open");
+                while chunk.has_remaining() {
+                    let bytes = chunk.chunk();
+                    received.extend_from_slice(bytes);
+                    chunk.advance(bytes.len());
+                }
+            }
+            assert_eq!(
+                received,
+                expected.as_bytes(),
+                "server received round {round}"
+            );
+
+            if round == 0 {
+                let response = http::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .body(())
+                    .unwrap();
+                stream.send_response(response).await.expect("send response");
+            }
+            stream
+                .send_data(Bytes::from(format!("pong-{round}")))
+                .await
+                .expect("send pong");
+        }
+
+        assert!(
+            stream
+                .recv_data()
+                .await
+                .expect("recv request finish")
+                .is_none(),
+            "request stream finishes after the final ping"
+        );
+        stream.finish().await.expect("finish response stream");
+    });
+
+    // --- client ---
+    let connector = H3QuicheConnector::new(server_addr, "localhost".to_string(), client_config())
+        .expect("build connector");
+    let conn = connector.connect().await.expect("client connect ok");
+    let (mut driver, mut send_request) = h3::client::new(conn).await.expect("h3 client handshake");
+    let drive = tokio::spawn(async move {
+        let _ = futures::future::poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+
+    let client_work = async {
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://localhost/stream")
+            .body(())
+            .unwrap();
+        let mut stream = send_request.send_request(req).await.expect("send_request");
+
+        for round in 0..ROUNDS {
+            stream
+                .send_data(Bytes::from(format!("ping-{round}")))
+                .await
+                .expect("send ping");
+
+            if round == 0 {
+                let response = stream.recv_response().await.expect("recv response");
+                assert_eq!(response.status(), http::StatusCode::OK);
+            }
+
+            let expected = format!("pong-{round}");
+            let mut received = Vec::with_capacity(expected.len());
+            while received.len() < expected.len() {
+                let mut chunk = stream
+                    .recv_data()
+                    .await
+                    .expect("recv pong")
+                    .expect("response stream remains open");
+                while chunk.has_remaining() {
+                    let bytes = chunk.chunk();
+                    received.extend_from_slice(bytes);
+                    chunk.advance(bytes.len());
+                }
+            }
+            assert_eq!(
+                received,
+                expected.as_bytes(),
+                "client received round {round}"
+            );
+        }
+
+        stream.finish().await.expect("finish request stream");
+        assert!(
+            stream
+                .recv_data()
+                .await
+                .expect("recv response finish")
+                .is_none(),
+            "response stream finishes after the final pong"
+        );
+    };
+
+    tokio::time::timeout(DEADLINE, client_work)
+        .await
+        .expect("strict ping-pong completed before deadline");
     tokio::time::timeout(DEADLINE, server_task)
         .await
         .expect("server task joined before deadline")
