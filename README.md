@@ -19,6 +19,9 @@ It exposes a standalone acceptor/connector whose `accept()` / `connect()` yield 
 into `h3::client` / `h3::server`. It is usable as the `quiche` backend for
 [`tonic-h3`](https://github.com/youyuanwu/tonic-h3) (gRPC over HTTP/3).
 
+Release history is recorded in the
+[`CHANGELOG.md`](https://github.com/youyuanwu/quiche-h3/blob/main/CHANGELOG.md).
+
 ## Design
 
 The full design lives in

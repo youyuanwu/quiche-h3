@@ -1,12 +1,15 @@
 # Design: issue #10 — concurrency tail-drain stall & FIN coalescing
 
-> **Status: Fixed for unary request/response; streaming caveat outstanding.**
+> **Status: Fixed for unary request/response and streaming liveness.**
 > The tail-drain stall is resolved in `quiche-h3/src/driver.rs` (held-write FIN
-> coalescing) and covered by a real-I/O loopback repro
+> coalescing) and covered by the real-I/O loopback repro
 > (`quiche-h3/tests/concurrency.rs::concurrent_requests_all_complete_no_tail_stall`)
-> plus a deterministic `MockConn` unit test
-> (`coalesced_write_then_finish_emits_single_fin_frame`). The fix's remaining
-> streaming limitation (§5) is **not yet addressed** and is tracked as follow-up.
+> plus the deterministic `MockConn` test
+> (`coalesced_write_then_finish_emits_single_fin_frame`). PR
+> [#19](https://github.com/youyuanwu/quiche-h3/pull/19) closes issue
+> [#12](https://github.com/youyuanwu/quiche-h3/issues/12) by flushing a held-only
+> write without FIN when the command stream goes quiescent; §5 records that
+> follow-up and the narrower late-`Finish` caveat that remains.
 >
 > Section numbers below are local to this document; references of the form
 > "bridge §N" point at [`quiche-h3-bridge.md`](./quiche-h3-bridge.md). Inline
@@ -28,9 +31,10 @@ The root cause is a transport-level interaction with the pinned **quiche
 **coalesces the FIN onto the final data frame** so quiche never produces a
 discardable standalone empty-FIN.
 
-The fix fully resolves the reported (unary request/response) stall. It carries a
-**streaming tradeoff** — deferring the last written message until the next
-write/finish — documented in §5.
+The FIN-coalescing fix fully resolves the reported unary request/response stall.
+PR #19 additionally resolves the paused-producer delay and strict bidirectional
+ping-pong deadlock introduced by an indefinitely held streaming write. The
+combined behavior and its narrower late-`Finish` caveat are documented in §5.
 
 ## 2. The bug
 
@@ -60,10 +64,10 @@ deadline.
   deterministic scaling: C=1 → 0 stranded; C=2 → 1; C=4 → 3; C=8 → 7.
 - **After the fix:** 200/200 in ~0.09 s.
 
-The test is `#[ignore]`d (binds UDP + runs a real handshake). Run with:
+The test runs in the default suite. Run it directly with:
 
 ```text
-cargo test -p quiche-h3 --test concurrency -- --ignored --nocapture
+cargo test -p quiche-h3 --test concurrency -- --nocapture
 ```
 
 ## 3. Root cause
@@ -163,6 +167,11 @@ Implemented in `quiche-h3/src/driver.rs` (driver-confined):
   pre-#10 completion timing), and pop the op. Capacity-limited or 0-byte writes
   keep the unchanged partial-send + low-water re-arm backpressure path
   (bridge §5.1).
+- **Command-stream quiescence (PR #19)**: give a following `Write` or `Finish`
+  one scheduler opportunity to consume the hold. If no command arrives, return
+  the held-only stream to the fair send queue and flush it with `fin=false`,
+  using the existing partial-write capacity/re-arm path. Streaming progress
+  therefore never depends on a later application command.
 - **`flush_held_once`** (`driver.rs:2332`) + **`service_finish_turn`**: flush the
   held bytes carrying the FIN as a single `stream_send(id, last_chunk, true)` —
   **coalesced**. A lone `Finish` / empty-body response still emits
@@ -186,59 +195,60 @@ race of §3.2 cannot discard the FIN.
   and that a lone `Finish` still records `(id, [], true)`. A `MockConn` test
   cannot reproduce the *live* stall (it does not model quiche's packetization),
   but it does lock in the coalescing invariant in normal CI.
+- **`quiescent_held_write_flushes_without_waiting_for_a_following_op`**
+  (`MockConn`): asserts a held-only write becomes runnable at command-stream
+  quiescence, flushes without FIN, and permits a later `Finish`.
+- **`bidirectional_ping_pong_streaming_never_deadlocks`** (loopback): runs eight
+  strict request/response streaming rounds in which each side waits for its peer
+  before producing the next message, locking in the issue #12 liveness fix.
 
 ### 4.2 Validation
 
-Green on both CI toolchains (Rust 1.90.0 and 1.97.0): `fmt --check`, `clippy
---all-targets -D warnings`, the unit suite (164 tests), and all `#[ignore]`d
-loopback tests including the repro.
+CI exercises Rust 1.90.0 (MSRV) and the pinned Rust 1.98.0 toolchain: `check`,
+`fmt --check`, `clippy --all-targets -D warnings`, `build`, and
+`test --all-targets -- --test-threads=1`. The loopback concurrency and streaming
+regressions run in the default suite.
 
-## 5. Remaining problem — the streaming tradeoff (NOT yet addressed)
+## 5. Streaming liveness follow-up (fixed by PR #19)
 
 FIN coalescing fundamentally requires **holding the last written message until
 the FIN is known**. For unary request/response this hold is transient (the
-`finish` follows the final `send_data` within one front↔back round-trip). But the
-hold is problematic for streaming:
+`finish` follows the final `send_data` within one front↔back round-trip). The
+initial fix left a held write waiting indefinitely when a streaming producer
+paused or awaited peer input, delaying server-streaming delivery and deadlocking
+strict ping-pong bidirectional streaming.
 
-- **Server-streaming across producer pauses:** a message written and then *not*
-  immediately followed by another write or a `finish` sits in `held` and is not
-  put on the wire until the next write/finish. This **delays** delivery of the
-  last message before any producer pause.
-- **Strict ping-pong bidi streaming (deadlock):** if the server writes a message
-  and then *awaits a client response before producing the next one*, the held
-  message is never flushed (the worker parks on `cmd_rx` with data still held),
-  the client never receives it, so it never responds — a **deadlock**. This
-  pattern is common in gRPC bidi streaming.
+PR #19 adds a command-stream-quiescence trigger without a timer:
 
-This tension is inherent to *any* FIN-coalescing scheme: the final data must be
-held speculatively until the FIN is known, which conflicts with sending data
-eagerly for streaming liveness. It cannot be cheaply removed without either
-reverting to immediate sends (which re-opens #10) or adding a flush trigger.
+1. A fully sendable write is held for one scheduler opportunity, preserving the
+  unary fast path when a following `Finish` arrives promptly.
+2. If the command queue remains quiescent, the held-only stream is returned to
+  the fair send queue.
+3. Its bytes are flushed with `fin=false` through the normal bounded
+  partial-write and capacity-rearm machinery. The stream remains open and the
+  peer can make progress without another local application command.
 
-### 5.1 Candidate remedies (for a follow-up)
+This resolves issue #12's producer-pause delay and ping-pong deadlock while
+retaining issue #10 FIN coalescing whenever `Finish` arrives in the opportunity
+window.
 
-1. **Bounded flush-on-park timer.** Hold the fully-sendable write, but arm a
-   short timer; if a `Finish` arrives first, coalesce (the unary fast path — the
-   `finish` is a channel round-trip, not a network RTT, so the window can be
-   very small); otherwise flush the held bytes without the FIN when the timer
-   fires or the worker would park with data held. This bounds streaming latency
-   to the timer and removes the deadlock. **Caveat:** it does *not* fully protect
-   a streaming response whose *final* message + `finish` still race the §3.2 reap
-   after a flush-without-FIN; that residual case would still rely on the
-   connection staying driven (as today for streaming) or on an upstream fix.
-2. **Gate/scope streaming use** and document the limitation until (1) lands.
-3. **Upstream fix in quiche** so a queued standalone empty-FIN is not reaped
-   before it is emitted (e.g. keep the stream flushable until the FIN bit is
-   actually transmitted, not merely until all bytes are ACKed). This is the most
-   correct long-term fix but is outside the `quiche-h3` bridge.
+### 5.1 Residual late-`Finish` caveat
 
-Until a remedy lands, `quiche-h3` is safe for **unary** request/response (the
-#10 scenario) and remains **experimental for streaming** workloads.
+If quiescence flushes the held bytes first, a later `Finish` uses the ordinary
+standalone empty-FIN path. PR #19 guarantees that this later `Finish` remains a
+valid operation, but it does not change quiche's underlying collection behavior
+described in §3.2. If the body is already ACKed and the stream reaches quiche's
+collection condition before that FIN is packetized, the same upstream
+standalone-FIN exposure remains possible. Eliminating that transport-level edge
+requires quiche to retain a stream until its FIN bit is actually emitted.
 
 ## 6. References
 
 - Issue: <https://github.com/youyuanwu/quiche-h3/issues/10>
 - Fix commit: `4620d11` (`fix(driver): coalesce FIN onto final data write …`).
+- Streaming follow-up: issue
+  [#12](https://github.com/youyuanwu/quiche-h3/issues/12), PR
+  [#19](https://github.com/youyuanwu/quiche-h3/pull/19), merged as `aa5b246`.
 - Repro: `quiche-h3/tests/concurrency.rs`.
 - Bridge send model: [`quiche-h3-bridge.md`](./quiche-h3-bridge.md) §5.3a
   (per-stream send ordering & completion), §5.1 (backpressure), §12 (follow-ups).
