@@ -70,10 +70,3 @@ jobs:
 
     - name: Run cargo test
       run: cargo +${{ matrix.rust }} test --all-targets
-
-    # The loopback / end-to-end tests bind UDP sockets and run real QUIC
-    # handshakes; they are #[ignore]d by default. Exercise them on Linux where
-    # loopback networking in CI is reliable.
-    - name: Run ignored loopback/e2e tests (linux)
-      if: runner.os == 'Linux'
-      run: cargo +${{ matrix.rust }} test --all-targets -- --ignored

@@ -2,11 +2,10 @@
 //!
 //! These tests stand up a real loopback QUIC client+server against the pinned
 //! `tokio-quiche` 0.19.1 / `quiche` 0.29 build and observe load-bearing behavior
-//! that the design depends on. They are `#[ignore]`d by default (they bind UDP
-//! sockets and run handshakes); run with:
+//! that the design depends on. Run with:
 //!
 //! ```text
-//! cargo test -p quiche-h3 --test spike_harness -- --ignored --nocapture
+//! cargo test -p quiche-h3 --test spike_harness -- --nocapture
 //! ```
 //!
 //! This file starts with the harness foundation (a minimal `ApplicationOverQuic`
@@ -155,7 +154,6 @@ fn server_params(certs: &TestCerts) -> ConnectionParams<'_> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "spike: binds UDP + runs a real handshake"]
 async fn spike_foundation_handshake_completes() {
     let certs = TestCerts::generate();
 
@@ -475,7 +473,6 @@ async fn probe_loopback(
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "spike: binds UDP + runs a real handshake"]
 async fn spike_t2a_client_rejecting_cert_resolves_err() {
     let certs = TestCerts::generate();
 
@@ -532,7 +529,6 @@ async fn spike_t2a_client_rejecting_cert_resolves_err() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "spike: binds UDP + runs a real handshake"]
 async fn spike_t2_handle_drop_keeps_worker_alive() {
     let certs = TestCerts::generate();
     let cparams = client_params();
@@ -582,7 +578,6 @@ async fn spike_t2_handle_drop_keeps_worker_alive() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "spike: binds UDP + runs a real handshake"]
 async fn spike_t1b_peer_observes_application_close() {
     let certs = TestCerts::generate();
     let cparams = client_params();
@@ -617,7 +612,6 @@ async fn spike_t1b_peer_observes_application_close() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "spike: binds UDP + runs a real handshake"]
 async fn spike_t4_garbage_datagram_then_real_connection() {
     let certs = TestCerts::generate();
 
@@ -714,7 +708,6 @@ async fn spike_t4_garbage_datagram_then_real_connection() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "spike: binds UDP + runs a real handshake"]
 async fn spike_q1_readable_destructive_and_priority_materialize() {
     let certs = TestCerts::generate();
     let cparams = client_params();
@@ -806,7 +799,6 @@ async fn spike_q1_readable_destructive_and_priority_materialize() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "spike: binds UDP + runs a real handshake"]
 async fn spike_q2_close_first_ok_repeat_done() {
     let certs = TestCerts::generate();
     let cparams = client_params();
@@ -835,7 +827,6 @@ async fn spike_q2_close_first_ok_repeat_done() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "spike: binds UDP + runs a real handshake"]
 async fn spike_q3_stream_shutdown_write_resets_without_capacity() {
     let certs = TestCerts::generate();
     let cparams = client_params();
@@ -893,7 +884,6 @@ async fn spike_q3_stream_shutdown_write_resets_without_capacity() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "spike: binds UDP + runs a real handshake"]
 async fn spike_q4_stop_sending_surfaces_stream_stopped() {
     let certs = TestCerts::generate();
     let cparams = client_params();
@@ -943,7 +933,6 @@ async fn spike_q4_stop_sending_surfaces_stream_stopped() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "spike: binds UDP + runs a real handshake"]
 async fn spike_q5_zero_capacity_fin_accepted_and_flushed() {
     let certs = TestCerts::generate();
     let cparams = client_params();
@@ -1010,7 +999,6 @@ async fn spike_q5_zero_capacity_fin_accepted_and_flushed() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "spike: binds UDP + runs a real handshake"]
 async fn spike_5_5_blocker_zero_txcap_hides_writable_discovery() {
     let certs = TestCerts::generate();
     let cparams = client_params();
@@ -1057,7 +1045,6 @@ async fn spike_5_5_blocker_zero_txcap_hides_writable_discovery() {
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "spike: binds UDP + runs a real handshake"]
 async fn spike_5_5_tombstone_terminal_id_never_reappears() {
     let certs = TestCerts::generate();
     let cparams = client_params();

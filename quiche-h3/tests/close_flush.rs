@@ -6,10 +6,10 @@
 //! server's `h3::server::Connection::accept()` resolves (returns `Ok(None)` or
 //! an error) within a timeout instead of hanging.
 //!
-//! `#[ignore]`d because it binds UDP and runs a real handshake. Run with:
+//! Run with:
 //!
 //! ```text
-//! cargo test -p quiche-h3 --test close_flush -- --ignored --nocapture
+//! cargo test -p quiche-h3 --test close_flush -- --nocapture
 //! ```
 
 use std::time::Duration;
@@ -81,7 +81,6 @@ fn client_config() -> H3QuicheClientConfig {
 /// After a normal GET, drop every client handle and assert the server observes
 /// the graceful connection close (T1b flush reaches the peer).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "binds UDP + runs a real handshake"]
 async fn client_last_handle_drop_closes_server_side() {
     let certs = TestCerts::generate();
 

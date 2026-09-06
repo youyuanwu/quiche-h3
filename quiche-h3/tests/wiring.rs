@@ -1,12 +1,12 @@
 //! Phase 7 loopback wiring test: stand up a real `H3QuicheAcceptor` +
 //! `H3QuicheConnector` over loopback and confirm both sides yield an
-//! established `Connection<Bytes>` (design §7.1, §7.2). `#[ignore]`d because it
-//! binds UDP and runs a real handshake (mirror of `spike_harness.rs`).
+//! established `Connection<Bytes>` (design §7.1, §7.2) using a real UDP
+//! handshake (mirror of `spike_harness.rs`).
 //!
 //! Run with:
 //!
 //! ```text
-//! cargo test -p quiche-h3 --test wiring -- --ignored --nocapture
+//! cargo test -p quiche-h3 --test wiring -- --nocapture
 //! ```
 
 use std::time::Duration;
@@ -54,7 +54,6 @@ impl Drop for TestCerts {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "binds UDP + runs a real handshake"]
 async fn acceptor_and_connector_complete_handshake() {
     let certs = TestCerts::generate();
 
