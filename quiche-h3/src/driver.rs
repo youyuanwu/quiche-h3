@@ -1043,6 +1043,38 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             || (!self.parked_uni.is_empty() && self.accept_uni_resume.load(Ordering::Relaxed))
     }
 
+    /// Whether a deferred write has no following operation with which to
+    /// coalesce. Such a write must be flushed when the command stream becomes
+    /// quiescent or a streaming producer that waits for its peer can deadlock.
+    fn has_quiescent_held_write(&self) -> bool {
+        self.send.values().any(|state| {
+            state.terminal.is_none() && state.held.is_some() && state.send_ops.is_empty()
+        })
+    }
+
+    /// Put quiescent held writes back through the ordinary fair send stage.
+    ///
+    /// The caller first gives a following `Write`/`Finish` one scheduler turn
+    /// to arrive. If no command is ready, holding can no longer improve FIN
+    /// coalescing and would violate streaming liveness, so these streams become
+    /// runnable and are flushed with `fin=false` by `service_send_turn`.
+    fn mark_quiescent_held_writes_runnable(&mut self) {
+        let ids: Vec<u64> = self
+            .send
+            .iter()
+            .filter_map(|(&id, state)| {
+                (state.terminal.is_none() && state.held.is_some() && state.send_ops.is_empty())
+                    .then_some(id)
+            })
+            .collect();
+        for id in ids {
+            self.mark_send_runnable(id);
+        }
+        if !self.runnable_send.is_empty() {
+            self.needs_iteration = true;
+        }
+    }
+
     /// Route a discovered peer id into its per-class admission queue (§5.1). The
     /// split lets `phase2_admission` skip a parked (accept-full) class without
     /// rescanning its backlog (MF-1); FIFO order is preserved within each class.
@@ -2302,12 +2334,28 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             return TurnOutcome::Drop;
         }
         // 2. Stale/terminal id: nothing to send. Evicted (already popped).
-        let has_ops = match self.send.get(&id) {
-            Some(state) => state.terminal.is_none() && !state.send_ops.is_empty(),
+        let has_ops_or_held = match self.send.get(&id) {
+            Some(state) => {
+                state.terminal.is_none() && (!state.send_ops.is_empty() || state.held.is_some())
+            }
             None => false,
         };
-        if !has_ops {
+        if !has_ops_or_held {
             return TurnOutcome::Drop;
+        }
+        // A held write with no following op reached command-stream quiescence.
+        // Flush it without FIN so streaming progress never depends on another
+        // application write. A later Finish uses the ordinary empty-FIN path.
+        let held_only = self
+            .send
+            .get(&id)
+            .is_some_and(|state| state.held.is_some() && state.send_ops.is_empty());
+        if held_only {
+            return match self.flush_held_once(qconn, id, false) {
+                HeldFlush::Complete | HeldFlush::Terminal => TurnOutcome::Drop,
+                HeldFlush::More => TurnOutcome::Requeue,
+                HeldFlush::Blocked => TurnOutcome::Park,
+            };
         }
         // 3. Service the head op with exactly one transport call.
         let is_write = matches!(
@@ -2823,6 +2871,23 @@ impl<B: Buf + Send + 'static> ApplicationOverQuic for QuicheDriver<B> {
                 WaitDecision::Yield => {
                     // Fairness; the worker's biased select keeps timer priority.
                     tokio::task::yield_now().await;
+                    Ok(())
+                }
+                WaitDecision::Recv if self.has_quiescent_held_write() => {
+                    // Preserve the unary fast path: give the front end whose
+                    // Write just completed one turn to enqueue Finish. If no
+                    // command is ready after that turn, the held bytes belong
+                    // to a paused/interactive stream and must make progress.
+                    tokio::task::yield_now().await;
+                    match self.cmd_rx.try_recv() {
+                        Ok(cmd) => self.inbox.push_back(cmd),
+                        Err(mpsc::error::TryRecvError::Empty) => {
+                            self.mark_quiescent_held_writes_runnable();
+                        }
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            self.last_handle_teardown = true;
+                        }
+                    }
                     Ok(())
                 }
                 WaitDecision::Recv => match self.cmd_rx.recv().await {
@@ -4057,6 +4122,40 @@ mod tests {
             matches!(lone.try_recv(), Ok(Ok(()))),
             "lone finish completes Ok exactly once"
         );
+    }
+
+    /// Issue #12: a held write without a following Write/Finish becomes
+    /// runnable at command-stream quiescence and leaves without FIN. A later
+    /// Finish remains valid and emits the standalone FIN.
+    #[test]
+    fn quiescent_held_write_flushes_without_waiting_for_a_following_op() {
+        let (mut d, _h) = driver();
+        let mut c = MockConn::new();
+        let body_wire = wbuf_len(b"ping");
+        let done = push_send(&mut d, 0, b"ping");
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+
+        assert!(matches!(done.state(), ProbeState::Ok));
+        assert_eq!(sent_len(&c, 0), 0, "fully-sendable write starts held");
+        assert!(d.has_quiescent_held_write());
+
+        d.mark_quiescent_held_writes_runnable();
+        while d.runnable_send_set.contains(&0) {
+            d.stage_send(&mut c);
+        }
+        assert_eq!(sent_len(&c, 0), body_wire);
+        assert!(
+            c.sent.iter().all(|(id, _, fin)| *id != 0 || !*fin),
+            "quiescence flush must not guess that the stream is finished"
+        );
+        assert!(!d.has_quiescent_held_write());
+
+        let mut finish = push_finish(&mut d, 0);
+        d.apply_inbox(&mut c);
+        d.stage_send(&mut c);
+        assert!(matches!(finish.try_recv(), Ok(Ok(()))));
+        assert!(sent_fin(&c, 0));
     }
 
     /// §11: `Reset` preempts an in-flight/queued `Write` — the queued op is
