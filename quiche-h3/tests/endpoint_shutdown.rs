@@ -471,6 +471,10 @@ async fn wait_for_live_at_least(
 /// it is asserted via the `#[doc(hidden)]` test-only registry snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s2_admission_fence_under_concurrent_close() {
+    // Allow worker shutdown to pass the configured 10-second QUIC idle timeout
+    // on slower platforms without weakening the admission-fence assertions.
+    const DRAIN_DEADLINE: Duration = Duration::from_secs(20);
+
     let certs = TestCerts::generate();
     let config = server_config(&certs);
 
@@ -541,7 +545,7 @@ async fn s2_admission_fence_under_concurrent_close() {
          (yielded={yielded}, registered_at_close={next_id_at_close})"
     );
 
-    tokio::time::timeout(DEADLINE, endpoint.wait_idle())
+    tokio::time::timeout(DRAIN_DEADLINE, endpoint.wait_idle())
         .await
         .expect("wait_idle drained after fenced close");
 

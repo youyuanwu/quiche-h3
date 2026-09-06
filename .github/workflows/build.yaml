@@ -69,4 +69,4 @@ jobs:
       run: cargo +${{ matrix.rust }} build --all-targets
 
     - name: Run cargo test
-      run: cargo +${{ matrix.rust }} test --all-targets
+      run: cargo +${{ matrix.rust }} test --all-targets -- --test-threads=1
