@@ -222,7 +222,6 @@ pub trait ApplicationOverQuic: Send + 'static {
     fn on_conn_established(&mut self, qconn: &mut QuicheConnection,
                            hs: &HandshakeInfo) -> QuicResult<()>;
     fn should_act(&self) -> bool;
-    fn buffer(&mut self) -> &mut [u8];
     fn wait_for_data(&mut self, qconn: &mut QuicheConnection)
         -> impl Future<Output = QuicResult<()>> + Send;   // MUST be cancel-safe
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()>;
@@ -237,12 +236,12 @@ call `process_writes` on every acting iteration → flush outbound packets → y
 until a packet arrives, a timer fires, or `wait_for_data` resolves.
 
 > **Pinned invocation contract (verified against the published tokio-quiche
-> 0.19.1 trait docs and source; see §14 spike T1).** The trait-level summary is
+> trait docs and source; see §14 spike T1).** The trait-level summary is
 > abbreviated; the method docs and `RunningApplication::on_read` provide the
 > operative distinction. If `should_act()` is true, `process_reads` is called
 > only when `received_packets` is true, while `process_writes` is called on every
 > acting iteration (after `process_reads` when reads ran). `should_act()` is
-> checked in each iteration (only `on_conn_established`/`buffer` bypass it).
+> checked in each iteration (only `on_conn_established` bypasses it).
 > Consequences the whole of §5 depends on:
 >
 > 1. A **packet-driven acting iteration** runs reads then writes. A **no-packet
@@ -510,16 +509,7 @@ struct QuicheDriver<B: Buf = Bytes> {
     // runs the pump. Its tail clears the flag at the common iteration boundary.
     // Thus all receive quotas, including ReadBudget, are consumable only once.
     read_budget: usize, reads_ran_this_iter: bool,
-    // TWO distinct buffers with DIFFERENT roles and sizes (finding: buffer/scratch
-    // must not be conflated):
-    //  * `pkt_buf` backs `ApplicationOverQuic::buffer()`, the worker's OUTBOUND
-    //    packet buffer (tokio-quiche docs: "a borrowed buffer for the worker to
-    //    write outbound packets into … can be used to artificially restrict the
-    //    size of outbound network packets"). It is sized for a full GSO send batch
-    //    (`PKT_BUF_LEN`, e.g. 64 KiB — at least `max_send_udp_payload_size`, larger
-    //    to amortize batched sends), NOT capped at MAX_CHUNK, so packet throughput
-    //    is not throttled to the stream chunk size.
-    //  * `recv_buf` is the `stream_recv` target. It is a lazily-allocated,
+    // `recv_buf` is the `stream_recv` target. It is a lazily-allocated,
     //    *reused* `BytesMut` arena (SF-5: nothing is allocated until the first
     //    readable byte; SF-1: reused across chunks). Each read grows a MAX_CHUNK
     //    window (§5.1) and carves the filled prefix out with `split_to(len)
@@ -527,7 +517,6 @@ struct QuicheDriver<B: Buf = Bytes> {
     //    h3 gets an owned `Bytes` with no per-chunk copy. A fresh RECV_ARENA
     //    block (a small multiple of MAX_CHUNK) is reserved only when the arena is
     //    exhausted or still shared by a live frozen chunk, amortizing allocation.
-    pkt_buf: Vec<u8>,                    // buffer(): outbound packet buffer, len PKT_BUF_LEN
     recv_buf: Option<BytesMut>,          // reused stream_recv arena, lazily allocated (SF-1/SF-5)
     // Handshake-completion signal. on_conn_close is gated by should_act(), which is
     // false before establishment, so it CANNOT classify handshake failures. On
@@ -630,12 +619,6 @@ struct PeerStream {
   per the §2.3 contract `process_writes` runs on every post-handshake iteration
   and `process_reads` runs on those iterations that received packets. It must
   remain false during handshake so tokio-quiche drives its handshake callbacks.
-- **`buffer`** — return `&mut self.pkt_buf`, the **outbound packet buffer**
-  (`PKT_BUF_LEN`, e.g. 64 KiB), **not** the `MAX_CHUNK`-capped `stream_recv`
-  scratch. `buffer()` is where tokio-quiche writes outbound packets and doubles as
-  the send-batch size bound; sizing it to a full GSO batch keeps UDP throughput
-  independent of the per-stream read chunk size (finding: buffer/scratch
-  separation).
 - **`wait_for_data`** — first takes a **pending-work fast path** (finding 2), then
   awaits the command channel:
   ```rust
@@ -2444,7 +2427,7 @@ manifest. Because these are pre-1.0 (0.x) crates a minor bump can break APIs, so
 each bump re-validates the exact stream/error surfaces this design depends on. A
 dedicated **CI compatibility test** constructs one value of every `h3` error
 variant this crate maps (§8.4, §14 H1) and calls each load-bearing `quiche`/
-`tokio-quiche` API (§14 T1–T3, Q1), while the loopback suite observes T1b's
+`tokio-quiche` API (§14 T1–T2, Q1), while the loopback suite observes T1b's
 close-flush behavior, so a reshaped upstream API or changed flush contract fails
 instead of silently mismapping.
 
@@ -2813,10 +2796,6 @@ Scenario tests that must be covered explicitly (from the design reviews):
   acceptance for other peers. Assert the listener still ends cleanly on `None`.
   Classified as a pinned-compatibility test guarding the §14 T4 item-error taxonomy
   and the continue-on-item-error server-loop policy (§7.1, §8.4).
-- **`buffer()` returns the packet buffer, not the read scratch** — `buffer()`'s
-  length is `PKT_BUF_LEN` (full send batch), independent of `MAX_CHUNK`; a large
-  `stream_recv` and a large outbound batch do not alias one buffer (finding:
-  buffer/scratch separation, §5).
 - **Full accept queue with data-bearing parked streams** — assert connection-window
   pressure from unadmitted parked streams is *bounded* by accept-queue depth and
   the peer's `initial_max_data`, and that already-admitted streams are not
@@ -2878,15 +2857,13 @@ Scenario tests that must be covered explicitly (from the design reviews):
   the buffers), the complete redesign of the send data plane.
 
   **Implemented (SF-4/SF-5/SF-6, additive, defaults preserve behavior):**
-  - **Per-connection buffer sizing is now tunable.** The receive byte-channel
-    depth (SF-4) and the outbound packet-buffer size (SF-5) are configurable via
-    `H3QuicheServerConfig`/`H3QuicheClientConfig` (`recv_channel_depth`,
-    `packet_buffer_size`) → `DriverBufferConfig`. Both default to the historical
-    constants (`BYTE_CHANNEL_DEPTH = 64`, `PKT_BUF_LEN = 64 KiB`), so out-of-the-box
-    behavior is byte-for-byte unchanged. These are **trade-offs**, not free wins:
-    shrinking the recv depth trades per-stream throughput/buffering for memory, and
-    the packet buffer must not be shrunk below a full GSO batch without a datapath
-    assessment. (The prior sentence "only the data/accept queues have tunable
+  - **Per-connection receive buffering is tunable.** The receive byte-channel
+    depth (SF-4) is configurable via `H3QuicheServerConfig`/
+    `H3QuicheClientConfig` (`recv_channel_depth`) → `DriverBufferConfig` and
+    defaults to `BYTE_CHANNEL_DEPTH = 64`. Shrinking it trades per-stream
+    throughput/buffering for memory. `tokio-quiche` 0.20 owns and optionally
+    pools its egress buffers via `QuicSettings::pool_send_buffer`. (The prior
+    sentence "only the data/accept queues have tunable
     depths" is superseded.)
   - **The `MAX_CHUNK` receive scratch is allocated lazily** (SF-5) on first
     `stream_recv`, so idle/control-only connections no longer pre-pay it.
@@ -2969,7 +2946,7 @@ recorded outcome.
 | **T1b** | normal post-`process_writes` flush transmits a last-handle `qconn.close` | **verified (docs) + spike** | The `ApplicationOverQuic` docs say the worker flushes pending outbound packets after `process_writes`; §5.2 therefore consumes channel EOF once and calls `qconn.close` inside `process_writes`, not `on_conn_close`. A staged explicit close crosses the non-write-budgeted barrier first; only an eligible teardown uses `H3_NO_ERROR`. The worker then leaves `wait_for_data` pending so packet/timer events drive closing without an EOF hot-spin. **Assumption requiring pinned-build verification:** that a successful close is serialized in the ordinary flush before worker exit. A packet-capture/loopback spike must show the peer promptly receives the selected application `CONNECTION_CLOSE`, including the saturated-write/pending-explicit-close case. |
 | **T2** | `InitialQuicConnection::start` / `connect_with_config` handshake-timing **and** connection-handle drop semantics | **verified (docs) + spike** | **Handshake timing (verified 0.19.1 docs):** the two entrypoints are asymmetric. `connect_with_config` is `async` — *"When the future resolves, the connection has completed its handshake and `app` is running in the worker task. In case the handshake failed, we close the connection automatically and the future will resolve with an error."* → client setup failures map that future's raw `Err`. `start` is synchronous and returns before handshake, so the server waits on `established()`; driver Drop supplies a typed unclassified failure if establishment never occurs. **Drop semantics (docs):** `QuicConnection` is metadata and does not represent the `quiche::Connection`. Assumption: dropping it does not tear down the worker. Confirm exact handle-drop behavior on the pinned build (§2.3, §7.1, §7.2). |
 | **T2a** | pre-handshake `on_conn_close` gating | **verified (published 0.19.1 source)** | `IoWorker<Close>::close` calls `application.on_conn_close(...)` only inside `if application.should_act()`. This design's `should_act()` is false until `on_conn_established`, so failed handshakes cannot publish a `ConnTerminal`. §5/§7/§8.4 instead map the client's raw `connect_with_config` error and resolve the server wait from `QuicheDriver::drop` as cause-unclassified `PreHandshakeWorkerExit`. A pinned compatibility test guards this invocation behavior; no contrary classification is asserted. |
-| **T3** | tokio-quiche `buffer()` role/size | **verified (docs)** | Docs: `buffer()` is *"a borrowed buffer for the worker to write outbound packets into … can be used to artificially restrict the size of outbound network packets."* Hence a dedicated `pkt_buf` (`PKT_BUF_LEN`), separate from the `MAX_CHUNK` `stream_recv` scratch (§5). |
+| **T3** | tokio-quiche egress-buffer ownership | **verified (0.20 source)** | `ApplicationOverQuic::buffer()` was removed in 0.20; the I/O worker owns and optionally pools its egress buffers. The bridge owns only its `MAX_CHUNK`-bounded receive scratch (§5). |
 | **T4** | tokio-quiche `0.19.1` `QuicConnectionStream` item-error taxonomy (per-packet/per-attempt vs listener-fatal) | **spike** | **Unverified external-crate assumption.** Published docs show `listen` yields one `io::Result<InitialQuicConnection<...>>` per item and that an error processing an *individual* initial packet is a stream item, not listener termination (`CodeResearch.md:474-480`); the exact set of item-`Err` variants, and whether any denotes a listener/socket-fatal condition distinct from a per-packet error, is **not** documented. Spike the pinned build: enumerate item-error variants, whether `next()` after a `Some(Err)` keeps yielding connections, and whether a genuinely fatal socket condition surfaces as a distinct signal or simply as `None`. §7.1 **continues** on item errors (log/metric) and reserves `accept()` `Err` for a listener/socket-fatal condition; if no distinct fatal signal exists, the recorded server-loop policy is continue-on-item-error and its availability limitation is documented (§7.1, §8.4). |
 | **Q1** | quiche `0.29` `stream_readable_next` / `stream_writable_next` / `stream_priority` | **verified (docs) + spike** | All three exist and are public in `0.29`; both `*_next` are documented destructive (dearm until re-armed); `stream_priority(id, urgency, incremental) -> Result<()>` documents *"the target stream is created if it did not exist."* **Spike** the undocumented behavior: exactly-one-credit consumption by `stream_priority` (§6.1), and the zero-send-capacity writable-discovery BLOCKER (§5.5). |
 | **Q2** | quiche `0.29` `Connection::close` result semantics | **spike** | **Unverified external-crate assumption:** `Ok(())` means this call accepted the supplied close code/reason, while `Error::Done` means a close was already in progress and this call did not accept a new cause. Before implementation, exercise first close, repeated close, peer-close race, and invalid-state/error paths on the pinned build. §5/§8.3 record a cause only on `Ok`, suppress synthetic teardown after an explicit `Done`, defer classification to existing `peer_error()`/`local_error()`, and map every other error to `Internal`; revise those rules if the spike differs. |

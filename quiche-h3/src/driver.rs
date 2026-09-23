@@ -783,8 +783,9 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
     /// Create a driver and its front-end handles. `is_server` selects the QUIC
     /// stream-id parity for locally-opened streams (§6.1); `accept_bidi_cap` /
     /// `accept_uni_cap` bound the respective accept queues (§5.2, provisional
-    /// §12 S3). Buffer sizes take the historical defaults ([`DriverBufferConfig`]);
-    /// use [`with_buffers`](Self::with_buffers) to override them (SF-4/SF-5).
+    /// §12 S3). Buffering takes the historical defaults
+    /// ([`DriverBufferConfig`]); use [`with_buffers`](Self::with_buffers) to
+    /// override it.
     pub(crate) fn new(
         is_server: bool,
         accept_bidi_cap: usize,
@@ -798,8 +799,8 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
         )
     }
 
-    /// Like [`new`](Self::new) but with explicit per-connection buffer sizing
-    /// (SF-4 recv channel depth, SF-5 packet buffer size). Passing
+    /// Like [`new`](Self::new) but with explicit per-connection buffering.
+    /// Passing
     /// `DriverBufferConfig::default()` is identical to [`new`](Self::new).
     pub(crate) fn with_buffers(
         is_server: bool,

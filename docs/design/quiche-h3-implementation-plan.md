@@ -95,11 +95,10 @@ spike has a recorded outcome in the design doc; `cargo build` and
 
 ## Phase 1 — Primitives: buffers, reason types, error mapping  *(no external gate)*
 
-Design: §8 (all), §5 `TerminalCell`, §10 buffer sizing (`PKT_BUF_LEN`, `MAX_CHUNK`).
+Design: §8 (all), §5 `TerminalCell`, §10 receive-buffer sizing (`MAX_CHUNK`).
 
 Deliverables (`buffer.rs`, plus a small internal `error`/`reason` module):
-- `WriteBuf<Bytes>` cursor + the outbound `pkt_buf` / recv `stream_recv` scratch
-  split (§5, T3).
+- `WriteBuf<Bytes>` cursor and the `stream_recv` scratch buffer (§5).
 - `TerminalCell` (Mutex + `futures::task::AtomicWaker`) with the race-free
   check/register/recheck ordering (§5, §5.4 invariant 2).
 - Crate-private internal reason types (§8.2) and the two mapping functions:
@@ -115,13 +114,13 @@ variant), `WriteBuf` partial-consume, and `TerminalCell` set-vs-register race
 
 Design: §5 intro, §2.3, §5.4 (esp. **invariant 4** — the worker never `await`s
 inside `process_reads`/`process_writes`; synchronous `try_send`/`try_reserve`,
-which is the load-bearing rationale for "No `tokio-util`"). Design refs T1/T3
+which is the load-bearing rationale for "No `tokio-util`"). Design ref T1
 (verified); **gating spike T1b** must be recorded before this phase is trusted.
 
 Deliverables (`driver.rs`): `impl ApplicationOverQuic for QuicheDriver` with the
 structural callbacks wired but stages stubbed:
-- `on_conn_established`, `should_act` (true once established), `buffer` (returns
-  `pkt_buf`), `wait_for_data` pending-work fast path (finding 2),
+- `on_conn_established`, `should_act` (true once established),
+  `wait_for_data` pending-work fast path (finding 2),
   `process_reads`/`process_writes` skeletons honoring the §2.3 invocation contract
   (per-iteration receive quotas; writes every acting iteration).
 - Command channel plumbing: unbounded control `mpsc` + weak worker sender; bounded
@@ -238,7 +237,7 @@ Design: §11 (full), §10 CI compatibility test, §14 H1.
 
 Deliverables: complete the §11 unit + loopback integration matrix; the CI
 compatibility test that constructs one value of every mapped `h3` error variant
-and calls each load-bearing `quiche`/`tokio-quiche` API (T1–T3, Q1, H1); the T1b
+and calls each load-bearing `quiche`/`tokio-quiche` API (T1–T2, Q1, H1); the T1b
 close-flush loopback observation; regression tests guarding each recorded spike
 outcome (Q3, Q4, Q5, tombstone).
 
