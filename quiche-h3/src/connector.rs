@@ -22,7 +22,6 @@ use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificat
 use tokio_quiche::socket::Socket;
 use tokio_quiche::ConnectionParams;
 
-use crate::buffer::PKT_BUF_LEN;
 use crate::driver::{DriverBufferConfig, QuicheDriver, BYTE_CHANNEL_DEPTH};
 use crate::stream::Connection;
 use crate::Error;
@@ -38,11 +37,11 @@ const DEFAULT_ACCEPT_UNI_CAP: usize = 128;
 /// `connect` (§7.2).
 ///
 /// **Construction (CO-C):** construct via [`Default`] + functional-update syntax.
-/// New fields (like the SF-4/SF-5 buffer knobs below) are added additively with
-/// defaults, so `..Default::default()` / `Default::default()` construction keeps
-/// compiling (a caller using an *exhaustive* field literal must name any new
-/// field). We deliberately do **not** mark this `#[non_exhaustive]`: that would
-/// forbid struct-literal/FRU construction downstream entirely — see Docs.md/§12.
+/// New fields are added with defaults, so `..Default::default()` /
+/// `Default::default()` construction keeps compiling (a caller using an
+/// *exhaustive* field literal must name any new field). We deliberately do
+/// **not** mark this `#[non_exhaustive]`: that would forbid struct-literal/FRU
+/// construction downstream entirely — see Docs.md/§12.
 #[derive(Clone)]
 pub struct H3QuicheClientConfig {
     /// QUIC transport settings (ALPN defaults to `[b"h3"]`).
@@ -64,10 +63,6 @@ pub struct H3QuicheClientConfig {
     /// `recv_channel_depth × MAX_CHUNK`. **Trade-off**: lowering it saves memory
     /// at the cost of per-stream throughput/buffering.
     pub recv_channel_depth: usize,
-    /// Outbound packet-buffer size in bytes for the connection (SF-5). Defaults
-    /// to `PKT_BUF_LEN` (64 KiB). **Do NOT shrink below a full GSO batch
-    /// without a datapath assessment** (§5, §12).
-    pub packet_buffer_size: usize,
     /// Optional aggregate cap (bytes) on buffered outbound send data admitted to
     /// the connection's worker (SF-6). `None` (default) leaves the send path
     /// unbounded, preserving historical behavior. A finite cap bounds resident
@@ -87,7 +82,6 @@ impl Default for H3QuicheClientConfig {
             verify_peer: true,
             server_name: None,
             recv_channel_depth: BYTE_CHANNEL_DEPTH,
-            packet_buffer_size: PKT_BUF_LEN,
             max_buffered_send_bytes: None,
         }
     }
@@ -189,7 +183,6 @@ impl H3QuicheConnector {
             DEFAULT_ACCEPT_UNI_CAP,
             DriverBufferConfig {
                 recv_channel_depth: inner.config.recv_channel_depth,
-                packet_buffer_size: inner.config.packet_buffer_size,
                 max_buffered_send_bytes: inner.config.max_buffered_send_bytes,
             },
         );
@@ -246,21 +239,17 @@ mod tests {
         let _cloned = connector.clone();
     }
 
-    /// SF-4/SF-5 (SC-006): the client config defaults to the historical buffer
-    /// sizes so out-of-the-box behavior is unchanged; overrides are honored.
+    /// The receive depth preserves its historical default and configured value.
     #[test]
-    fn client_config_buffer_defaults_and_overrides() {
+    fn client_config_recv_depth_defaults_and_overrides() {
         let def = H3QuicheClientConfig::default();
         assert_eq!(def.recv_channel_depth, BYTE_CHANNEL_DEPTH);
-        assert_eq!(def.packet_buffer_size, PKT_BUF_LEN);
 
         let custom = H3QuicheClientConfig {
             recv_channel_depth: 32,
-            packet_buffer_size: 16384,
             ..H3QuicheClientConfig::default()
         };
         assert_eq!(custom.recv_channel_depth, 32);
-        assert_eq!(custom.packet_buffer_size, 16384);
     }
 
     /// SF-6 (SC-007): the aggregate send-byte cap defaults to `None` (unbounded,

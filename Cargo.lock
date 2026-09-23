@@ -641,7 +641,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1301,21 +1301,15 @@ dependencies = [
 
 [[package]]
 name = "intrusive-collections"
-version = "0.9.7"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "189d0897e4cbe8c75efedf3502c18c887b05046e59d28404d4d8e46cbc4d1e86"
-dependencies = [
- "memoffset",
-]
+checksum = "4275b20e6057cd7733fd8df8a5a31701e4fe44497dad0f3fa0e1c4fb971506be"
 
 [[package]]
 name = "ipnetwork"
-version = "0.20.0"
+version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf466541e9d546596ee94f9f69590f89473455f88372423e0008fc1a7daf100e"
-dependencies = [
- "serde",
-]
+checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
 
 [[package]]
 name = "is-terminal"
@@ -1325,7 +1319,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1518,9 +1512,9 @@ dependencies = [
 
 [[package]]
 name = "nix"
-version = "0.30.1"
+version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
 dependencies = [
  "bitflags",
  "cfg-if",
@@ -1590,9 +1584,9 @@ dependencies = [
 
 [[package]]
 name = "octets"
-version = "0.3.6"
+version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "866cb5af6f3aa3c1b44c3c2d79d22165fbb1b102e1b3fb499864bfe34736ec4b"
+checksum = "4d59d30d3ad7f7e1c9a66e51c9cb71ae1c794b28ffe7053fd785defb0d180069"
 
 [[package]]
 name = "oid-registry"
@@ -1920,11 +1914,12 @@ dependencies = [
 
 [[package]]
 name = "quiche"
-version = "0.29.3"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61166d27591eb7cb1310eec2b8fc6ae0e0686e9e4ed742a3ffc6317171175e7d"
+checksum = "52b35a721a2a56797347929745fa783fc99e680d9484b80324ce40106b75493a"
 dependencies = [
  "boring",
+ "boring-sys",
  "bytes",
  "debug_panic",
  "either",
@@ -2529,7 +2524,7 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8c27177b12a6399ffc08b98f76f7c9a1f4fe9fc967c784c5a071fa8d93cf7e1"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2676,12 +2671,13 @@ dependencies = [
 
 [[package]]
 name = "tokio-quiche"
-version = "0.19.1"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5474b6d00a60bd3d87029a8cd7764af18e5f4a0cd6a4704d5b1d049d15b3e8d"
+checksum = "b36d680054da76b46de6f673f21a9da631cc02d1850c7550321f40065adbb31a"
 dependencies = [
  "anyhow",
  "boring",
+ "boring-sys",
  "bytes",
  "crossbeam",
  "datagram-socket",

@@ -1,6 +1,6 @@
 //! Buffers and the out-of-band terminal primitive (design §5, §10).
 //!
-//! Home of the buffer-sizing constants, the send-side cursor helper that
+//! Home of the receive-buffer sizing constant, the send-side cursor helper that
 //! partial-consumes an [`h3::quic::WriteBuf`] into `quiche::stream_send`, and
 //! [`TerminalCell`] — the sticky, pollable, out-of-band one-shot the worker uses
 //! to publish terminal reasons to synchronous `h3::quic` `poll_*` methods.
@@ -15,13 +15,6 @@ use bytes::Buf;
 use futures::task::AtomicWaker;
 
 use crate::quiche;
-
-/// Outbound packet buffer length backing `ApplicationOverQuic::buffer()`
-/// (§5, T3). Sized for a full GSO send batch — at least
-/// `max_send_udp_payload_size`, larger to amortize batched sends — and
-/// deliberately **not** capped at [`MAX_CHUNK`], so UDP throughput is
-/// independent of the per-stream read chunk size. Provisional (§12 C1).
-pub(crate) const PKT_BUF_LEN: usize = 64 * 1024;
 
 /// Cap on a single `stream_recv` into the receive scratch buffer (§5.1).
 /// The per-stream in-flight memory bound is `channel_depth × MAX_CHUNK`.

@@ -208,9 +208,7 @@ fn listen_ref(socks: Vec<tokio::net::UdpSocket>, params: tokio_quiche::Connectio
 /// A do-nothing `ApplicationOverQuic` used only to satisfy the trait-bound
 /// references above; never driven. Implementing the full method set guards the
 /// trait surface the bridge relies on.
-struct Noop {
-    buf: Vec<u8>,
-}
+struct Noop;
 impl tokio_quiche::ApplicationOverQuic for Noop {
     fn on_conn_established(
         &mut self,
@@ -221,9 +219,6 @@ impl tokio_quiche::ApplicationOverQuic for Noop {
     }
     fn should_act(&self) -> bool {
         false
-    }
-    fn buffer(&mut self) -> &mut [u8] {
-        &mut self.buf
     }
     fn wait_for_data(
         &mut self,
