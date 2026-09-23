@@ -79,16 +79,12 @@ impl Drop for TestCerts {
 /// The smallest driver that lets a handshake complete and then idles. Probes
 /// override behavior by wrapping/extending this.
 struct MinimalApp {
-    pkt_buf: Vec<u8>,
     established: Arc<AtomicBool>,
 }
 
 impl MinimalApp {
     fn new(established: Arc<AtomicBool>) -> Self {
-        Self {
-            pkt_buf: vec![0u8; 1350],
-            established,
-        }
+        Self { established }
     }
 }
 
@@ -104,10 +100,6 @@ impl ApplicationOverQuic for MinimalApp {
 
     fn should_act(&self) -> bool {
         self.established.load(Ordering::SeqCst)
-    }
-
-    fn buffer(&mut self) -> &mut [u8] {
-        &mut self.pkt_buf
     }
 
     fn wait_for_data(
@@ -256,7 +248,6 @@ fn conn_err_tuple(e: &quiche::ConnectionError) -> (bool, u64, String) {
 
 /// A driver that runs test-submitted closures against the worker's `qconn`.
 struct ProbeApp {
-    pkt_buf: Vec<u8>,
     established: Arc<AtomicBool>,
     rx: mpsc::UnboundedReceiver<Job>,
     pending: VecDeque<Job>,
@@ -277,7 +268,6 @@ impl ProbeApp {
         let established = Arc::new(AtomicBool::new(false));
         let close_obs = Arc::new(Mutex::new(None));
         let app = ProbeApp {
-            pkt_buf: vec![0u8; 1350],
             established: established.clone(),
             rx,
             pending: VecDeque::new(),
@@ -354,10 +344,6 @@ impl ApplicationOverQuic for ProbeApp {
 
     fn should_act(&self) -> bool {
         self.established.load(Ordering::SeqCst)
-    }
-
-    fn buffer(&mut self) -> &mut [u8] {
-        &mut self.pkt_buf
     }
 
     #[allow(clippy::manual_async_fn)]

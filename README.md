@@ -41,7 +41,7 @@ The full design lives in
 
 ## Pinned build
 
-Depends on semver ranges (`tokio-quiche 0.19`, which pulls `quiche 0.29`; `h3 0.0.8`)
+Depends on semver ranges (`tokio-quiche 0.20`, which pulls `quiche 0.30`; `h3 0.0.8`)
 and pins exact builds via the committed `Cargo.lock`. A CI compatibility test
 (`tests/ci_compat.rs`) constructs one value of every mapped `h3` error variant and
 names every load-bearing `quiche`/`tokio-quiche` API, so a minor upstream bump that
@@ -125,7 +125,7 @@ let (mut driver, mut send_request) = h3::client::new(conn).await.unwrap();
 
 At **zero connection-level send capacity**, a peer that opens a *writable-only*
 bidi stream (e.g. via `STOP_SENDING`) is undiscoverable through any public
-`quiche 0.29` API — quiche's `tx_cap == 0` guard precedes the stopped-stream
+`quiche 0.30` API — quiche's `tx_cap == 0` guard precedes the stopped-stream
 branch. This pathological case is an explicitly documented gap in the otherwise
 drop-in adapter contract, pending an upstream stream-enumeration API.
 

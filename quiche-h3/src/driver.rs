@@ -24,7 +24,6 @@ use tokio_quiche::{ApplicationOverQuic, QuicResult};
 
 use crate::buffer::{
     send_from_buf, SendAccounting, SendBytesPermit, TerminalCell, WriteCompleter, MAX_CHUNK,
-    PKT_BUF_LEN,
 };
 use crate::conn::QuicConn;
 use crate::error::{
@@ -66,22 +65,12 @@ const CHUNK_BUDGET: usize = 16;
 /// and [`H3QuicheClientConfig`](crate::connector::H3QuicheClientConfig).
 pub(crate) const BYTE_CHANNEL_DEPTH: usize = 64;
 
-/// Per-connection buffer sizing knobs (SF-4 / SF-5-pkt_buf). Both default to the
-/// historical constants so out-of-the-box behavior is byte-for-byte unchanged;
-/// callers may raise/lower them to trade memory against throughput.
-///
-/// These are **trade-offs**, not free wins: shrinking `recv_channel_depth`
-/// reduces per-stream buffering (throughput) to save memory, and the packet
-/// buffer must NOT be shrunk below a full GSO batch without a datapath
-/// assessment (§5, §12).
+/// Per-connection buffering knobs owned by the bridge.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DriverBufferConfig {
     /// Bounded per-recv byte-channel depth (default [`BYTE_CHANNEL_DEPTH`]).
     /// Effective value is clamped to at least 1.
     pub recv_channel_depth: usize,
-    /// Outbound packet-buffer size in bytes (default [`PKT_BUF_LEN`]).
-    /// Effective value is clamped to at least 1.
-    pub packet_buffer_size: usize,
     /// Optional aggregate cap (bytes) on buffered outbound send data admitted to
     /// the worker command/op queues (SF-6, FR-010/FR-011). `None` (default) =
     /// unlimited, preserving the historical unbounded behavior. A finite cap
@@ -93,7 +82,6 @@ impl Default for DriverBufferConfig {
     fn default() -> Self {
         Self {
             recv_channel_depth: BYTE_CHANNEL_DEPTH,
-            packet_buffer_size: PKT_BUF_LEN,
             max_buffered_send_bytes: None,
         }
     }
@@ -736,9 +724,6 @@ pub(crate) struct QuicheDriver<B: Buf = Bytes> {
     // ----- worker loop flags / buffers (§2.3, §5) -----
     /// `should_act()` result: true once established.
     acting: bool,
-    /// Outbound packet buffer backing `buffer()` (§5, T3). Sized from
-    /// [`DriverBufferConfig::packet_buffer_size`] (SF-5-pkt_buf).
-    pkt_buf: Vec<u8>,
     /// Configured recv byte-channel depth applied in `build_recv` (SF-4).
     recv_channel_depth: usize,
     /// Reusable `stream_recv` target arena (SF-1). A single `BytesMut` grown a
@@ -867,7 +852,6 @@ impl<B: Buf + Send + 'static> QuicheDriver<B> {
             phase2_pops: 0,
             established: Some(est_tx),
             acting: false,
-            pkt_buf: vec![0u8; buffers.packet_buffer_size.max(1)],
             recv_channel_depth: buffers.recv_channel_depth,
             recv_buf: None,
             #[cfg(test)]
@@ -2853,11 +2837,6 @@ impl<B: Buf + Send + 'static> ApplicationOverQuic for QuicheDriver<B> {
         self.acting
     }
 
-    fn buffer(&mut self) -> &mut [u8] {
-        // The outbound packet buffer (PKT_BUF_LEN), NOT the MAX_CHUNK recv buffer.
-        &mut self.pkt_buf
-    }
-
     // The explicit `impl Future + Send` return type (rather than `async fn`)
     // documents the `Send` bound the `ApplicationOverQuic` trait requires.
     #[allow(clippy::manual_async_fn)]
@@ -2979,40 +2958,28 @@ mod tests {
         assert!(!d.should_act());
     }
 
+    /// SF-4 (SC-006): the default constructor preserves the historical receive
+    /// channel depth.
     #[test]
-    fn buffer_is_packet_sized_not_chunk_sized() {
-        let (mut d, _h) = driver();
-        assert_eq!(d.buffer().len(), PKT_BUF_LEN);
-        assert_ne!(PKT_BUF_LEN, MAX_CHUNK);
-    }
-
-    /// SF-4/SF-5 (SC-006): the default constructor preserves the historical
-    /// buffer sizes exactly — recv channel depth == `BYTE_CHANNEL_DEPTH` and the
-    /// packet buffer == `PKT_BUF_LEN`.
-    #[test]
-    fn sf4_sf5_default_buffer_sizes_unchanged() {
-        let (mut d, _h) = QuicheDriver::<Bytes>::new(false, 4, 4);
+    fn sf4_default_buffer_size_unchanged() {
+        let (d, _h) = QuicheDriver::<Bytes>::new(false, 4, 4);
         assert_eq!(d.recv_channel_depth, BYTE_CHANNEL_DEPTH);
-        assert_eq!(d.buffer().len(), PKT_BUF_LEN);
     }
 
-    /// SF-4/SF-5 (SC-006): `with_buffers` overrides take effect end-to-end — the
-    /// packet buffer is sized to `packet_buffer_size`, and a freshly-built recv
-    /// channel's max capacity equals `recv_channel_depth`.
+    /// SF-4 (SC-006): a `with_buffers` override controls a freshly-built recv
+    /// channel's maximum capacity.
     #[test]
-    fn sf4_sf5_buffer_overrides_take_effect() {
-        let (mut d, h) = QuicheDriver::<Bytes>::with_buffers(
+    fn sf4_buffer_override_takes_effect() {
+        let (d, h) = QuicheDriver::<Bytes>::with_buffers(
             false,
             4,
             4,
             DriverBufferConfig {
                 recv_channel_depth: 8,
-                packet_buffer_size: 4096,
                 max_buffered_send_bytes: None,
             },
         );
         assert_eq!(d.recv_channel_depth, 8);
-        assert_eq!(d.buffer().len(), 4096);
         // The configured depth is applied to the per-stream byte channel.
         let cmd_tx = h.cmd_tx.clone();
         let (state, _handoff, _done) = d.build_recv(0, cmd_tx, None);
@@ -3020,21 +2987,18 @@ mod tests {
         assert_eq!(state.bytes.max_capacity(), 8);
     }
 
-    /// SF-4/SF-5: zero-valued overrides are clamped to at least 1 (no panic on
-    /// channel/buffer construction).
+    /// SF-4: a zero-valued receive depth is clamped to at least 1.
     #[test]
-    fn sf4_sf5_zero_sizes_clamped_to_one() {
-        let (mut d, h) = QuicheDriver::<Bytes>::with_buffers(
+    fn sf4_zero_size_clamped_to_one() {
+        let (d, h) = QuicheDriver::<Bytes>::with_buffers(
             false,
             4,
             4,
             DriverBufferConfig {
                 recv_channel_depth: 0,
-                packet_buffer_size: 0,
                 max_buffered_send_bytes: None,
             },
         );
-        assert_eq!(d.buffer().len(), 1);
         let (state, _handoff, _done) = d.build_recv(0, h.cmd_tx.clone(), None);
         assert_eq!(state.expect("live recv state").bytes.max_capacity(), 1);
     }
@@ -4303,7 +4267,6 @@ mod tests {
             4,
             DriverBufferConfig {
                 recv_channel_depth: BYTE_CHANNEL_DEPTH,
-                packet_buffer_size: PKT_BUF_LEN,
                 max_buffered_send_bytes: Some(cap),
             },
         );

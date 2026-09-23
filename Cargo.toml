@@ -9,7 +9,7 @@ repository = "https://github.com/youyuanwu/quiche-h3"
 
 # Version policy (design §10): depend on semver-compatible ranges and pin exact
 # builds via the committed Cargo.lock, rather than `=` pins in the manifest.
-# tokio-quiche 0.19 re-exports quiche (0.29); h3 0.0.8.
+# tokio-quiche 0.20 re-exports quiche (0.30); h3 0.0.8.
 [workspace.dependencies]
 tokio-quiche = "0.20"
 h3 = "0.0.8"

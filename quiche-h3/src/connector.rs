@@ -64,9 +64,9 @@ pub struct H3QuicheClientConfig {
     /// `recv_channel_depth × MAX_CHUNK`. **Trade-off**: lowering it saves memory
     /// at the cost of per-stream throughput/buffering.
     pub recv_channel_depth: usize,
-    /// Outbound packet-buffer size in bytes for the connection (SF-5). Defaults
-    /// to `PKT_BUF_LEN` (64 KiB). **Do NOT shrink below a full GSO batch
-    /// without a datapath assessment** (§5, §12).
+    /// Retained for source compatibility. `tokio-quiche` 0.20 owns its egress
+    /// buffers, so this value is ignored. Use
+    /// [`QuicSettings::pool_send_buffer`] to control egress-buffer pooling.
     pub packet_buffer_size: usize,
     /// Optional aggregate cap (bytes) on buffered outbound send data admitted to
     /// the connection's worker (SF-6). `None` (default) leaves the send path
@@ -189,7 +189,6 @@ impl H3QuicheConnector {
             DEFAULT_ACCEPT_UNI_CAP,
             DriverBufferConfig {
                 recv_channel_depth: inner.config.recv_channel_depth,
-                packet_buffer_size: inner.config.packet_buffer_size,
                 max_buffered_send_bytes: inner.config.max_buffered_send_bytes,
             },
         );
@@ -246,8 +245,8 @@ mod tests {
         let _cloned = connector.clone();
     }
 
-    /// SF-4/SF-5 (SC-006): the client config defaults to the historical buffer
-    /// sizes so out-of-the-box behavior is unchanged; overrides are honored.
+    /// The receive depth and compatibility-only packet-buffer field preserve
+    /// their historical defaults and configured values.
     #[test]
     fn client_config_buffer_defaults_and_overrides() {
         let def = H3QuicheClientConfig::default();
