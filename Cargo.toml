@@ -11,7 +11,7 @@ repository = "https://github.com/youyuanwu/quiche-h3"
 # builds via the committed Cargo.lock, rather than `=` pins in the manifest.
 # tokio-quiche 0.19 re-exports quiche (0.29); h3 0.0.8.
 [workspace.dependencies]
-tokio-quiche = "0.19"
+tokio-quiche = "0.20"
 h3 = "0.0.8"
 bytes = "1"
 futures = "0.3"
