@@ -392,6 +392,7 @@ impl SendAccounting {
     ///
     /// Unlimited (`cap == None`) always succeeds. `bytes == 0` always succeeds
     /// with a zero-cost permit.
+    #[allow(deprecated)]
     pub(crate) fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<SendBytesPermit> {
         let outcome = self
             .resident
@@ -450,6 +451,7 @@ impl SendAccounting {
 
     /// Release `bytes` back to the pool and wake every parked admission (they
     /// re-check under the atomic). Invoked only by [`SendBytesPermit::drop`].
+    #[allow(deprecated)]
     fn release(&self, bytes: usize) {
         if bytes != 0 {
             // Saturating guard: each permit releases exactly once, so this never
