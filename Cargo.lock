@@ -496,9 +496,9 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "datagram-socket"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e352260f0c4539a6380c32001b3ca4912aa7a038030478d70d74bcffe3b0fc95"
+checksum = "532e26edbe1cbfcc6a94ecf2e339cc727cc245fc63ff1f831acd07e27d7a94e1"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1884,9 +1884,9 @@ dependencies = [
 
 [[package]]
 name = "qlog"
-version = "0.18.0"
+version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c65c0ae39cba4538fd935d376ba17f858046b386dc4597e3fa5c1aedb919ef30"
+checksum = "558dc1a757765c329efc2465e55991849998c8e8878f8d1974daee18813de6d5"
 dependencies = [
  "flate2",
  "foundations",
@@ -2643,9 +2643,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.54.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "a0c168a474b95bfecfe908a65d4bdffc523144b649a74c09c286afb35d53e0bc"
 dependencies = [
  "bytes",
  "libc",
@@ -2671,9 +2671,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-quiche"
-version = "0.20.0"
+version = "0.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b36d680054da76b46de6f673f21a9da631cc02d1850c7550321f40065adbb31a"
+checksum = "39272b0b2b311cc3e5cab36d9094bfa8e7ebc9725b4b2b4cb7a52aa57f17f075"
 dependencies = [
  "anyhow",
  "boring",
